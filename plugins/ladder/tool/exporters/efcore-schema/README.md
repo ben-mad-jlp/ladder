@@ -1,7 +1,9 @@
 # EF Core schema exporter
 
 Records, per column: name, type, required, max length, `generated` (identity keys, SQL defaults)
-and `default` (what an insert that leaves the column out gets).
+and `default` (what an insert that leaves the column out gets: only a configured `HasDefaultValue` /
+`HasDefaultValueSql`, never the C# type's zero value). Files from the v0.6.0 exporter ("ladder
+efcore-schema 2") wrote zero values as defaults; Ladder ignores those, but re-export when you can.
 
 For projects whose database changes are not EF migrations (no `ModelSnapshot.cs` to point
 `"kind": "efcore-snapshot"` at). It builds each DbContext's model offline, without opening a

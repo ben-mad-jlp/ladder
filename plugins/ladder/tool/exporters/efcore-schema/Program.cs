@@ -113,7 +113,7 @@ foreach (var (contextName, outPath) in pairs)
         });
     }
     Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outPath))!);
-    File.WriteAllText(outPath, JsonSerializer.Serialize(new { exporter = "ladder efcore-schema 2", context = ctxType.Name, entities },
+    File.WriteAllText(outPath, JsonSerializer.Serialize(new { exporter = "ladder efcore-schema 3", context = ctxType.Name, entities },
         new JsonSerializerOptions { WriteIndented = true }));
     Console.WriteLine($"{ctxType.Name}: {entities.Count} entities -> {outPath}");
 }
@@ -121,12 +121,21 @@ return 0;
 
 static string? DefaultText(IProperty p)
 {
+    // Only a default someone configured (HasDefaultValue / HasDefaultValueSql). GetDefaultValue() also
+    // answers default(T) for value types (0, false, the zero Guid), which is not a database default.
     try
     {
-        var sql = p.GetDefaultValueSql();
+        var sql = p.FindAnnotation(RelationalAnnotationNames.DefaultValueSql)?.Value as string;
         if (sql != null) return sql;
-        var v = p.GetDefaultValue();
-        return v switch { null => null, string str => $"'{str}'", bool b => b ? "1" : "0", _ => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture) };
+        var a = p.FindAnnotation(RelationalAnnotationNames.DefaultValue);
+        if (a == null) return null;
+        return a.Value switch
+        {
+            null => "NULL",
+            string str => $"'{str}'",
+            bool b => b ? "1" : "0",
+            var v => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture),
+        };
     }
     catch { return null; }
 }

@@ -44,7 +44,7 @@ are passed back to the generator too, marked as possibly caused by the file it w
 
 If ladder.json sets `"check_command"` (`["npx", "tsc", "--noEmit"]`), `generate` builds after writing
 and retries once with the compile errors; `"format_command"` runs the formatter over every file the
-generator changed. `generate --out=<file>` writes somewhere else, to try a regeneration safely.
+generator changed. `generate --out=<file>` writes somewhere else, to try a regeneration safely. When code regenerated in a scratch copy is copied back, run `ladder accept <ladder.json> --from=<scratch>/ladder.json` so the copied regions are not reported as hand-edited.
 `repair` can open an `@support imports` region at the top of a file that has none when the fix is a
 missing import, and it repairs `@contract` regions (entities, DTOs) as well as step regions.
 

@@ -292,6 +292,24 @@ def _pick(result: dict, path: str):
     return cur
 
 
+def _ladder_version() -> str:
+    try:
+        return json.loads((Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json").read_text())["version"]
+    except (OSError, ValueError, KeyError):
+        return "unknown"
+
+
+def _write_replay_meta(out: Path, mask: dict, mask_text: list, jwt_on: bool, record: list, observe) -> None:
+    """How these traces were recorded, so `check` can tell when two builds' traces were recorded
+    differently (another Ladder version, other masks) and the difference is the recording's."""
+    import datetime
+    meta = {"ladder": _ladder_version(), "mask": dict(sorted(mask.items())),
+            "mask_text": [f"{rx.pattern}={rep}" for rx, rep in mask_text], "jwt": jwt_on,
+            "record_headers": sorted(record), "observe": observe or "",
+            "recorded": datetime.date.today().isoformat()}
+    (out / ".replay.json").write_text(json.dumps(meta, indent=2) + "\n")
+
+
 def replay(argv: list[str]) -> int:
     """Send each scenario's requests to a running service, in order; one trace per scenario.
     Each request becomes a traced step (its "step" field, default "http") whose result is
@@ -413,6 +431,7 @@ def replay(argv: list[str]) -> int:
             events.append({"step": step, "ev": "exit", "ms": 0, "info": f"{status}",
                            "data": json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)})
         (out / f"{f.stem}.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+        _write_replay_meta(out, mask, mask_text, jwt_on, record_default, observe)
         print(f"  {f.stem}: {len(events) // 2} requests -> {out / (f.stem + '.jsonl')}")
     return 0
 

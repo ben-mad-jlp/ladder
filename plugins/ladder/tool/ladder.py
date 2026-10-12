@@ -37,10 +37,12 @@ Commands
   ladder retag  <project.json> <STEP IDS> [--build=NAME]
                                    the English was reworded without changing behavior: update the
                                    markers' hashes instead of regenerating (a person's call)
-  ladder accept <project.json> [--build=NAME] [STEP IDS] [--exports]
+  ladder accept <project.json> [--build=NAME] [STEP IDS] [--exports] [--from=SCRATCH/ladder.json]
                                    accept hand edits to regions: the English still describes them
                                    (regen and repair refuse to overwrite hand-edited regions unless
                                    given --discard-hand-edits)
+                                   --from: accept regions copied from a scratch copy, when each is
+                                   exactly what that scratch project recorded as generated
 
 check, hashes, stamp, view, export, init, adopt-check and replay never call an LLM: they are the
 mechanical checks around it. generate, regen and repair call the project's generator command:
@@ -470,7 +472,7 @@ def contract_hash(tree: dict[str, Node], build: dict | None = None) -> str:
 CONTRACT_DECL_RE = re.compile(r"\b(?:class|interface|record|struct|type|enum)\s+([A-Z][A-Za-z0-9_]*)\b")
 
 
-def region_contract_hash(tree, build: dict | None, code: list[str]) -> str:
+def region_contract_hash(tree, build: dict | None, code: list[str], label: str = "") -> str:
     """The hash a @contract region carries: from the data blocks its code declares (a region that
     declares ClockInRequest depends on data ClockInRequest and the rules it names), so editing one
     block marks only the regions that spell it out stale. A region that declares no data block
@@ -479,7 +481,11 @@ def region_contract_hash(tree, build: dict | None, code: list[str]) -> str:
     def base(t: str) -> str:   # ICircuitOptions / ClockInRequestDto / ClockInRequestDTO -> the block name
         t = re.sub(r"(Dto|DTO)$", "", t)
         return t[1:] if len(t) > 2 and t[0] == "I" and t[1].isupper() and t[1:] in data else t
-    declared = sorted({base(m.group(1)) for l in code for m in CONTRACT_DECL_RE.finditer(l)} & set(data))
+    declared = {base(m.group(1)) for l in code for m in CONTRACT_DECL_RE.finditer(l)}
+    # the region's label names its block when the class name doesn't (@contract ClockStatus@... over
+    # class ClockStatusResponseDto)
+    declared |= {w for w in re.split(r"[\s,+]+", label.replace("contract ", "", 1)) if w}
+    declared = sorted(declared & set(data))
     if not declared:
         return contract_hash(tree, build)
     text = "\n".join(data[k].text() for k in declared).lower()
@@ -488,10 +494,10 @@ def region_contract_hash(tree, build: dict | None, code: list[str]) -> str:
     return "d" + hashlib.sha1(t.encode()).hexdigest()[:5]
 
 
-def contract_region_ok(tree, build, tag_hash: str, code: list[str]) -> bool:
+def contract_region_ok(tree, build, tag_hash: str, code: list[str], label: str = "") -> bool:
     """A @contract region is current when its tag matches what its code depends on now (per region),
     or the whole build contract (regions written before per-region hashes)."""
-    return tag_hash in (region_contract_hash(tree, build, code), contract_hash(tree, build))
+    return tag_hash in (region_contract_hash(tree, build, code, label), contract_hash(tree, build))
 
 
 def restamp_contracts(root: Path, cfg: dict) -> int:
@@ -514,7 +520,7 @@ def restamp_contracts(root: Path, cfg: dict) -> int:
                 if r.tags[0][1] != whole:
                     continue
                 own = region_own_code(regions, lines, regions.index(r))
-                h = region_contract_hash(root_tree(root, cfg), b, own)
+                h = region_contract_hash(root_tree(root, cfg), b, own, r.label)
                 if h != whole:
                     lines[r.start - 1] = lines[r.start - 1].replace(f"@{whole}", f"@{h}", 1)
                     changed = True
@@ -657,7 +663,25 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
         known = S.attrs_known(was_all)     # attributes the old facts never carry are not compared
         for nid, now in sfacts.items():
             was = was_all.get(nid, {})
-            changed = [c for k, v in now.items() if k in was for c in S.fact_changes(k, was[k], v, known)]
+            named, table = [], []
+            for k, v in now.items():
+                if k in was:
+                    for c in S.fact_changes(k, was[k], v, known):
+                        (table if ".*" in k else named).append(c)
+            named = list(dict.fromkeys(named))
+            # a change seen both by name and through the whole table is reported once
+            table = [c for c in dict.fromkeys(table) if c not in named]
+            if named or any("inserts must now set it" in c for c in table):
+                changed = named + table
+            else:
+                changed = []
+                if table:
+                    report["warnings"].append(dict(
+                        kind="schema-changed-table", node=nid,
+                        msg=f"refers to a whole table (reads:/writes:) in which something changed {since} ("
+                            + "; ".join(table) + "); it names none of those columns, so this is only a warning. If "
+                                                 "the step does use one, name it with [[Entity.Member]] so changes to it "
+                                                 "are reviewed"))
             for c in changed:
                 if "inserts must now set it" in c:
                     ent_key = c.split(" added", 1)[0].rsplit(".", 1)[0]          # qbs:Dbo_Timeclock
@@ -667,10 +691,17 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                         writers_seen.add(ent_key)
                         found = S.other_writers(root, cfg, e)
                         if found:
+                            shown = found[:10]
+                            more = ""
+                            if len(found) > 10:
+                                listing = root / ".ladder" / f"other-writers-{ename}.txt"
+                                listing.parent.mkdir(exist_ok=True)
+                                listing.write_text("\n".join(found) + "\n")
+                                more = f", and {len(found) - 10} more (all {len(found)} in {listing.relative_to(root)})"
                             report["warnings"].append(dict(
                                 kind="other-writers", node=ename,
-                                msg=f"code outside this project creates {ename} rows and must set the new required "
-                                    f"column too (tests and seeders included): {', '.join(found)}"))
+                                msg=f"{len(found)} places outside this project create {ename} rows and must set the new "
+                                    f"required column too (tests and seeders included): {', '.join(shown)}{more}"))
             if changed:
                 report["tree"].append(dict(kind="schema-changed", node=nid,
                                            msg=f"the schema it refers to changed {since} (" + "; ".join(changed)
@@ -725,9 +756,9 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                     h = r.tags[0][1] if r.tags else ""
                     has_contract = True
                     own = region_own_code(regions, flines, regions.index(r))
-                    if not contract_region_ok(tree, b, h, own):
+                    if not contract_region_ok(tree, b, h, own, r.label):
                         br["problems"].append(dict(kind="stale-contract", file=f, line=r.start,
-                                                   msg=f"contract types were generated from older in:/out: lines or data blocks (tag {h}, now {region_contract_hash(tree, b, own)}); regenerate this region"))
+                                                   msg=f"contract types were generated from older in:/out: lines or data blocks (tag {h}, now {region_contract_hash(tree, b, own, r.label)}); regenerate this region"))
                     continue
                 if r.kind != "node":
                     continue
@@ -771,10 +802,12 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
             br["problems"].append(dict(
                 kind="hand-edited", file=f, line=line, node=what,
                 msg=(f"code for [{what}] changed since it was last approved or generated; if behavior changed, update the "
-                     f"English (ladder-write), then `ladder accept`; if not (refactor, formatting), just `ladder accept`")
+                     f"English (ladder-write), then `ladder accept`; if not (refactor, formatting), just `ladder accept`; "
+                     f"if it was regenerated in a scratch copy and copied here, `ladder accept --from=<scratch ladder.json>`")
                 if adopted else
                 (f"code for [{what}] was edited by hand since it was last generated or approved; regenerating would throw the edit away. "
-                 f"Move the change into the English and regenerate, or `ladder accept` it if it changes no behavior")))
+                 f"Move the change into the English and regenerate, or `ladder accept` it if it changes no behavior; "
+                 f"if it was regenerated in a scratch copy and copied here, `ladder accept --from=<scratch ladder.json>`")))
 
         def is_covered(nid: str) -> bool:
             if covered[nid]:
@@ -810,6 +843,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                                            msg=f"no code is tagged with [{nid}]"))
         report["builds"].append(br)
     report["compare"] = compare_runs(root, cfg, tree)
+    report["warnings"] += replay_settings_warnings(root, cfg)
     # Mutants (builds with "mutant": true) are broken on purpose: they must differ somewhere.
     mutants = {b["name"] for b in cfg["builds"] if b.get("mutant")}
     report["mutants"] = {}
@@ -973,6 +1007,45 @@ def run_names(root: Path, c: dict, cfg: dict | None = None) -> list[str]:
         else:
             runs.append(r)
     return runs
+
+
+def replay_settings_warnings(root: Path, cfg: dict) -> list[dict]:
+    """Traces that `ladder replay` recorded with different settings (masks, --jwt, --observe) or a
+    different Ladder version than the reference's: their differences may come from the recording."""
+    c = cfg.get("compare") or {}
+    ref = c.get("reference")
+    if not ref:
+        return []
+    folder = {b["name"]: b.get("traces", b["name"]) for b in cfg.get("builds", [])}
+
+    def meta(name):
+        p = root / "traces" / folder.get(name, name) / ".replay.json"
+        try:
+            return json.loads(p.read_text())
+        except (OSError, ValueError):
+            return None
+    want = meta(ref)
+    out = []
+    for b in cfg.get("builds", []):
+        if b["name"] == ref or folder.get(b["name"]) == folder.get(ref):
+            continue
+        got = meta(b["name"])
+        if want is None and got is None:
+            continue
+        if want is None or got is None:
+            which = ref if want is None else b["name"]
+            out.append(dict(kind="replay-settings", node=b["name"],
+                            msg=f"traces/{folder.get(which, which)} have no .replay.json (recorded by a Ladder older than "
+                                f"0.6.1, or not by replay) while the other side has one; if they differ, re-record with "
+                                f"the same settings before trusting the comparison"))
+            continue
+        diffs = [f"{k}: {want.get(k)} vs {got.get(k)}" for k in sorted(set(want) | set(got))
+                 if k != "recorded" and want.get(k) != got.get(k)]
+        if diffs:
+            out.append(dict(kind="replay-settings", node=b["name"],
+                            msg=f"recorded with different replay settings than {ref} (" + "; ".join(diffs)
+                                + "); differences may come from the recording, not the code"))
+    return out
 
 
 def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
@@ -1477,6 +1550,9 @@ def accept(pj: Path, args: list[str]) -> int:
         print("accepted the current exports" + (f" of {build}" if build else " of every build"))
         if not ids:
             return 0
+    src = next((a.split("=", 1)[1] for a in args if a.startswith("--from=")), None)
+    if src:
+        return accept_from(root, cfg, Path(src), build, ids)
     keys = set()
     for b in cfg["builds"]:
         if b.get("tagged") is False or (build and b["name"] != build):
@@ -1491,6 +1567,35 @@ def accept(pj: Path, args: list[str]) -> int:
         return 1
     record_code(root, cfg, keys=keys)
     return 0
+
+
+def accept_from(root: Path, cfg: dict, src_pj: Path, build: str | None, ids: set[str]) -> int:
+    """Regions generated in a scratch copy and copied here: accept each one whose code is exactly what
+    the scratch project recorded as generated (its ladder.code.json). Anything else stays hand-edited."""
+    src_root = src_pj.parent if src_pj.suffix == ".json" else src_pj
+    theirs = load_code(src_root)
+    if not theirs:
+        print(f"no {CODE_FILE} in {src_root}: nothing was generated there")
+        return 1
+    keys, refused = set(), []
+    for b in cfg["builds"]:
+        if b.get("tagged") is False or (build and b["name"] != build):
+            continue
+        for f, key, line in hand_edited(root, b):
+            region_ids = set(key.split(" ", 1)[1].split(" #")[0].split("+")) if key.startswith("node ") else {key}
+            if ids and not (region_ids & ids or key in ids):
+                continue
+            mine = code_fingerprints(root, b).get(f, {}).get(key, (None,))[0]
+            if theirs.get(b["name"], {}).get(f, {}).get(key) == mine:
+                keys.add((b["name"], f, key))
+                print(f"accepted  {b['name']}  {f}:{line}  {key}  (generated in {src_root})")
+            else:
+                refused.append(f"{f}:{line}  {key}")
+    for r in refused:
+        print(f"still hand-edited  {r}  (differs from what {src_root} generated)")
+    if keys:
+        record_code(root, cfg, keys=keys)
+    return 0 if keys and not refused else 1
 
 
 # ---------------------------------------------------------------- viewer
