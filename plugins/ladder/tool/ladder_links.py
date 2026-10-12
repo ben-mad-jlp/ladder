@@ -146,6 +146,24 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                 approvals.append(dict(kind="linked-changed", node=nid,
                                       msg=f"calls {key}, whose contract changed {when}: " + diff_text(was, now)
                                           + "; re-read this step (and the code that handles the answer), then approve"))
+    # Steps in this tree that rely on a linked-changed step: they name it ("signs in through
+    # [authsvc.1]"), or they are its parent. They handle the same answer, one step removed.
+    flagged = {a["node"]: a for a in approvals}
+    frontier = list(flagged)
+    while frontier:
+        src = frontier.pop()
+        for nid, n in tree.items():
+            if nid in flagged:
+                continue
+            text = " ".join([n.title, n.inputs, n.outputs, n.effects, *n.steps, *n.notes])
+            if f"[{src}]" in text or tree[src].parent == nid:
+                why = "is its parent" if tree[src].parent == nid else f"refers to [{src}]"
+                flagged[nid] = dict(kind="linked-changed", node=nid,
+                                    msg=f"{why}, which is affected by a change in another tree "
+                                        f"({flagged[src]['msg'].split(',')[0].replace('calls ', 'it calls ')}); "
+                                        f"re-read this step too, then approve")
+                approvals.append(flagged[nid])
+                frontier.append(nid)
     # The other direction: steps here that projects we link to call.
     for alias, got in linked.items():
         if isinstance(got, str):
@@ -156,14 +174,25 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                 or (r2 / link_spec(c2, a)["project"]).resolve().parent == root.resolve()]
         if not back:
             continue
+        own_old = tree_at(cfg, root, since) if since else None
         for cid, cn in t2.items():
             for a, tid, _ in parse_calls(cn):
-                if a in back and tid in tree:
+                if a not in back or tid not in tree:
+                    continue
+                if since:
+                    # compare the contract callers rely on with this tree as it was at the ref
+                    changed = own_old is not None and tid in own_old and \
+                        contract_text(own_old, tid) != contract_text(tree, tid)
+                    when = f"since {since}"
+                else:
                     was = lock.get(tid, {}).get("hash") if isinstance(lock.get(tid), dict) else None
-                    if was and was != tree[tid].hash:
-                        warnings.append(dict(kind="has-callers", node=tid,
-                                             msg=f"edited, and called by {alias} [{cid}]: if its contract changed, "
-                                                 f"that step will show as linked-changed until re-approved"))
+                    changed = bool(was) and was != tree[tid].hash
+                    when = "since approval"
+                if changed:
+                    warnings.append(dict(kind="has-callers", node=tid,
+                                         msg=f"{'its contract changed' if since else 'edited'} {when}, and it is called by "
+                                             f"{alias} [{cid}]: that step shows as linked-changed until re-read and approved; "
+                                             f"update its English in the same change, or tell whoever owns it"))
     return problems, approvals, warnings, facts
 
 
@@ -207,15 +236,36 @@ def capability_tests(cap) -> list[tuple[str, str]]:
     return out
 
 
-def capability_test_hash(cap, key: str, cmd: str) -> str:
+def command_files_hash(cmd: str, cwd: Path | None) -> str:
+    """Hash of the files a test command names (scripts and test files), so editing a test makes its
+    recorded result stale. Arguments that are not files under cwd are ignored."""
+    import shlex
+    if cwd is None:
+        return ""
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        words = cmd.split()
+    h = hashlib.sha1()
+    for w in words:
+        p = (cwd / w)
+        try:
+            if p.is_file() and p.stat().st_size < 5_000_000:
+                h.update(w.encode() + b"\0" + p.read_bytes())
+        except OSError:
+            continue
+    return h.hexdigest()[:8]
+
+
+def capability_test_hash(cap, key: str, cmd: str, cwd: Path | None = None) -> str:
     t = "\n".join([cap.inputs, cap.outputs, cap.bindings.get(key, "") if key != "*" else
-                   json.dumps(cap.bindings, sort_keys=True), *cap.known, cmd])
+                   json.dumps(cap.bindings, sort_keys=True), *cap.known, cmd, command_files_hash(cmd, cwd)])
     return hashlib.sha1(" ".join(t.split()).encode()).hexdigest()[:8]
 
 
-def link_test_hash(tree: L.Tree, alias: str, linked, cmd: str) -> str:
+def link_test_hash(tree: L.Tree, alias: str, linked, cmd: str, cwd: Path | None = None) -> str:
     got = linked.get(alias)
-    parts = [cmd]
+    parts = [cmd, command_files_hash(cmd, cwd)]
     for nid, n in tree.items():
         for a, tid, _ in parse_calls(n):
             if a == alias:
@@ -235,6 +285,7 @@ def all_tests(cfg: dict, root: Path, tree: L.Tree) -> list[dict]:
     """Every test this project declares: {key, what, cmd, hash, users}. A capability's tests count only
     when this project's steps use it, and only for bindings its builds have ("*" for all): with a
     vocabulary shared by an API and a client project, each runs and reports its own."""
+    cwd = root / cfg.get("check_cwd", ".")   # where `ladder test` runs the commands
     out = []
     vocab = L.load_vocabulary(cfg, root) or {}
     users: dict[str, list[str]] = {}
@@ -249,14 +300,14 @@ def all_tests(cfg: dict, root: Path, tree: L.Tree) -> list[dict]:
             if key != "*" and key not in keys:
                 continue
             out.append(dict(key=f"capability {name} [{key}]", what=f"capability '{name}' ({key})", cmd=cmd,
-                            hash=capability_test_hash(cap, key, cmd), users=users.get(name, [])))
+                            hash=capability_test_hash(cap, key, cmd, cwd), users=users.get(name, [])))
     linked = load_linked(cfg, root) if cfg.get("links") else {}
     for alias in (cfg.get("links") or {}):
         spec = link_spec(cfg, alias)
         callers = [nid for nid, n in tree.items() if any(a == alias for a, _, _ in parse_calls(n))]
         if spec.get("test"):
             out.append(dict(key=f"link {alias}", what=f"the seam with {alias}", cmd=spec["test"],
-                            hash=link_test_hash(tree, alias, linked, spec["test"]), users=callers))
+                            hash=link_test_hash(tree, alias, linked, spec["test"], cwd), users=callers))
     return out
 
 

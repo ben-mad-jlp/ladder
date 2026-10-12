@@ -121,10 +121,87 @@ def context_text(build: dict, ids: list[str] | None = None, conventions: bool = 
     if CTX.get("schemas") and tree is not None:
         import ladder_schema as S
         out.append(S.prompt_text(ids or list(tree), tree, CTX["schemas"]))
+    if tree is not None and ids:
+        out.append(referenced_steps_text(ids))
     if CTX.get("cfg", {}).get("links") and tree is not None:
         import ladder_links as K
         out.append(K.prompt_text(ids or list(tree), tree, CTX["cfg"], CTX["root"]))
     return "\n".join(out)
+
+
+STEP_REF_RE = re.compile(r"\[([A-Za-z0-9_.\-]+)\]")
+
+
+def code_signature(nid: str) -> tuple[str, str] | None:
+    """(file, first code line(s)) of the region implementing a step, in any build of the project:
+    the function or method a caller of that step must call."""
+    cfg, root = CTX.get("cfg") or {}, CTX.get("root")
+    if root is None or nid in CTX.get("hidden_steps", set()):
+        return None     # blind regeneration: its old code must not leak into other prompts
+    cache = CTX.setdefault("_regions", {})
+    for b in cfg.get("builds", []):
+        if b.get("tagged") is False:
+            continue
+        c = L.COMMENT.get(b["lang"], "//")
+        for f in b.get("files", []):
+            key = (b["lang"], f)
+            if key not in cache:
+                try:
+                    regions, _, lines, _ = L.parse_regions(root / f, b["lang"])
+                except (OSError, SystemExit):
+                    regions, lines = [], []
+                cache[key] = (regions, lines)
+            regions, lines = cache[key]
+            for r in regions:
+                if r.kind != "node" or not any(t == nid for t, _ in r.tags):
+                    continue
+                sig = []
+                for l in lines[r.start:r.end - 1]:
+                    t = l.strip()
+                    if not t or t.startswith((c, "/*", "*", "[", "@")):
+                        continue
+                    sig.append(t)
+                    if ")" in t or len(sig) == 3:
+                        break
+                if sig and "(" in sig[0]:
+                    return f, " ".join(sig).rstrip("{").strip()
+    return None
+
+
+def referenced_steps_text(ids: list[str]) -> str:
+    """Steps of this tree that the given steps' English names ("as [emp.7] says"), with their
+    contract and, where code exists, the call that implements them: so the generator calls that
+    method instead of a similar-sounding one."""
+    tree = CTX.get("tree")
+    if tree is None:
+        return ""
+    own = set(ids)
+    for i in ids:
+        if i in tree:
+            stack = list(tree[i].children)
+            while stack:
+                c = stack.pop()
+                own.add(c)
+                stack += tree[c].children
+    refs = []
+    for i in ids:
+        if i not in tree:
+            continue
+        n = tree[i]
+        for m in STEP_REF_RE.finditer(" ".join([n.title, n.inputs, n.outputs, n.effects, *n.steps, *n.notes])):
+            r = m.group(1)
+            if r in tree and r not in own and r not in refs and r != n.parent:
+                refs.append(r)
+    if not refs:
+        return ""
+    CTX["_regions"] = {}     # files change between prompts while regenerating
+    out = ["=== Steps these steps refer to (call them as implemented; do not substitute a similar method):"]
+    for r in refs:
+        out.append(step_block(tree[r]))
+        sig = code_signature(r)
+        if sig:
+            out.append(f"  implemented in {sig[0]} as: {sig[1]}")
+    return "\n".join(out) + "\n"
 
 
 def step_block(n: L.Node) -> str:
@@ -700,6 +777,7 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
             has_child = {rr.parent for rr in regions if rr.parent is not None and rr.kind in ("node", "contract")}
             idx = next(i for i, k in enumerate(keys) if k == pending[0])
             hide = {i for i, k in enumerate(keys) if k in pending}
+            CTX["hidden_steps"] = {t for i in hide for t, _ in regions[i].tags}
             # parents' own lines (constructors, fields) are hidden too: they are rewritten last
             view = blinded_own(blinded(lines, regions, hide), regions,
                                {i for i, k in enumerate(keys) if k in parents})
@@ -739,6 +817,7 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
             fpath.write_text("\n".join(new) + "\n")
             results.append((f, key, f"written blind ({len(clean_reply(reply))} lines)"))
             results += [(f, "support", n) for n in notes]
+        CTX["hidden_steps"] = set()
         while parents:
             regions, _, lines, _ = L.parse_regions(fpath, b["lang"])
             keys = L.region_keys(regions)

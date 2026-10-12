@@ -126,6 +126,7 @@ on; a migration that changes one (a column's type, length, nullability or name) 
 `schema-changed` until it is re-read and approved. A whole-entity reference (`reads: X`) also relies on
 every member of X: removing or retyping one flags the step, and for `writes:` so does a new required
 column the database doesn't fill in (inserts must now set it); new optional columns flag nothing.
+A step that never inserts says `writes: X (updates only)`, and new required columns don't flag it.
 Before the first stamp, `ladder check --since=<git ref>` compares with the schema files as they were
 at that commit. Generator prompts include the referenced entities exactly, and entity classes are
 never generated: tag them as support code (a support-only build has `"steps": []`).
@@ -187,8 +188,9 @@ records each result in `ladder.code.json` against what it tested: the capability
 project can share one vocabulary. `check` reports a failed test as a problem (with the assertion's
 expected and received values when the output shows them), and as warnings: a capability with
 `known:` lines that steps use and no test checks (`untested-capability`), a test never run, and a test
-whose subject changed since it ran (`test-stale`). The test file's own contents are not part of that
-subject: after editing a test, run `ladder test` again.
+whose subject changed since it ran (`test-stale`). The files a command names (a script, a test
+file) are part of that subject too, so editing a test makes its result stale; files it reaches
+only indirectly are not.
 
 ### Links between trees
 
@@ -209,9 +211,12 @@ and ladder.json names the other project, optionally with a test that runs both s
 (`"links": {"api": "../api/ladder.json"}` without a test.) `check` resolves every `calls:` item.
 `stamp` records the called step's contract: its `in:`, `out:` and `effects:` lines and the data
 blocks they name. When that contract changes, the calling step shows as `linked-changed` until it
-is re-read and approved, so a change to the API's answer reaches the client's review. If the called
-project lists the caller in its own `"links"`, its `check` warns that an edited step has callers
-(`has-callers`). Generator prompts for a calling step include the called step's contract. A link
+is re-read and approved, so a change to the API's answer reaches the client's review. Steps in the
+calling tree that rely on that step are flagged too: its parent, and any step whose English names it
+(`> signs in through [authsvc.1]`), and so on outward. So name the step you use, in the English. If
+the called project lists the caller in its own `"links"`, its `check` warns that an edited step has
+callers (`has-callers`); with `--since=<ref>` it compares the called step's contract with that commit
+instead of the lock. Generator prompts for a calling step include the called step's contract. A link
 with callers but no `"test"` is reported as `untested-link`: only running both sides catches a
 wrong assumption about the code between them.
 
@@ -358,7 +363,8 @@ say which differences don't matter for it; each line holds one or more clauses s
 | `final result only` | only the step's last result is compared (retries, progress updates) |
 
 `check` lists every differing result of a step, with the request it answered (`#15 POST /login`) when
-the traces come from `ladder replay`; the first 10 per step, or all with `--all-differences`.
+the traces come from `ladder replay`; the first 10 per step, or all with `--all-differences`. Long
+values are shown around the place where they first differ.
 
 `ladder check` rejects clauses it doesn't understand. Use them for differences that are truly
 harmless and that nobody can rely on; anything a caller or user can depend on belongs in the English

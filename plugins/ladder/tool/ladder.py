@@ -940,6 +940,19 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
     return out
 
 
+def clip_pair(a: str, b: str, width: int = 200) -> tuple[str, str]:
+    """Two long values cut to the same window around where they first differ, so the difference
+    is always on screen (not hidden past the first 200 characters)."""
+    if len(a) <= width and len(b) <= width:
+        return a, b
+    i = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b)))
+    start = max(0, i - width // 3)
+
+    def cut(x: str) -> str:
+        return ("…" if start > 0 else "") + x[start:start + width] + ("…" if start + width < len(x) else "")
+    return cut(a), cut(b)
+
+
 SHOW_ALL = False    # --all-differences: list every differing result, not the first DIFF_LIMIT per step
 DIFF_LIMIT = 10
 
@@ -1020,8 +1033,9 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
                 where_ = f"result {r.get('at', '?')} of {r.get('count', '?')}"
                 if r["step"] == "(order)":
                     print(f"    order of results: DIFFERENT from result {r['at']} (of {r['count']} in sequence)")
-                    print(f"      {b['build']}: {r['val'][:200]}")
-                    print(f"      {run['reference']}: {r['ref'][:200]}")
+                    va, ra = clip_pair(r['val'], r['ref'])
+                    print(f"      {b['build']}: {va}")
+                    print(f"      {run['reference']}: {ra}")
                     print(f"      ({r['note']})")
                     continue
                 if r["status"] == "close":
@@ -1033,8 +1047,9 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
                     print(f"    {r['step']}: DIFFERENT in {len(diffs)} of {r.get('count', '?')} results")
                     for d in shown_d:
                         print(f"      result {d['at']}" + (f" (request {d['label']})" if d.get("label") else "") + ":")
-                        print(f"        {b['build']}: {d['val'][:200]}")
-                        print(f"        {run['reference']}: {d['ref'][:200]}")
+                        va, ra = clip_pair(d['val'], d['ref'])
+                        print(f"        {b['build']}: {va}")
+                        print(f"        {run['reference']}: {ra}")
                     if len(diffs) > len(shown_d):
                         print(f"      ... {len(diffs) - len(shown_d)} more (ladder check --all-differences)")
                 if r.get("note"):
@@ -1049,8 +1064,9 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
             d = rep.get("mutant_first", {}).get(m)
             if d:
                 print(f"    first difference: run '{d['run']}', {d['step']}")
-                print(f"      {m}: {d['val'][:160]}")
-                print(f"      reference: {d['ref'][:160]}")
+                va, ra = clip_pair(d['val'], d['ref'], 160)
+                print(f"      {m}: {va}")
+                print(f"      reference: {ra}")
     if rep.get("warnings"):
         print("\nWarnings (not failures)")
         for w in rep["warnings"]:
