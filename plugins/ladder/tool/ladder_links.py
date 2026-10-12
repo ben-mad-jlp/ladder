@@ -191,6 +191,7 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
     """Problems, approval items, warnings and the facts `stamp` records ({step: {"alias:id": text}})."""
     problems, approvals, warnings, facts = [], [], [], {}
     pending_cache: dict[str, dict[str, str]] = {}
+    callee_locks: dict[str, dict] = {}
     callers = {nid: parse_calls(n) for nid, n in tree.items() if getattr(n, "calls", None)}
     linked = load_linked(cfg, root) if (callers or cfg.get("links")) else {}
     for alias, v in linked.items():
@@ -218,6 +219,19 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                 problems.append(dict(kind="link", node=nid, msg=f"calls: {written}: the {alias} tree has no step [{tid}]"))
                 continue
             key = f"{alias}:{tid}"
+            if alias not in callee_locks:
+                lp = r2 / "ladder.lock.json"
+                try:
+                    callee_locks[alias] = json.loads(lp.read_text()) if lp.exists() else {}
+                except ValueError:
+                    callee_locks[alias] = {}
+            approved = callee_locks[alias].get(tid, {}).get("hash")
+            if approved != t2[tid].hash:
+                warnings.append(dict(kind="linked-unapproved", node=nid,
+                                     msg=f"calls {key}, which the {alias} project has "
+                                         + ("never approved" if approved is None else "changed since its approval")
+                                         + f": its English may still change; stamp {alias} first, or re-read this step "
+                                           f"after {alias} is approved"))
             now = contract_text(t2, tid)
             facts.setdefault(nid, {})[key] = now
             now_behind = behind_hashes(t2, tid)
@@ -422,6 +436,14 @@ def link_test_hash(tree: L.Tree, alias: str, linked, cmd: str, cwd: Path | None 
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:8]
 
 
+def project_test_hash(root: Path, cmd: str, files: list[str], cwd: Path | None = None) -> str:
+    parts = [cmd, command_files_hash(cmd, cwd)]
+    for f in sorted(files):
+        p = root / f
+        parts.append(f + ":" + (hashlib.sha1(p.read_bytes()).hexdigest() if p.exists() else "missing"))
+    return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:8]
+
+
 def build_keys(cfg: dict) -> set[str]:
     """The binding keys this project's builds answer to: each build's name and language."""
     return {k for b in cfg.get("builds", []) if b.get("tagged", True) is not False
@@ -462,6 +484,13 @@ def all_tests(cfg: dict, root: Path, tree: L.Tree) -> list[dict]:
                             facts += f"{sname}:{e.name} {S.members_fact(e)}\n"
             out.append(dict(key=f"capability {name} [{key}]", what=f"capability '{name}' ({key})", cmd=cmd,
                             hash=capability_test_hash(cap, key, cmd, cwd, facts), users=users.get(name, [])))
+    for t in cfg.get("tests") or []:
+        # The project's own behaviour tests (the slice's unit or integration tests). They test the code, so a
+        # change to any file of the builds they name (all tagged builds by default) makes their result stale.
+        names = t.get("builds") or [b["name"] for b in cfg.get("builds", []) if b.get("tagged", True) is not False]
+        files = [f for b in cfg.get("builds", []) if b["name"] in names for f in b.get("files", [])]
+        out.append(dict(key=f"tests {t['name']}", what=f"the project's tests '{t['name']}'", cmd=t["command"],
+                        hash=project_test_hash(root, t["command"], files, cwd), users=[]))
     linked = load_linked(cfg, root) if cfg.get("links") else {}
     for alias in (cfg.get("links") or {}):
         spec = link_spec(cfg, alias)
@@ -493,6 +522,10 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
             warnings.append(dict(kind="untested-link", node=alias,
                                  msg=f"{', '.join(callers)} call {alias}, but no test runs both sides together; "
                                      f"add \"test\": \"<command>\" to links.{alias}"))
+    if not cfg.get("tests") and any(b.get("tagged", True) is not False and b.get("steps") for b in cfg.get("builds", [])):
+        warnings.append(dict(kind="untested-project", node="tests",
+                             msg="no \"tests\" in ladder.json: nothing records that this code passes the slice's own "
+                                 "tests; add {\"name\": ..., \"command\": ...} for each (run from check_cwd)"))
     for t in tests:
         r = results.get(t["key"])
         if r is None:
@@ -500,8 +533,8 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
         elif r.get("hash") != t["hash"]:
             warnings.append(dict(kind="test-stale", node=t["key"],
                                  msg=f"what it tests changed since it last ran ({r.get('at', '?')}): the capability or link, its test "
-                                     f"files, or the schema of tables it touches (after a Ladder upgrade, possibly only "
-                                     f"how that is recorded); run `ladder test`"))
+                                     f"files, the code of the builds it tests, or the schema of tables it touches (after a "
+                                     f"Ladder upgrade, possibly only how that is recorded); run `ladder test`"))
         elif not r.get("ok"):
             problems.append(dict(kind="test-failed", node=t["key"],
                                  msg=f"failed when last run ({r.get('at', '?')}): {r.get('tail', '')[:600]}"))
@@ -534,19 +567,25 @@ def run_tests(pj: Path, only: list[str] | None = None) -> int:
     if only:
         tests = [t for t in tests if any(o in t["key"] for o in only)]
     if not tests:
-        print("no tests declared (capability `test:` lines, or \"test\" on a links entry)")
+        print("no tests declared (capability `test:` lines, \"test\" on a links entry, or the project's \"tests\")")
         return 0
     code = L.load_code(root)
     results = code.setdefault("@tests", {})
     cwd = root / cfg.get("check_cwd", ".")
     failed = 0
-    for t in tests:
-        print(f"{t['what']}: {t['cmd']}")
-        res = subprocess.run(t["cmd"], shell=True, cwd=cwd, capture_output=True, text=True)
-        tail = failure_lines(res.stdout + res.stderr)
-        ok = res.returncode == 0
+    ran: dict[str, tuple[bool, int, list[str]]] = {}   # one run per distinct command (round 9: one link test named
+    for t in tests:                                     # by five subjects started the API five times)
+        if t["cmd"] in ran:
+            ok, rc, tail = ran[t["cmd"]]
+            print(f"{t['what']}: same command as above, not run again")
+        else:
+            print(f"{t['what']}: {t['cmd']}")
+            res = subprocess.run(t["cmd"], shell=True, cwd=cwd, capture_output=True, text=True)
+            tail = failure_lines(res.stdout + res.stderr)
+            ok, rc = res.returncode == 0, res.returncode
+            ran[t["cmd"]] = (ok, rc, tail)
         failed += not ok
-        print(f"  {'ok' if ok else 'FAILED (exit ' + str(res.returncode) + ')'}")
+        print(f"  {'ok' if ok else 'FAILED (exit ' + str(rc) + ')'}")
         if not ok:
             print("    " + "\n    ".join(tail))
         results[t["key"]] = dict(hash=t["hash"], ok=ok, at=datetime.date.today().isoformat(),

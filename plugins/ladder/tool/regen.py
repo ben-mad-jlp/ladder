@@ -15,6 +15,7 @@ from __future__ import annotations
 import fnmatch
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -131,6 +132,8 @@ def context_text(build: dict, ids: list[str] | None = None, conventions: bool = 
             out += [f"=== Capabilities these steps use, with the binding for {build['name']} ({build['lang']}). "
                     "Use exactly this library, version and call; do not substitute another:"]
             out += [vocab[u].text_for(build) for u in sorted(wanted) if u in vocab] + [""]
+            if CTX["root"] is not None:
+                out.append(binding_files_text(CTX["root"], build, [vocab[u] for u in sorted(wanted) if u in vocab]))
     if CTX["root"] is not None and build.get("reads"):
         out.append(read_files_text(CTX["root"], build))
     if CTX.get("schemas") and tree is not None:
@@ -345,7 +348,9 @@ def build_prompt(build: dict, file_rel: str, lines: list[str], r: L.Region,
     if reason:
         parts += ["=== This region is being regenerated because the build or run FAILED with the errors "
                   "below. Fix the cause. If the fix needs a line outside this region (an import, include "
-                  "or declaration), request it with @add-to-support.", reason, ""]
+                  "or declaration), request it with @add-to-support. Keep to the capabilities' bindings: an "
+                  "error about a binding's call means the call is written wrong; never replace a binding with "
+                  "another library or a direct call to what it wraps.", reason, ""]
     for nid in changed:
         n = tree[nid]
         parts += [f"=== Step [{nid}] CHANGED. Before:", old_block(lock.get(nid)), "",
@@ -762,6 +767,10 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
     L.COMMENT_FOR_HIDDEN = L.COMMENT[b["lang"]]
     conv = conventions_text(b)
     keep = protected(root, b)
+    # --redo=IDS limits a blind run to the regions tagged with those steps (a parent's own lines only when the
+    # parent is named): adding steps to a stamped tree must not rewrite its approved neighbours. Copied now,
+    # because REDO also collects the regions this run rewrites.
+    asked = set(REDO)
     for f in b["files"]:
         fpath = root / f
         regions, _, lines, _ = L.parse_regions(fpath, b["lang"])
@@ -775,6 +784,10 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
         pending = todo_keys(regions, keys)
         parents = [k for r, k, i in zip(regions, keys, range(len(regions)))
                    if k and r.kind == "node" and i in has_child and all(in_scope(b, t) for t, _ in r.tags)]
+        if asked:
+            named = {k for r, k in zip(regions, keys) if k and r.kind == "node" and any(t in asked for t, _ in r.tags)}
+            pending = [k for k in pending if k in named]
+            parents = [k for k in parents if k in named]
         # deepest parents first, so an outer class is written around inner ones already rewritten
         depth = lambda i: 0 if regions[i].parent is None else 1 + depth(regions[i].parent)
         parents.sort(key=lambda k: -depth(keys.index(k)))
@@ -1179,6 +1192,49 @@ def tree_for_prompt(tree: dict, lang: str, b: dict | None = None) -> str:
             out.append(f"{pad}  (implemented in another file of this program; do not write it here, only call it)")
         out.append("")
     return "\n".join(out)
+
+
+BINDING_FILE_MAX_LINES = 300
+
+
+def binding_files_text(root: Path, build: dict, caps: list) -> str:
+    """The source of each "(in repository)" binding the steps use, so the generator calls what exists (round 9: it
+    wrote storageService.getItem for storageService.get, and the repair then imported another library). Files in the
+    build's own "files" or "reads" are shown elsewhere. A long file is cut to the declarations naming the binding's
+    calls, with a few lines after each."""
+    shown = {(root / f).resolve() for f in list(build.get("files", [])) + list(build.get("reads", []))}
+    bases = L.project_bases(CTX.get("cfg") or {}, root)
+    parts = []
+    for c in caps:
+        bind = c.binding_for(build)
+        if not bind:
+            continue
+        names = L.binding_call_names(bind[1])
+        for p in L.binding_files(bind[1], bases):
+            if p in shown:
+                continue
+            shown.add(p)
+            lines = p.read_text(errors="replace").splitlines()
+            rel = os.path.relpath(p, root)
+            if len(lines) <= BINDING_FILE_MAX_LINES:
+                parts += ["", f"=== {rel} (the binding of capability '{c.name}'; exists already, read only; call it as written here):",
+                          *lines]
+                continue
+            keep = set()
+            for i, l in enumerate(lines):
+                if any(re.search(r"\b" + re.escape(n) + r"\b", l) for n in names) and re.search(
+                        r"\b(export|public|def|function|class|interface|async|static|func|fn)\b", l):
+                    keep.update(range(max(0, i - 2), min(len(lines), i + 6)))
+            if keep:
+                body, last = [], -2
+                for i in sorted(keep):
+                    if i != last + 1:
+                        body.append("...")
+                    body.append(lines[i])
+                    last = i
+                parts += ["", f"=== {rel} (the binding of capability '{c.name}', the declarations it names; read only):",
+                          *body]
+    return "\n".join(parts)
 
 
 def read_files_text(root: Path, b: dict) -> str:

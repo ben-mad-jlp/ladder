@@ -40,7 +40,16 @@ English. Put files in `scenarios/` and list their names in ladder.json `compare.
 - Seams between trees: when a client tree `calls:` the API tree, also write one test that runs the
   real client code against the running API (a success, a failure, each error the client handles)
   and put it in the link's `"test"` in ladder.json. Replaying the API alone can't see what the
-  client's HTTP layer does with an answer.
+  client's HTTP layer does with an answer. A client that can talk to a real host (its default may be
+  production) gets a guard in that test: replace `fetch` before the client loads with one that refuses
+  every URL outside the test API, and fail at once when the test API's URL is missing.
+- One runner script per repository (reset the test data, start the API on 127.0.0.1, run one test file
+  of a given app, stop the API), taking the app folder, the reset command and the port as arguments, so
+  every area's link and behaviour tests use it rather than a copy.
+- The slice's own tests (the existing unit tests for those files, and behaviour tests you write for the
+  states the English describes) go in ladder.json `"tests"`, so `ladder test` runs and records them and
+  `check` sees when the code changed after they ran. A generated build that compiles can still use the
+  wrong library or answer `undefined` for `null`; in the trials only these tests caught it.
 
 ## 3. Record traces
 
@@ -100,7 +109,15 @@ Builds that exist only to be compared (the original before laddering, a mutant) 
   limit and one past it alongside the random ones.
 
 For an adopted system, record the existing build's traces *before* regenerating anything. They are
-the reference that later builds must match.
+the reference that later builds must match. Record it twice and add the second run as a build
+(`{"name": "original-2", "tagged": false, ...}`): identical runs show the scenarios and masks are
+deterministic. Every recording you want compared must be a build: tagged builds that share the
+reference's traces compare nothing, and `check` says "nothing was compared" and warns `traces-unused`
+for a folder no build names.
+
+Masks: a value the response carries twice (an incident id, and the same number inside its message)
+needs both a key mask and, for short values, a `--mask-text` pattern; text masks also apply when
+comparing, so adding one to a newer recording covers the older ones.
 
 ## 4. Compare and explain
 
@@ -114,6 +131,7 @@ waiting for a person's approval. For each difference, decide which kind it is, b
 | Difference | Fix |
 |---|---|
 | Generated code doesn't do what the English says | `ladder repair` or regenerate (ladder-generate) |
+| The intended change (the English was changed and stamped) | record the approved code as a build, then `ladder reference <ladder.json> --from=<build>`; the old reference moves to `traces/history/` |
 | The English allows both behaviors | tighten the English (ladder-write), then regenerate |
 | The reference itself is surprising | a `note: QUESTION:` for the person; don't copy or fix silently |
 | Library or environment difference (versions, decoder, collation) | pin it or record it in the vocabulary (`known:`); set `number_tolerance` only for real numeric noise |

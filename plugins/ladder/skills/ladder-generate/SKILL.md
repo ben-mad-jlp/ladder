@@ -54,7 +54,7 @@ Kotlin, Go, Rust, Swift and Dart; when no error line points into the build's fil
 
 If ladder.json sets `"check_command"` (`["npx", "tsc", "--noEmit"]`), `generate` builds after writing
 and retries once with the compile errors; `"format_command"` runs the formatter over every file the
-generator changed. `generate --out=<file>` writes somewhere else, to try a regeneration safely. When code regenerated in a scratch copy is copied back, run `ladder accept <ladder.json> --from=<scratch>/ladder.json` so the copied regions are not reported as hand-edited. Bring later English changes into the scratch copy with git as usual: what the scratch copy generated is kept in its local `.ladder/generated.json`, which a sync does not touch.
+generator changed. `generate --out=<file>` writes somewhere else, to try a regeneration safely. When code regenerated in a scratch copy is copied back, run `ladder accept <ladder.json> --from=<scratch>/ladder.json` so the copied regions are not reported as hand-edited. `accept` does not copy: copy the build files over first. A project with no stamp yet has no approved code, so copied code needs no accepting (`accept --from` says so). Bring later English changes into the scratch copy with git as usual: what the scratch copy generated is kept in its local `.ladder/generated.json`, which a sync does not touch.
 `repair` can open an `@support imports` region at the top of a file that has none when the fix is a
 missing import, and it repairs `@contract` regions (entities, DTOs) as well as step regions.
 
@@ -72,7 +72,14 @@ contract of the step they call in the other tree. When a step's English names an
 tree ("as [emp.7] says"), the prompt shows that step and the method that implements it, so the
 generator calls it rather than a similar-sounding method (round 5 found a blind regeneration calling
 `HasAuthorizationAsync` where `[emp.7]` is `HasAnyAuthorizationAsync`: identical answers, four fewer
-queries, only `--observe` saw it).
+queries, only `--observe` saw it). A step that uses an in-repository capability gets the binding's
+source file in its prompt, so it calls what exists; `check` warns `binding-not-called` when a build
+calls none of a binding's calls (round 9: `storageService.getItem` for `storageService.get`, then a
+repair that imported the storage library directly).
+
+**New steps in an approved tree.** `ladder regen --build=<name> --blind --redo=<new step ids>` rewrites
+only those steps' regions, so their neighbours' approved code stays. Without `--redo`, a blind run
+rewrites every region of the build.
 
 `regen` exits 1 if any region's reply was rejected (that region keeps its old code; the reason is
 printed and the prompt and reply are logged), 0 otherwise. `generate` writes only the steps in the

@@ -37,12 +37,17 @@ Commands
   ladder retag  <project.json> <STEP IDS> [--build=NAME]
                                    the English was reworded without changing behavior: update the
                                    markers' hashes instead of regenerating (a person's call)
+  ladder reference <project.json> --from=BUILD
+                                   an approved change of behaviour: BUILD's recording (made from the
+                                   approved code) becomes the comparison's reference; the old reference
+                                   traces move to traces/history/
   ladder accept <project.json> [--build=NAME] [STEP IDS] [--exports] [--from=SCRATCH/ladder.json]
                                    accept hand edits to regions: the English still describes them
                                    (regen and repair refuse to overwrite hand-edited regions unless
                                    given --discard-hand-edits)
                                    --from: accept regions copied from a scratch copy, when each is
-                                   exactly what that scratch project recorded as generated
+                                   exactly what that scratch project recorded as generated (copy the
+                                   build files over first; accept does not copy)
 
 check, hashes, stamp, view, export, init, adopt-check and replay never call an LLM: they are the
 mechanical checks around it. generate, regen and repair call the project's generator command:
@@ -263,6 +268,51 @@ class Capability:
             out.append(f"  {b[0]}: {b[1]}")
         out += [f"  known: {k}" for k in self.known] + [f"  note: {n}" for n in self.notes]
         return "\n".join(out)
+
+
+PATHLIKE_RE = re.compile(r"[\w.@-]+(?:/[\w.@-]+)+\.\w+|[\w.-]+\.(?:py|cs|ts|tsx|js|jsx|mjs|go|rs|java|kt|rb|php|cpp|cc|h|hpp|swift|dart)\b")
+CALL_KEYWORDS = {"await", "new", "return", "typeof", "sizeof", "if", "for", "foreach", "while", "switch", "catch",
+                 "using", "lock", "var", "let", "const", "function", "async", "def", "fn", "func", "throw", "yield"}
+CALL_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^<>()]*>)?\s*\(")
+
+
+def binding_parts(binding: str) -> tuple[str, str]:
+    """(where, call) of a binding line: "(in repository) src/x.ts on lib 1.2 | await x.get(key)"."""
+    where, _, call = binding.partition("|")
+    return where.strip(), call.strip()
+
+
+def binding_files(binding: str, bases: list[Path]) -> list[Path]:
+    """The source files an "(in repository)" binding names, resolved against the first base where each exists.
+    A binding for a published library or the platform names none."""
+    where, _ = binding_parts(binding)
+    if "(in repository)" not in where:
+        return []
+    out = []
+    for tok in PATHLIKE_RE.findall(where.replace("(in repository)", " ")):
+        for base in bases:
+            p = (base / tok).resolve()
+            if p.is_file():
+                if p not in out:
+                    out.append(p)
+                break
+    return out
+
+
+def binding_call_names(binding: str) -> set[str]:
+    """The names a binding's call part calls ("await storageService.get<T>(key)" -> {"get"}): code that uses the
+    capability calls at least one of them."""
+    _, call = binding_parts(binding)
+    return {m.group(1) for m in CALL_NAME_RE.finditer(call)} - CALL_KEYWORDS
+
+
+def project_bases(cfg: dict, root: Path) -> list[Path]:
+    """Where a binding's paths may be written from: the project folder, its check_cwd, and every folder above."""
+    bases = [root.resolve()]
+    if cfg.get("check_cwd"):
+        bases.append((root / cfg["check_cwd"]).resolve())
+    bases += list(root.resolve().parents)
+    return list(dict.fromkeys(bases))
 
 
 def parse_vocabulary(path: Path) -> dict[str, Capability]:
@@ -826,6 +876,18 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                     br["problems"].append(dict(kind="unbound-capability", node=ids[0],
                                                msg=f"capability '{name}' (used by {', '.join(ids)}) has no binding for {b['name']} / {b['lang']}"))
                     continue
+                # Only for code in this repository whose files resolve: a published library's binding is checked by
+                # its version and tests, and a binding naming a folder says too little to look for.
+                names = binding_call_names(bind[1]) if binding_files(bind[1], project_bases(cfg, root)) else set()
+                if names and b.get("tagged") is not False:
+                    text = "\n".join((root / f).read_text() for f in b["files"] if (root / f).exists())
+                    if not any(re.search(r"\b" + re.escape(n) + r"\s*(?:<[^<>()]*>)?\s*\(", text) for n in names):
+                        report["warnings"].append(dict(
+                            kind="binding-not-called", node=ids[0],
+                            msg=f"capability '{name}' (used by {', '.join(ids)}): no file of build '{b['name']}' calls "
+                                f"{', '.join(sorted(names))}, the calls its binding names. If these steps rely on it "
+                                f"without calling it (another build does), drop it from their uses:; otherwise the code "
+                                f"may call an API that does not exist or another library: regenerate those steps"))
                 was = vlock.get(name, {}).get("bindings", {}).get(bind[0])
                 if was and was != c.binding_hash(bind[0]):
                     br["problems"].append(dict(kind="binding-changed", node=ids[0],
@@ -844,6 +906,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
         report["builds"].append(br)
     report["compare"] = compare_runs(root, cfg, tree)
     report["warnings"] += replay_settings_warnings(root, cfg)
+    report["warnings"] += unused_trace_warnings(root, cfg)
     # Mutants (builds with "mutant": true) are broken on purpose: they must differ somewhere.
     mutants = {b["name"] for b in cfg["builds"] if b.get("mutant")}
     report["mutants"] = {}
@@ -877,6 +940,11 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
             or any(run.get("missing_reference") for run in report["compare"]))
     report["status"] = "problems" if real else ("awaiting-approval" if report["tree"] else "ok")
     report["compared"] = bool(report["compare"])
+    # Runs are configured but no build has its own traces to set against the reference's (every tagged build
+    # shares them): nothing was compared, so the result must not say the comparison is fine.
+    report["nothing_compared"] = bool(report["compare"]) and not any(run["builds"] for run in report["compare"])
+    if report["nothing_compared"]:
+        report["compared"] = False
     report["ok"] = report["status"] == "ok"
     return report
 
@@ -996,6 +1064,29 @@ def trace_exits(path: Path, order: list[str] | None = None,
     return out
 
 
+def recorded_mask_text(folder: Path) -> list[tuple[str, str]]:
+    """The --mask-text patterns a trace folder was recorded with (its .replay.json), as (pattern, replacement)."""
+    try:
+        meta = json.loads((folder / ".replay.json").read_text())
+    except (OSError, ValueError):
+        return []
+    out = []
+    for item in meta.get("mask_text", []):
+        pat, sep, rep_ = item.rpartition("=")
+        if sep and pat:
+            out.append((pat, rep_))
+    return out
+
+
+def apply_mask_text(value: str, patterns: list[tuple[str, str]]) -> str:
+    for pat, rep_ in patterns:
+        try:
+            value = re.sub(pat, rep_, value)
+        except re.error:
+            pass
+    return value
+
+
 def run_names(root: Path, c: dict, cfg: dict | None = None) -> list[str]:
     """compare.runs, with "*" meaning every trace the reference build has."""
     ref_b = next((x for x in (cfg or {}).get("builds", []) if x["name"] == c["reference"]), {})
@@ -1007,6 +1098,22 @@ def run_names(root: Path, c: dict, cfg: dict | None = None) -> list[str]:
         else:
             runs.append(r)
     return runs
+
+
+def unused_trace_warnings(root: Path, cfg: dict) -> list[dict]:
+    """Folders under traces/ holding recordings (*.jsonl) that no build's traces name: check never reads them,
+    so a recording made there (a second run, a regenerated build) is silently not compared."""
+    tdir = root / "traces"
+    if not cfg.get("compare") or not tdir.is_dir():
+        return []
+    named = {b.get("traces", b["name"]) for b in cfg.get("builds", [])}
+    out = []
+    for d in sorted(p for p in tdir.iterdir() if p.is_dir()):
+        if d.name not in named and any(d.glob("*.jsonl")):
+            out.append(dict(kind="traces-unused", node=f"traces/{d.name}",
+                            msg="recordings no build names, so they are never compared; add a build "
+                                f"{{\"name\": \"{d.name}\", \"tagged\": false, ...}} to compare them, or move them out of traces/"))
+    return out
 
 
 def replay_settings_warnings(root: Path, cfg: dict) -> list[dict]:
@@ -1040,7 +1147,7 @@ def replay_settings_warnings(root: Path, cfg: dict) -> list[dict]:
                                 f"the same settings before trusting the comparison"))
             continue
         diffs = [f"{k}: {want.get(k)} vs {got.get(k)}" for k in sorted(set(want) | set(got))
-                 if k != "recorded" and want.get(k) != got.get(k)]
+                 if k not in ("recorded", "mask_text") and want.get(k) != got.get(k)]   # mask_text: applied to both at compare
         if diffs:
             out.append(dict(kind="replay-settings", node=b["name"],
                             msg=f"recorded with different replay settings than {ref} (" + "; ".join(diffs)
@@ -1069,6 +1176,9 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
         ref_order: list[str] = []
         ref_labels: dict[str, list[str]] = {}
         ref_ex = trace_exits(ref_path, ref_order, ref_labels) if ref_path.exists() else {}
+        # Text masks either recording was made with apply to both sides now, so adding a pattern to the harness
+        # does not mean re-recording every older run (round 9: an incident number inside a message).
+        ref_patterns = recorded_mask_text(ref_path.parent)
         entry["missing_reference"] = not ref_path.exists()
         if tree:
             allowed = set(c.get("extra_steps", [])) | {"http"}
@@ -1085,29 +1195,35 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
                 continue
             order: list[str] = []
             ex = trace_exits(path, order)
+            pats = ref_patterns + [p for p in recorded_mask_text(path.parent) if p not in ref_patterns]
+            if pats:
+                ref_ex_b = {st: [apply_mask_text(v, pats) for v in vs] for st, vs in ref_ex.items()}
+                ex = {st: [apply_mask_text(v, pats) for v in vs] for st, vs in ex.items()}
+            else:
+                ref_ex_b = ref_ex
             rows = []
-            for step in ref_ex:
+            for step in ref_ex_b:
                 if step not in ex:
                     continue
                 note = ""
                 rl = rules.get(step)
                 step_tol = rl["tolerance"] if rl and rl["tolerance"] is not None else tol
                 if rl and rl["final_only"]:
-                    pairs = [(ref_ex[step][-1], ex[step][-1])]
+                    pairs = [(ref_ex_b[step][-1], ex[step][-1])]
                     note = "compared the final result only (compare: final result only)"
                 elif rl and rl["any_order"]:
-                    rs = sorted(apply_compare(v, rl) for v in ref_ex[step])
+                    rs = sorted(apply_compare(v, rl) for v in ref_ex_b[step])
                     vs = sorted(apply_compare(v, rl) for v in ex[step])
                     if len(rs) != len(vs):
                         note = f"{len(vs)} results here, {len(rs)} in {ref}"
                     pairs = list(zip(rs, vs)) if len(rs) == len(vs) else [("\n".join(rs), "\n".join(vs))]
-                elif len(ref_ex[step]) != len(ex[step]):
+                elif len(ref_ex_b[step]) != len(ex[step]):
                     # e.g. an optimized build opens one span per retry where the literal build
                     # opens one for the whole step: compare what the step finally handed back.
-                    note = f"{len(ex[step])} spans here, {len(ref_ex[step])} in {ref}; compared final values"
-                    pairs = [(ref_ex[step][-1], ex[step][-1])]
+                    note = f"{len(ex[step])} spans here, {len(ref_ex_b[step])} in {ref}; compared final values"
+                    pairs = [(ref_ex_b[step][-1], ex[step][-1])]
                 else:
-                    pairs = list(zip(ref_ex[step], ex[step]))
+                    pairs = list(zip(ref_ex_b[step], ex[step]))
                 if rl:
                     pairs = [(apply_compare(r, rl), apply_compare(v, rl)) for r, v in pairs]
                 results = [match_info(r, v, step_tol) for r, v in pairs]
@@ -1131,7 +1247,7 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
                     last = {st: i for i, st in enumerate(o)}
                     return [st for i, st in enumerate(o) if st not in free and st in other
                             and (st not in final or last[st] == i)]
-                a, bseq = seq(ref_order, ex), seq(order, ref_ex)
+                a, bseq = seq(ref_order, ex), seq(order, ref_ex_b)
                 if a != bseq:
                     i = next((k for k in range(min(len(a), len(bseq))) if a[k] != bseq[k]), min(len(a), len(bseq)))
                     show = lambda seq: " ".join(seq[max(0, i - 2): i + 3]) or "(end)"
@@ -1141,7 +1257,7 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
                                           f"there may answer earlier or later, mark it `compare: any timing`"))
             entry["builds"].append(dict(
                 build=b["name"], missing=False, rows=rows,
-                not_comparable=sorted(set(ref_ex) ^ set(ex)),
+                not_comparable=sorted(set(ref_ex_b) ^ set(ex)),
                 ok=all(r["status"] != "different" for r in rows)))
         out.append(entry)
     return out
@@ -1267,6 +1383,9 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
                         print(f"      ... {len(diffs) - len(shown_d)} more (ladder check --all-differences)")
                 if r.get("note"):
                     print(f"      ({r['note']})")
+    if any(not b["ok"] and not b["missing"] for run in rep.get("compare", []) for b in run["builds"]):
+        print("\n  If a difference is an approved change of behaviour, make the run recorded from the approved code the "
+              "reference: `ladder reference <ladder.json> --from=<build>` (the old reference moves to traces/history/).")
     if rep.get("mutants"):
         total = len(rep.get("compare", []))
         print("\nMutants (broken on purpose; each must differ somewhere)")
@@ -1289,7 +1408,11 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
                         "awaiting-approval": "awaiting approval (code and comparison are fine; "
                                              "a person must review the English, then `ladder stamp`)"}[status]
           .replace("code and comparison are fine", "code is fine" if not rep.get("compared", True) else "code and comparison are fine"))
-    if not rep.get("compared", True):
+    if rep.get("nothing_compared"):
+        print("note: nothing was compared: every build shares the reference's traces, so no other recording is "
+              "set against them; add each recording to compare as a build with its own traces "
+              "({\"name\": \"<folder under traces/>\", \"tagged\": false, ...})")
+    elif not rep.get("compared", True):
         print("note: no comparison runs are configured (compare.runs), so behavior was not checked")
 
 
@@ -1625,6 +1748,14 @@ def accept_from(root: Path, cfg: dict, src_pj: Path, build: str | None, ids: set
         print(f"still hand-edited  {r}  (differs from what {src_root} generated)")
     if keys:
         record_code(root, cfg, keys=keys)
+    if not keys and not refused:
+        if not any(v for k, v in load_code(root).items() if not k.startswith("@")):
+            print("nothing to accept: this project has no approved code recorded yet (no stamp), so code copied here "
+                  "is not a hand edit; check and stamp it as it is")
+        else:
+            print(f"nothing to accept: no region here differs from the approved code. `accept --from` does not copy: "
+                  f"copy the regenerated build files from {src_root} first, then run it again")
+        return 0
     return 0 if keys and not refused else 1
 
 
@@ -1666,6 +1797,34 @@ def build_view(pj: Path, out: Path) -> None:
     print(f"viewer -> {out}")
 
 
+def make_reference(pj: Path, src: str) -> int:
+    """After a reviewed, intended change of behaviour: the recording of build `src` (made from the approved code)
+    becomes the comparison's reference. The old reference traces move to traces/history/, so nothing is lost."""
+    import shutil
+    from datetime import datetime
+    cfg, root = json.loads(pj.read_text()), pj.parent
+    c = cfg.get("compare") or {}
+    if not c.get("reference"):
+        raise SystemExit("ladder reference: this project has no compare.reference")
+    folder = {b["name"]: b.get("traces", b["name"]) for b in cfg.get("builds", [])}
+    if src not in folder:
+        raise SystemExit(f"ladder reference: no build '{src}' (builds: {', '.join(folder)})")
+    ref_dir, src_dir = root / "traces" / folder.get(c["reference"], c["reference"]), root / "traces" / folder[src]
+    if src_dir == ref_dir:
+        raise SystemExit(f"ladder reference: build '{src}' already records into the reference's traces")
+    if not any(src_dir.glob("*.jsonl")):
+        raise SystemExit(f"ladder reference: traces/{folder[src]} has no recordings")
+    if ref_dir.exists():
+        dest = root / "traces" / "history" / f"{ref_dir.name}-{datetime.now():%Y%m%d-%H%M%S}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(ref_dir), str(dest))
+        print(f"moved   traces/{ref_dir.name} -> {dest.relative_to(root)}")
+    shutil.copytree(src_dir, ref_dir)
+    print(f"copied  traces/{src_dir.name} -> traces/{ref_dir.name} (the reference now)")
+    print("Other builds are now compared with this run: re-record any whose recording came from the old code.")
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -1689,6 +1848,11 @@ def main(argv: list[str]) -> int:
     if len(argv) >= 3 and argv[1] == "test":
         import ladder_links as K
         return K.run_tests(Path(argv[2]), [a for a in argv[3:] if not a.startswith("--")] or None)
+    if len(argv) >= 3 and argv[1] == "reference":
+        src = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--from=")), None)
+        if not src:
+            raise SystemExit("usage: ladder reference <ladder.json> --from=BUILD")
+        return make_reference(Path(argv[2]), src)
     if len(argv) >= 3 and argv[1] == "retag":
         return retag(Path(argv[2]), argv[3:])
     if len(argv) >= 3 and argv[1] in {"generate", "repair", "regen"}:
