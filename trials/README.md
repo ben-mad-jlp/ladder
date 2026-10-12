@@ -1,6 +1,9 @@
 # Trials
 
-Each trial runs Ladder on real code and reports what broke, so the tool can be fixed.
+Each trial runs Ladder on real code and reports what broke, so the tool can be fixed. The goal is to
+harden Ladder, not to make the trial's code work: the code is throwaway, and a report should say
+which problems are Ladder's and which are "not Ladder" (the code, its data, the environment). See
+`../CLAUDE.md`.
 
 ```
 trials/<trial>/HANDOFF.md   what the trial agent should do (written by us)

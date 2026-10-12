@@ -15,6 +15,7 @@ navigation; a prefix (`qbs:`) picks the schema when the name exists in more than
 from __future__ import annotations
 
 import difflib
+import fnmatch
 import hashlib
 import json
 import re
@@ -420,7 +421,7 @@ def other_writers(root: Path, cfg: dict, e: "Entity") -> list[str]:
     """file:line of source code in the repository, outside this project's builds, that creates rows of an
     entity: `new Dbo_Timeclock(` / `new Dbo_Timeclock {` and SQL `INSERT INTO [dbo].[TIMECLOCK]`.
     Test seeders and other services must set a new required column too, and Ladder can't see them.
-    Skips Ladder's own folders (.ladder/ logs, trial copies) and anything git ignores."""
+    Skips Ladder's own folders (.ladder/ logs), anything git ignores, and the project's "ignore" globs."""
     import subprocess
     top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if top.returncode != 0:
@@ -437,8 +438,10 @@ def other_writers(root: Path, cfg: dict, e: "Entity") -> list[str]:
     for line in res.stdout.splitlines():
         f, ln = line.split(":", 2)[:2]
         p = Path(f)
-        if p.suffix.lower() not in SOURCE_EXT or ".ladder" in p.parts or "trial" in p.parts:
+        if p.suffix.lower() not in SOURCE_EXT or ".ladder" in p.parts:
             continue
+        if any(fnmatch.fnmatch(f, g) for g in cfg.get("ignore", [])):
+            continue          # ladder.json "ignore": globs (from the repo root) of copies, vendored code
         if (top_dir / f).resolve() in own:
             continue
         out.append(f"{f}:{ln}")

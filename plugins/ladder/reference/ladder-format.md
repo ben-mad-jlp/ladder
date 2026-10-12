@@ -130,8 +130,8 @@ A step that never inserts says `writes: X (updates only)`, and new required colu
 neither does a required column with a default. When a new required column does flag an inserting
 step, `check` also lists code elsewhere in the repository that creates rows of that entity
 (`new Dbo_Timeclock {`, `INSERT INTO [dbo].[TIMECLOCK]`): tests, seeders and other services must set
-it too, and no step covers them (`other-writers`: source files only, skipping `.ladder/` logs,
-`trial/` copies and ignored files; past 10 places the full list goes to
+it too, and no step covers them (`other-writers`: source files only, skipping `.ladder/` logs, files git
+ignores and ladder.json's `"ignore"` globs (paths from the repository root, for copies or vendored code); past 10 places the full list goes to
 `.ladder/other-writers-<Entity>.txt`). A change seen only through a whole-table reference
 (`reads:` / `writes:`), in a column the step never names, is a warning (`schema-changed-table`), not an
 approval item; name the column with `[[Entity.Member]]` if the step relies on it. An attribute the old facts never carried
