@@ -38,6 +38,9 @@ ladder/<area>/api/ladder.json            tree api.ladder; build "api" (csharp)
 ladder/<area>/clients/ladder.json        tree clients.ladder; builds "web" and "mobile" (typescript)
 ```
 
+Set `"baseline"` in each ladder.json to the branch the work will merge into (`"origin/main"`), so
+`check` shows what a change touched even when nothing has been approved with `ladder stamp`.
+
 Link the two: in each ladder.json, `"links": {"api": {"project": "../api/ladder.json", "test":
 "<command>"}}` (and `"clients"` the other way), and give every client step that calls the API a
 `calls: api [api.1.1]` line. The `"test"` is a test that runs the real client code against the

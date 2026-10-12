@@ -73,6 +73,9 @@ def set_context(cfg: dict, root: Path, tree) -> None:
         CTX["lock"] = json.loads((root / "ladder.lock.json").read_text())
     except (OSError, ValueError):
         CTX["lock"] = {}
+    if not CTX["lock"] and cfg.get("baseline"):
+        # nothing approved yet: prompts show changed steps' wording as it was at the baseline
+        CTX["lock"] = L.baseline_lock(cfg, root, cfg["baseline"]) or {}
 
 
 def new_log_dir(root: Path, suffix: str = "") -> Path:
@@ -856,6 +859,7 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
 def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
     cfg, root, tree, lock, _ = L.load_project(pj)
     set_context(cfg, root, tree)
+    lock = lock or CTX["lock"]   # the baseline's wording when nothing is approved yet
     gen = cfg.get("generator", {}).get("command")
     if not gen and not dry_run:
         print("no generator.command in project file")
@@ -1048,6 +1052,7 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
     with the error text in the prompt. Errors inside @support regions are reported, not touched."""
     cfg, root, tree, lock, _ = L.load_project(pj)
     set_context(cfg, root, tree)
+    lock = lock or CTX["lock"]   # the baseline's wording when nothing is approved yet
     gen = cfg["generator"]["command"]
     b = next(x for x in cfg["builds"] if x["name"] == build_name)
     log_dir = new_log_dir(root, "-repair")
@@ -1196,6 +1201,7 @@ def generate(pj: Path, build_name: str, attempts: int = 2) -> int:
     """Write a build's file from scratch (for a new build or language)."""
     cfg, root, tree, lock, _ = L.load_project(pj)
     set_context(cfg, root, tree)
+    lock = lock or CTX["lock"]   # the baseline's wording when nothing is approved yet
     gen = cfg["generator"]["command"]
     b = next(x for x in cfg["builds"] if x["name"] == build_name)
     if len(b["files"]) != 1:

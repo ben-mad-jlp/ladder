@@ -471,6 +471,21 @@ def data_texts(tree) -> dict[str, str]:
     return out
 
 
+def baseline_lock(cfg: dict, root: Path, ref: str) -> dict | None:
+    """What a stamp at `ref` would have recorded for the tree's steps and data (None if the tree
+    is not in git at that ref)."""
+    import ladder_links as K
+    old = K.tree_at(cfg, root, ref)
+    if old is None:
+        return None
+    out = {n.id: {"hash": n.hash, "review_hash": n.review_hash,
+                  "parent_hash": old[n.parent].hash if n.parent else None,
+                  "text": n.own_text(), "compare": n.compare} for n in old.values()}
+    if data_texts(old):
+        out["@data"] = data_texts(old)
+    return out
+
+
 def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | None = None,
           links_since: str | None = None) -> dict:
     cfg, root, tree, lock, _ = load_project(pj)
@@ -478,6 +493,20 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
         ref = cfg.get("compare", {}).get("reference")
         cfg["builds"] = [b for b in cfg["builds"] if b["name"] in only_builds or b["name"] == ref]
     report = {"tree": [], "builds": []}
+    # Nothing approved yet? Compare with the project's baseline commit instead of a lock, so a review
+    # shows what changed, not every step as new. An explicit --since wins; a stamp always wins.
+    base = None
+    if not any(not k.startswith("@") for k in lock) and cfg.get("baseline") and not (schema_since or links_since):
+        base = cfg["baseline"]
+        old = baseline_lock(cfg, root, base)
+        if old is None:
+            report["tree"].append(dict(kind="baseline", node=base,
+                                       msg=f"\"baseline\": {base} is not a commit git knows here, or the tree did not exist "
+                                           f"there; every step shows as new (git fetch, or fix the ref)"))
+        else:
+            lock = old
+            schema_since = links_since = base
+            report["baseline"] = base
 
     # Tree review: what changed since the tree was last approved?
     for n in tree.values():
@@ -960,11 +989,15 @@ DIFF_LIMIT = 10
 def print_report(rep: dict, tree: dict[str, Node]) -> None:
     def where(p):
         return f"{p['file']}:{p['line']}  " if "file" in p else ""
-    print("Tree")
+    base = rep.get("baseline")
+    print("Tree" + (f" (nothing approved yet: compared with the baseline, {base})" if base else ""))
     if not rep["tree"]:
-        print("  ok: matches the last approved version")
+        print("  ok: " + (f"no changes since {base}" if base else "matches the last approved version"))
     for p in rep["tree"]:
-        print(f"  {p['kind']:<15} [{p['node']}] {p['msg']}")
+        msg = p["msg"]
+        if base:
+            msg = msg.replace("since last approval", f"since {base}").replace("since approval", f"since {base}")
+        print(f"  {p['kind']:<15} [{p['node']}] {msg}")
     for b in rep["builds"]:
         scope = b.get("scope")
         leaves = [n for n in tree.values() if n.is_leaf

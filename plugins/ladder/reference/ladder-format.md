@@ -321,6 +321,12 @@ program that reads a prompt on stdin and prints code; the default is Claude Code
 `note: DIFFERS: web ...; mobile ...` (two builds behave differently today), `note: DECISION: ...`
 (a choice made without the person; review before approving).
 
+**Before anything is approved**, set `"baseline": "origin/main"` (any git ref) in ladder.json.
+With no stamp, `check` compares the tree with the tree file at that commit instead: steps changed
+since then show as `edited`, schema and linked-step changes are measured from it (as with
+`--since`), and regeneration prompts show the baseline's wording as "Before". A stamp, once made,
+takes over; an explicit `--since` overrides the baseline for one run.
+
 `ladder stamp` records the current English (step hashes and text, data blocks and rules, vocabulary hashes) in
 `ladder.lock.json`. `ladder check` then reports steps edited since approval, steps whose parent
 changed, new and removed steps, data blocks or rules added, edited or removed, and steps whose
