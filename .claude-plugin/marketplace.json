@@ -1,0 +1,14 @@
+{
+  "name": "ladder",
+  "owner": {
+    "name": "Ben"
+  },
+  "description": "Ladder: write software behavior in plain English, generate tagged code from it, and verify the two match.",
+  "plugins": [
+    {
+      "name": "ladder",
+      "source": "./plugins/ladder",
+      "description": "Ladder: plain-English behavior, generated tagged code, and checks that the two match."
+    }
+  ]
+}

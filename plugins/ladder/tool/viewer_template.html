@@ -1,0 +1,499 @@
+<title>Ladder Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a working bench in three panes. English steps on the left, generated code in the
+   middle, a recorded run on the right. One color per leaf step ties all three together;
+   fused code shows the colors of every step it merged, as stripes. */
+:root {
+  --bg: #f3f5f6;
+  --panel: #ffffff;
+  --ink: #17212b;
+  --muted: #5d6b78;
+  --line: #d9dfe4;
+  --soft: #e9edf0;
+  --accent: #0a6c74;
+  --accent-soft: #d8eeef;
+  --ok: #1d7a46;
+  --warn: #a45d00;
+  --bad: #b3261e;
+  --s1: #2f6fd0; --s2: #8a4fc8; --s3: #c2410c; --s4: #0f8a6a; --s5: #b8860b;
+  --hl: #fff2c2;
+  --font-ui: "Schibsted Grotesk", "Segoe UI", system-ui, sans-serif;
+  --font-code: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1418; --panel: #161d23; --ink: #e3e9ee; --muted: #93a2ae; --line: #2a343c;
+    --soft: #1e272e; --accent: #5cc6cd; --accent-soft: #173539; --ok: #5ccf8d; --warn: #e3a248;
+    --bad: #f28b82; --s1: #6ea4f5; --s2: #b892ea; --s3: #f08a55; --s4: #4fd1a8; --s5: #e2bd52;
+    --hl: #3a3416; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1418; --panel: #161d23; --ink: #e3e9ee; --muted: #93a2ae; --line: #2a343c;
+  --soft: #1e272e; --accent: #5cc6cd; --accent-soft: #173539; --ok: #5ccf8d; --warn: #e3a248;
+  --bad: #f28b82; --s1: #6ea4f5; --s2: #b892ea; --s3: #f08a55; --s4: #4fd1a8; --s5: #e2bd52;
+  --hl: #3a3416; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font-ui); font-size: 14px; line-height: 1.45; }
+.wrap { padding-inline: 16px; padding-block: 16px 32px; max-width: 1600px; margin: 0 auto; display: grid; gap: 14px; }
+
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; }
+header h1 { font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+header .sub { color: var(--muted); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.chip { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); white-space: nowrap; }
+.chip.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.chip.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
+.chip.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
+
+.bench { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(0, 1.5fr) minmax(280px, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 1100px) { .bench { grid-template-columns: 1fr 1fr; } .trace-pane { grid-column: 1 / -1; } }
+@media (max-width: 720px) { .bench { grid-template-columns: 1fr; } }
+.pane { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-width: 0; display: flex; flex-direction: column; }
+.pane > h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
+.pane > h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: auto; }
+.scroll { overflow: auto; max-height: 72vh; }
+
+/* Steps */
+.tree { padding: 8px 6px 12px; display: grid; gap: 2px; }
+.node { display: grid; grid-template-columns: 4px 1fr; gap: 10px; padding: 7px 8px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; text-align: left; background: none; color: inherit; font: inherit; width: 100%; }
+.node:hover { background: var(--soft); }
+.node:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.node.sel { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.node.path { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }
+.node.live { box-shadow: inset 0 0 0 2px var(--accent); }
+.bar { border-radius: 2px; background: var(--line); }
+.node .top { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.nid { font-family: var(--font-code); font-size: 11px; color: var(--muted); }
+.ntitle { font-weight: 600; }
+.contract { margin-top: 4px; font-size: 12.5px; color: var(--muted); display: grid; gap: 1px; }
+.contract b { font-weight: 600; color: var(--ink); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 4px; }
+.how { margin: 4px 0 0; padding-left: 14px; font-size: 12.5px; }
+.how li::marker { color: var(--muted); }
+.note { font-size: 12px; color: var(--warn); margin-top: 3px; }
+.badges { display: flex; gap: 4px; margin-left: auto; }
+.badge { font-family: var(--font-code); font-size: 10px; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--line); color: var(--muted); }
+.badge.direct { background: var(--soft); color: var(--ink); }
+.badge.stale, .badge.missing { color: var(--bad); border-color: var(--bad); }
+
+/* Code */
+.tabs { display: flex; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.tab { font: inherit; font-size: 13px; padding: 6px 12px; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; background: none; color: var(--muted); cursor: pointer; margin-bottom: -1px; }
+.tab[aria-selected="true"] { background: var(--panel); color: var(--ink); border-color: var(--line); font-weight: 600; }
+.tab:focus-visible { outline: 2px solid var(--accent); }
+.tab .mode { font-size: 11px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+.reshape { font-size: 12.5px; color: var(--muted); padding: 8px 14px; border-bottom: 1px solid var(--line); }
+.code { font-family: var(--font-code); font-size: 12.5px; line-height: 1.6; min-width: max-content; padding-block: 6px; }
+.ln { display: grid; grid-template-columns: 6px 3.2em 1fr; cursor: pointer; }
+.ln:hover { background: var(--soft); }
+.ln .band { align-self: stretch; }
+.ln .num { color: var(--muted); text-align: right; padding-right: 12px; user-select: none; font-variant-numeric: tabular-nums; }
+.ln .src { white-space: pre; padding-right: 16px; }
+.ln.hit { background: var(--hl); }
+.ln.dim .src { opacity: 0.45; }
+.cm { color: var(--muted); }
+.tag { font-size: 11px; padding: 0 6px; border-radius: 4px; background: var(--soft); color: var(--accent); }
+.tag.support { color: var(--muted); }
+
+/* Trace */
+.tracebar { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); align-items: center; }
+select, .btn { font: inherit; font-size: 13px; padding: 5px 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+.btn { cursor: pointer; }
+.btn:hover { background: var(--soft); }
+.btn:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.pos { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+.events { padding: 6px 0; }
+.ev { display: grid; grid-template-columns: 4.4em 1fr; gap: 8px; padding: 4px 14px; cursor: pointer; font-size: 13px; }
+.ev:hover { background: var(--soft); }
+.ev.cur { background: var(--accent-soft); }
+.ev.past { opacity: 0.55; }
+.ev .ms { font-family: var(--font-code); font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; padding-top: 2px; }
+.ev .what { min-width: 0; overflow-wrap: anywhere; }
+.ev .arrow { font-family: var(--font-code); color: var(--muted); margin-right: 4px; }
+.ev .info { color: var(--muted); font-size: 12px; }
+.fused { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--warn); border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
+.compare { border-top: 1px solid var(--line); padding: 10px 14px 14px; }
+.compare h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 6px; font-weight: 600; }
+.compare p { margin: 0 0 8px; font-size: 12.5px; color: var(--muted); }
+.ctable { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.ctable td { padding: 4px 6px 4px 0; border-top: 1px solid var(--soft); vertical-align: top; }
+.ctable .nid { white-space: nowrap; }
+.same { color: var(--ok); font-weight: 600; }
+.diff { color: var(--bad); font-weight: 600; }
+.nc { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.ctable th { font-size: 11px; font-weight: 600; color: var(--muted); text-align: left; padding: 4px 8px 4px 0; white-space: nowrap; }
+.ctable th.playing { color: var(--accent); }
+.ctable td.same, .ctable td.close, .ctable td.diff, .ctable td.nc { white-space: nowrap; padding-right: 10px; font-size: 12px; }
+.close { color: var(--warn); font-weight: 600; }
+.refval { color: var(--muted); font-size: 12px; min-width: 14em; }
+.cdetails { margin: 8px 0 0; padding-left: 18px; font-size: 12.5px; display: grid; gap: 3px; }
+
+.problems { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; font-size: 13px; }
+.problems ul { margin: 6px 0 0; padding-left: 18px; }
+.problems li { margin: 2px 0; }
+.legend { color: var(--muted); font-size: 12.5px; max-width: 75ch; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .node, .ln, .ev { transition: background-color 120ms ease; }
+}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1 id="title">Ladder</h1>
+    <span class="sub">English steps, the code generated from them, and a recorded run</span>
+    <div class="chips" id="status"></div>
+  </header>
+  <p class="legend">Click a step to see the code that implements it. Click a line of code to see which step it came from. Play a recorded run to watch it move through the steps. Each colored band is one step; striped bands mark code where a build merged several steps into one.</p>
+
+  <div class="problems" id="problems" hidden></div>
+
+  <div class="bench">
+    <section class="pane" aria-label="Steps">
+      <h2>Steps <span class="hint" id="treehint"></span></h2>
+      <div class="scroll"><div class="tree" id="tree"></div></div>
+    </section>
+
+    <section class="pane" aria-label="Generated code">
+      <h2>Generated code <span class="hint" id="codehint">click a line</span></h2>
+      <div class="tabs" role="tablist" id="tabs"></div>
+      <div class="reshape" id="reshape" hidden></div>
+      <div class="scroll"><div class="code" id="code"></div></div>
+    </section>
+
+    <section class="pane trace-pane" aria-label="Recorded run">
+      <h2>Recorded run</h2>
+      <div class="tracebar">
+        <select id="traceSel" aria-label="Recorded run"></select>
+        <button class="btn" id="prev" aria-label="Previous event">◀</button>
+        <button class="btn" id="next" aria-label="Next event">▶</button>
+        <button class="btn" id="play">Play</button>
+        <span class="pos" id="pos"></span>
+      </div>
+      <div class="scroll" style="max-height: 46vh"><div class="events" id="events"></div></div>
+      <div class="compare" id="compare"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+const DATA = /*__LADDER_DATA__*/null;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const nodes = Object.fromEntries(DATA.tree.map((n) => [n.id, n]));
+const leaves = DATA.tree.filter((n) => !n.children.length);
+const colorOf = {};
+leaves.forEach((n, i) => { colorOf[n.id] = `var(--s${(i % 5) + 1})`; });
+
+const descendants = (id) => [id, ...nodes[id].children.flatMap(descendants)];
+const ancestors = (id) => { const out = []; let p = nodes[id] && nodes[id].parent; while (p) { out.push(p); p = nodes[p].parent; } return out; };
+const leafColors = (ids) => [...new Set(ids.flatMap((id) => nodes[id] ? descendants(id) : []).filter((id) => colorOf[id]).map((id) => colorOf[id]))];
+
+function bandStyle(region) {
+  if (!region) return "";
+  if (region.kind === "support") return "background: repeating-linear-gradient(0deg, var(--line) 0 3px, transparent 3px 6px)";
+  const direct = region.tags.filter((t) => colorOf[t]);
+  const cols = direct.length ? direct.map((t) => colorOf[t]) : [];
+  if (!cols.length) return "background: var(--line)";
+  if (cols.length === 1) return `background: ${cols[0]}`;
+  const stops = cols.map((c, i) => `${c} ${i * 6}px ${(i + 1) * 6}px`).join(", ");
+  return `background: repeating-linear-gradient(0deg, ${stops})`;
+}
+
+const state = { build: 0, sel: new Set(), live: null, trace: 0, cursor: -1, timer: null };
+
+/* ---------- header and problems ---------- */
+function renderStatus() {
+  const rep = DATA.report;
+  $("title").textContent = DATA.title;
+  const chips = [];
+  chips.push(rep.tree.length
+    ? `<span class="chip warn">${rep.tree.length} step change${rep.tree.length > 1 ? "s" : ""} to review</span>`
+    : `<span class="chip ok">Steps approved</span>`);
+  const badBuilds = rep.builds.filter((b) => b.problems.length);
+  badBuilds.forEach((b) => chips.push(`<span class="chip bad">${esc(b.name)}: ${b.problems.length} problem${b.problems.length > 1 ? "s" : ""}</span>`));
+  const goodCount = rep.builds.length - badBuilds.length;
+  if (goodCount) chips.push(`<span class="chip ok">${goodCount} build${goodCount > 1 ? "s" : ""} tagged and current</span>`);
+  if (rep.compare && rep.compare.length) {
+    const cells = rep.compare.flatMap((run) => run.builds);
+    const diff = cells.filter((b) => !b.ok).length;
+    const close = cells.filter((b) => b.ok && b.rows.some((r) => r.status === "close")).length;
+    chips.push(diff ? `<span class="chip bad">${diff} build run${diff > 1 ? "s" : ""} differ from ${esc(rep.compare[0].reference)}</span>`
+                    : `<span class="chip ok">All builds agree on ${rep.compare.length} runs</span>`);
+    if (close) chips.push(`<span class="chip warn">${close} within tolerance</span>`);
+  }
+  $("status").innerHTML = chips.join("");
+
+  const items = [...rep.tree.map((p) => `[${p.node}] ${p.msg}`),
+    ...rep.builds.flatMap((b) => b.problems.map((p) => `${b.name}: ${p.file ? p.file + ":" + p.line + " " : ""}${p.msg}`)),
+    ...(rep.compare || []).flatMap((run) => {
+      const bad = run.builds.filter((b) => !b.ok);
+      if (!bad.length) return [];
+      const leafDiffs = [...new Set(bad.flatMap((b) => b.rows.filter((r) => r.status === "different" && DATA.tree.find((n) => n.id === r.step && !n.children.length)).map((r) => r.step)))];
+      return [`${run.run.replace(/_/g, " ")}: ${bad.map((b) => b.build).join(", ")} disagree with ${run.reference}` +
+              (leafDiffs.length ? `, first at step ${leafDiffs[0]}` : "")];
+    })];
+  if (items.length) {
+    $("problems").hidden = false;
+    $("problems").innerHTML = `<strong>Needs attention</strong><ul>${items.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>`;
+  }
+}
+
+/* ---------- steps ---------- */
+function coverageFor(build, id) {
+  const cov = build.coverage[id] || [];
+  const stale = build.problems.some((p) => p.kind === "stale" && p.node === id);
+  const missing = build.problems.some((p) => p.kind === "missing" && p.node === id);
+  if (stale) return ["stale", "regenerate"];
+  if (missing) return ["missing", "no code"];
+  if (cov.length) return ["direct", ""];
+  return ["", "via sub-steps"];
+}
+const shortName = (b) => ({ python: "py", cpp: "c++", typescript: "ts", csharp: "c#" }[b.lang] || b.lang);
+
+function renderTree() {
+  $("tree").innerHTML = DATA.tree.map((n) => {
+    const bar = colorOf[n.id] ? `background:${colorOf[n.id]}` : "";
+    const badges = DATA.report.builds.map((b) => {
+      const [cls, why] = coverageFor(b, n.id);
+      return `<span class="badge ${cls}" title="${esc(b.name)}${why ? ": " + why : ": has its own tagged code"}">${shortName(b)}</span>`;
+    }).join("");
+    const contract = [["in", n.inputs], ["out", n.outputs], ["effects", n.effects]]
+      .filter(([, v]) => v).map(([k, v]) => `<div><b>${k}</b>${esc(v)}</div>`).join("");
+    const how = n.steps.length ? `<ul class="how">${n.steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>` : "";
+    const notes = n.notes.map((t) => `<div class="note">${esc(t)}</div>`).join("");
+    return `<button class="node" id="node-${esc(n.id)}" data-id="${esc(n.id)}" style="margin-left:${n.depth * 16}px; width:calc(100% - ${n.depth * 16}px)">
+      <span class="bar" style="${bar}"></span>
+      <span><span class="top"><span class="nid">${esc(n.id)}</span><span class="ntitle">${esc(n.title)}</span><span class="badges">${badges}</span></span>
+      <span class="contract">${contract}</span>${how}${notes}</span></button>`;
+  }).join("");
+  $("tree").querySelectorAll(".node").forEach((el) => el.addEventListener("click", () => select([el.dataset.id], "tree")));
+}
+
+/* ---------- code ---------- */
+function renderTabs() {
+  $("tabs").innerHTML = DATA.builds.map((b, i) =>
+    `<button class="tab" role="tab" id="tab-${i}" aria-selected="${i === state.build}" data-i="${i}" title="${esc(b.name)}">${esc({ python: "Python", cpp: "C++", csharp: "C#", typescript: "TypeScript" }[b.lang] || b.lang)}<span class="mode">${esc(b.mode)}</span></button>`).join("");
+  $("tabs").querySelectorAll(".tab").forEach((el) => el.addEventListener("click", () => {
+    state.build = +el.dataset.i; renderTabs(); renderCode(); applyHighlight(true);
+  }));
+}
+
+function regionChain(file, idx) {
+  const out = []; let i = idx;
+  while (i !== null && i !== undefined) { out.push(file.regions[i]); i = file.regions[i].parent; }
+  return out;
+}
+function lineTags(file, lineIdx) {
+  const own = file.owner[lineIdx];
+  if (own === null || own === undefined) return { tags: [], region: null };
+  const chain = regionChain(file, own);
+  const nodeRegion = chain.find((r) => r.kind === "node");
+  return { tags: chain[0].kind === "support" ? [] : (nodeRegion ? nodeRegion.tags : []), region: chain[0] };
+}
+
+function fmtLine(raw, lang) {
+  const c = lang === "python" ? "#" : "//";
+  const t = raw.trimStart();
+  const m = t.match(new RegExp("^" + c.replace(/\//g, "\\/") + "\\s*@(node|support|end)\\b(.*)$"));
+  if (m) {
+    const pad = esc(raw.slice(0, raw.length - t.length));
+    if (m[1] === "end") return `${pad}<span class="cm">${esc(c)} @end</span>`;
+    if (m[1] === "support") return `${pad}<span class="cm">${esc(c)} </span><span class="tag support">support · ${esc(m[2].trim())}</span>`;
+    const ids = m[2].trim().split(/\s+/).map((tok) => tok.split("@")[0]);
+    return `${pad}<span class="cm">${esc(c)} </span><span class="tag">${esc(ids.join(" + "))}</span>`;
+  }
+  const at = raw.indexOf(c);
+  if (at >= 0 && !raw.slice(0, at).includes('"') && !raw.slice(0, at).includes("'")) {
+    return esc(raw.slice(0, at)) + `<span class="cm">${esc(raw.slice(at))}</span>`;
+  }
+  return esc(raw);
+}
+
+function renderCode() {
+  const b = DATA.builds[state.build];
+  const fusedRegions = b.files.flatMap((f) => f.regions.filter((r) => r.kind === "node" && r.tags.filter((t) => colorOf[t]).length > 1));
+  if (fusedRegions.length) {
+    $("reshape").hidden = false;
+    $("reshape").innerHTML = "This build merged steps: " + fusedRegions.map((r) =>
+      `<strong>${esc(r.tags.filter((t) => colorOf[t]).join(" + "))}</strong>`).join(", ") +
+      ". Striped bands show the merged code; it is reviewed against all of those steps together.";
+  } else { $("reshape").hidden = true; }
+  if (b.uses) {
+    $("reshape").hidden = false;
+    $("reshape").innerHTML = ($("reshape").innerHTML && fusedRegions.length ? $("reshape").innerHTML + "<br>" : "") +
+      `Libraries: ${esc(b.uses)}`;
+  }
+
+  $("code").innerHTML = b.files.map((f, fi) => f.lines.map((raw, i) => {
+    const { region } = lineTags(f, i);
+    return `<div class="ln" data-f="${fi}" data-i="${i}"><span class="band" style="${bandStyle(region)}"></span><span class="num">${i + 1}</span><span class="src">${fmtLine(raw, b.lang) || " "}</span></div>`;
+  }).join("")).join("");
+  $("code").querySelectorAll(".ln").forEach((el) => el.addEventListener("click", () => {
+    const f = DATA.builds[state.build].files[+el.dataset.f];
+    const { tags, region } = lineTags(f, +el.dataset.i);
+    if (region && region.kind === "support") {
+      $("codehint").textContent = "support code: not tied to a step";
+      select([], "code");
+      return;
+    }
+    $("codehint").textContent = tags.length ? "from " + tags.join(" + ") : "untagged";
+    select(tags, "code");
+  }));
+}
+
+/* ---------- selection ---------- */
+function select(ids, from) {
+  state.sel = new Set(ids);
+  if (from !== "trace") state.live = null;
+  applyHighlight(from !== "code");
+}
+
+function applyHighlight(scrollCode) {
+  const sel = [...state.sel];
+  const path = new Set(sel.flatMap(ancestors));
+  document.querySelectorAll(".node").forEach((el) => {
+    const id = el.dataset.id;
+    el.classList.toggle("sel", state.sel.has(id));
+    el.classList.toggle("path", !state.sel.has(id) && path.has(id));
+    el.classList.toggle("live", !!state.live && state.live.includes(id));
+  });
+  $("treehint").textContent = sel.length ? sel.join(" + ") : "click a step";
+
+  const want = new Set(sel.flatMap((id) => nodes[id] ? descendants(id) : []));
+  const b = DATA.builds[state.build];
+  let first = null;
+  document.querySelectorAll("#code .ln").forEach((el) => {
+    const f = b.files[+el.dataset.f];
+    const { tags } = lineTags(f, +el.dataset.i);
+    const hit = want.size > 0 && tags.some((t) => want.has(t));
+    el.classList.toggle("hit", hit);
+    el.classList.toggle("dim", want.size > 0 && !hit);
+    if (hit && !first) first = el;
+  });
+  if (scrollCode && first) {
+    const box = first.closest(".scroll");
+    box.scrollTo({ top: first.offsetTop - box.offsetTop - 40, behavior: (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches) ? "auto" : "smooth" });
+  }
+}
+
+/* ---------- traces ---------- */
+const allTraces = DATA.builds.flatMap((b, bi) => b.traces.map((t) => ({ ...t, build: bi })));
+const pretty = (name) => name.replace(/_/g, " ");
+
+function renderTraceSelect() {
+  $("traceSel").innerHTML = allTraces.map((t, i) =>
+    `<option value="${i}">${esc(DATA.builds[t.build].name)} · ${esc(pretty(t.name))}</option>`).join("");
+  const firstInteresting = allTraces.findIndex((t) => /blurry/.test(t.name));
+  state.trace = firstInteresting >= 0 ? firstInteresting : 0;
+  $("traceSel").value = String(state.trace);
+  $("traceSel").addEventListener("change", () => { stop(); state.trace = +$("traceSel").value; state.cursor = -1; renderTrace(); });
+}
+
+function stepTitle(id) {
+  const ids = id.split("+");
+  return ids.map((x) => nodes[x] ? nodes[x].title : x).join(" + ");
+}
+
+function renderTrace() {
+  const t = allTraces[state.trace];
+  if (!t) { $("events").innerHTML = `<p style="padding:10px 14px;color:var(--muted)">No recorded runs yet.</p>`; return; }
+  let depth = 0;
+  $("events").innerHTML = t.events.map((e, i) => {
+    if (e.ev === "exit") depth--;
+    const d = Math.max(depth, 0);
+    if (e.ev === "enter") depth++;
+    const fused = e.step.includes("+") ? `<span class="fused">merged</span>` : "";
+    const line = e.ev === "enter"
+      ? `<span class="arrow">→</span>${esc(stepTitle(e.step))}${fused}<div class="info">given ${esc(e.info)}</div>`
+      : `<span class="arrow">←</span><span class="info">${esc(e.step)} returned ${esc(e.info)}</span>`;
+    return `<div class="ev" data-i="${i}"><span class="ms">${e.ms.toFixed(2)} ms</span><span class="what" style="padding-left:${d * 14}px">${line}</span></div>`;
+  }).join("");
+  $("events").querySelectorAll(".ev").forEach((el) => el.addEventListener("click", () => { stop(); goto(+el.dataset.i); }));
+  renderCompare();
+  goto(state.cursor);
+}
+
+function goto(i) {
+  const t = allTraces[state.trace];
+  state.cursor = Math.max(-1, Math.min(i, t.events.length - 1));
+  document.querySelectorAll("#events .ev").forEach((el, k) => {
+    el.classList.toggle("cur", k === state.cursor);
+    el.classList.toggle("past", k < state.cursor);
+  });
+  $("pos").textContent = `${state.cursor + 1} / ${t.events.length}`;
+  if (state.cursor >= 0) {
+    const e = t.events[state.cursor];
+    const ids = e.step.split("+");
+    if (state.build !== t.build) { state.build = t.build; renderTabs(); renderCode(); }
+    state.live = ids;
+    select(ids, "trace");
+    const cur = document.querySelector("#events .ev.cur");
+    if (cur) { const box = cur.closest(".scroll"); if (cur.offsetTop - box.offsetTop > box.clientHeight - 40 || cur.offsetTop < box.scrollTop + box.offsetTop) box.scrollTop = cur.offsetTop - box.offsetTop - 60; }
+  } else { state.live = null; select([], "trace"); }
+}
+
+function stop() { if (state.timer) { clearInterval(state.timer); state.timer = null; $("play").textContent = "Play"; } }
+$("prev").addEventListener("click", () => { stop(); goto(state.cursor - 1); });
+$("next").addEventListener("click", () => { stop(); goto(state.cursor + 1); });
+$("play").addEventListener("click", () => {
+  if (state.timer) return stop();
+  const t = allTraces[state.trace];
+  if (state.cursor >= t.events.length - 1) goto(-1);
+  $("play").textContent = "Pause";
+  state.timer = setInterval(() => {
+    if (state.cursor >= allTraces[state.trace].events.length - 1) return stop();
+    goto(state.cursor + 1);
+  }, 700);
+});
+
+const buildLabel = (name) => {
+  const b = DATA.builds.find((x) => x.name === name);
+  if (!b) return name;
+  const lang = { python: "Python", cpp: "C++", csharp: "C#", typescript: "TS" }[b.lang] || b.lang;
+  return b.mode === "optimized" ? lang + " opt" : lang;
+};
+
+function renderCompare() {
+  const t = allTraces[state.trace];
+  const run = (DATA.report.compare || []).find((c) => c.run === t.name);
+  if (!run) { $("compare").innerHTML = ""; return; }
+  const playing = DATA.builds[t.build].name;
+  const order = DATA.tree.map((n) => n.id);
+  const stepsSeen = new Set(run.builds.flatMap((b) => b.rows.map((r) => r.step)));
+  const steps = order.filter((id) => stepsSeen.has(id));
+  const refVal = {};
+  run.builds.forEach((b) => b.rows.forEach((r) => { refVal[r.step] = r.ref; }));
+  const th = (name) => `<th scope="col" class="${name === playing ? "playing" : ""}">${esc(buildLabel(name))}</th>`;
+  const cell = (b, step) => {
+    if (b.missing) return `<td class="nc">no run</td>`;
+    const r = b.rows.find((x) => x.step === step);
+    if (!r) return `<td class="nc" title="This build has no separate boundary here (merged or skipped)">—</td>`;
+    if (r.status === "same") return `<td class="same" title="${esc(r.val)}">same</td>`;
+    if (r.status === "close") return `<td class="close" title="${esc(r.val)}">±${r.worst}</td>`;
+    return `<td class="diff" title="${esc(r.val)}">differs</td>`;
+  };
+  const short = (s) => (s && s.length > 90 ? s.slice(0, 87) + "…" : s || "");
+  const rows = steps.map((step) => `<tr><td class="nid">${esc(step)}</td>${run.builds.map((b) => cell(b, step)).join("")}<td class="refval" title="${esc(refVal[step] || "")}">${esc(short(refVal[step]))}</td></tr>`).join("");
+  const details = run.builds.flatMap((b) => b.rows.filter((r) => r.status !== "same").map((r) =>
+    `<li><strong>${esc(buildLabel(b.build))}</strong> at <span class="nid">${esc(r.step)}</span>: ${esc(r.val.length > 160 ? r.val.slice(0, 157) + "…" : r.val)} <span class="nc">vs</span> ${esc(r.ref.length > 160 ? r.ref.slice(0, 157) + "…" : r.ref)}${r.note ? ` <span class="nc">(${esc(r.note)})</span>` : ""}</li>`));
+  $("compare").innerHTML = `<h3>Same frame, every build</h3>
+    <p>Each build ran on this frame. Every cell compares what a step handed back with ${esc(buildLabel(run.reference))} (the reference). ± means only numbers differ, by at most ${run.tolerance}.</p>
+    <div style="overflow-x:auto"><table class="ctable"><thead><tr><th scope="col">step</th>${run.builds.map((b) => th(b.build)).join("")}<th scope="col" class="${run.reference === playing ? "playing" : ""}">${esc(buildLabel(run.reference))} value</th></tr></thead><tbody>${rows}</tbody></table></div>
+    ${details.length ? `<ul class="cdetails">${details.join("")}</ul>` : ""}`;
+}
+
+renderStatus();
+renderTree();
+renderTabs();
+renderCode();
+renderTraceSelect();
+state.cursor = -1;
+renderTrace();
+goto(8);
+</script>
