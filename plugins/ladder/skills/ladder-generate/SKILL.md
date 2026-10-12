@@ -58,7 +58,11 @@ would drop everything outside it. It warns when a region's code appears word for
 conventions: the generator could copy it rather than write it from the English. Replace such an
 example in the profile with a neutral one unless the profile fixes that line on purpose (a public
 signature). Every region prompt includes the build profile, and, for steps with `calls:`, the
-contract of the step they call in the other tree.
+contract of the step they call in the other tree. When a step's English names another step of the
+tree ("as [emp.7] says"), the prompt shows that step and the method that implements it, so the
+generator calls it rather than a similar-sounding method (round 5 found a blind regeneration calling
+`HasAuthorizationAsync` where `[emp.7]` is `HasAnyAuthorizationAsync`: identical answers, four fewer
+queries, only `--observe` saw it).
 
 `regen` exits 1 if any region's reply was rejected (that region keeps its old code; the reason is
 printed and the prompt and reply are logged), 0 otherwise. `generate` writes only the steps in the
