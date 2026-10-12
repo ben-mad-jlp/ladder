@@ -65,7 +65,15 @@ capability save data
 - `known:` records quirks a generator or reviewer must not miss: transactional behavior, case
   sensitivity of SQL Server comparisons, retry semantics, timezone of returned dates, a decoder
   that reads some inputs another binding cannot.
-- `check:` says how to verify the binding behaves as the in/out say (usually a scenario).
+- `check:` says in words how to verify the binding behaves as the in/out say.
+- `test: <binding key> | <command>` runs that check against the real library: a small test that
+  calls the binding and asserts every `known:` line (a 401's message, the order of results, what
+  comes back for an empty input). Write one for every capability the steps rely on, and run
+  `ladder test <ladder.json>`. Do not trust your own reading of a library's source: in a trial, an
+  HTTP client entry said an error's message was the response body's message; it passed `check`,
+  generation followed it, it typechecked, and only an end-to-end run showed the client replaces every
+  401's message with "Unauthorized". `check` reports capabilities with no test, tests never run,
+  tests whose capability changed since they ran, and failed tests.
 
 ## 4. Connect it to the tree
 
@@ -79,7 +87,7 @@ yet: add one, or say clearly why that build does not need it.
 To upgrade or replace a library, change only its binding line(s), then run `ladder check`. Once
 the vocabulary has been approved (`ladder stamp`), a changed binding flags exactly the builds and
 steps that depend on it (`binding-changed`), and `ladder regen <ladder.json> --redo=<ids>` regenerates
-them. Re-run that capability's `check:` scenarios before approving.
+them. Run `ladder test` (the changed binding's tests show as `test-stale` until you do) before approving.
 
 ## Hand back
 

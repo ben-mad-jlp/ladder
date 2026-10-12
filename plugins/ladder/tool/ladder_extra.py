@@ -113,12 +113,55 @@ def adopt_check(argv: list[str]) -> int:
 # ---------------------------------------------------------------- replay
 
 
-def _mask(v, keys: set[str]):
+def _mask_one(v, kind: str, sent_at):
+    """How a masked value is written to the trace. value: hidden entirely. presence: only whether it
+    is null, empty or set (and its JSON type). time: a date-time made relative to when the request
+    was sent, rounded to the minute (time:s for seconds), e.g. "now+120m"."""
+    if kind == "presence":
+        if v is None:
+            return "<null>"
+        if v in ("", [], {}):
+            return "<empty>"
+        names = {str: "text", bool: "yes/no", int: "number", float: "number", dict: "object", list: "list"}
+        return f"<{names.get(type(v), 'set')}>"
+    if kind.startswith("time"):
+        from datetime import datetime, timezone
+        if not isinstance(v, str):
+            return "<null>" if v is None else "<not a time>"
+        try:
+            t = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return "<not a time>"
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        secs = (t - sent_at).total_seconds()
+        if kind == "time:s":
+            return f"now{'+' if secs >= 0 else '-'}{abs(round(secs))}s"
+        return f"now{'+' if secs >= 0 else '-'}{abs(round(secs / 60))}m"
+    return "<masked>"
+
+
+def _mask(v, keys, sent_at=None):
+    """keys: a set of names (hidden entirely) or {name: kind}."""
+    kinds = keys if isinstance(keys, dict) else {k: "value" for k in keys}
     if isinstance(v, dict):
-        return {k: ("<masked>" if k in keys else _mask(x, keys)) for k, x in v.items()}
+        return {k: (_mask_one(x, kinds[k], sent_at) if k in kinds else _mask(x, kinds, sent_at)) for k, x in v.items()}
     if isinstance(v, list):
-        return [_mask(x, keys) for x in v]
+        return [_mask(x, kinds, sent_at) for x in v]
     return v
+
+
+def _parse_mask(text: str) -> dict:
+    out = {}
+    for item in (x.strip() for x in text.split(",")):
+        if not item:
+            continue
+        name, _, kind = item.partition(":")
+        kind = kind or "value"
+        if kind not in ("value", "presence", "time", "time:s"):
+            raise SystemExit(f"replay: --mask {item}: kinds are value (default), presence, time, time:s")
+        out[name] = kind
+    return out
 
 
 JWT_RE = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$")
@@ -198,6 +241,8 @@ def _subst(v, env: dict, saved: dict):
 def _pick(result: dict, path: str):
     """A value from a result by path: status, body.a.b.0, header.location, cookie.refresh_token."""
     head, _, rest = path.partition(".")
+    if head not in ("status", "header", "cookie", "body"):
+        head, rest = "body", path           # a bare path means the body: "accessToken" = "body.accessToken"
     if head == "status":
         return result["status"]
     if head in ("header", "cookie"):
@@ -219,19 +264,24 @@ def replay(argv: list[str]) -> int:
     {status, body} plus any recorded headers and cookies. Comparing these traces across builds is
     a black-box check that needs no changes to the service's code.
 
-    Per request: "wait" (seconds to sleep first), "headers", "body", "save" ({"name": "body.token"}
-    for later {{var:name}}), "record_headers" (names). Anywhere in a request: {{env:NAME}} for
+    Per request: "wait" (seconds to sleep first; a {"wait": n} entry alone just pauses), "headers",
+    "body", "save" ({"name": "body.token"} or just "token" for later {{var:name}}), "record_headers"
+    (names). A scenario may list "mask" entries too. --mask name[:kind]: value hides it, presence keeps
+    null / empty / set, time keeps it relative to when the request was sent. --observe runs a command
+    after each request (e.g. a SQL command count) and compares what it prints. Anywhere in a request: {{env:NAME}} for
     secrets kept out of scenario files, {{var:name}}, {{now}} / {{now+30s}}. Cookies are kept per
     scenario like a browser and every Set-Cookie is recorded by name and attributes."""
     import http.cookiejar
     import time as _time
     if not argv or argv[0].startswith("--"):
         raise SystemExit("usage: ladder replay <scenario.json|folder> --base URL --out traces/<build> "
-                         "[--mask a,b] [--header 'K: V'] [--before-each 'command'] [--record-headers a,b] [--jwt]")
+                         "[--mask a,b:presence,c:time] [--header 'K: V'] [--before-each 'command'] [--record-headers a,b] [--jwt] "
+                         "[--observe 'command']")
     src = Path(argv[0])
     base = opt(argv, "--base", required=True).rstrip("/")
     out = Path(opt(argv, "--out", required=True))
-    mask = set(opt(argv, "--mask", default="").split(",")) - {""}
+    mask = _parse_mask(opt(argv, "--mask", default=""))
+    observe = opt(argv, "--observe")
     before_each = opt(argv, "--before-each")
     record_default = [h.strip().lower() for h in opt(argv, "--record-headers", default="").split(",") if h.strip()]
     jwt_on = "--jwt" in argv
@@ -254,9 +304,14 @@ def replay(argv: list[str]) -> int:
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar),
                                              urllib.request.HTTPRedirectHandler())
         events = []
+        mask_f = {**mask, **_parse_mask(",".join(sc.get("mask", [])))}
         for raw_r in sc["requests"]:
             if raw_r.get("wait"):
                 _time.sleep(float(raw_r["wait"]))
+            if "path" not in raw_r:
+                continue        # {"wait": 32} on its own: a pause between requests, nothing traced
+            from datetime import datetime, timezone
+            sent_at = datetime.now(timezone.utc)
             r = _subst({k: v for k, v in raw_r.items() if k != "save"}, env, saved)
             step = r.get("step", "http")
             data = None if "body" not in r else json.dumps(r["body"]).encode()
@@ -298,13 +353,19 @@ def replay(argv: list[str]) -> int:
                     result["set_cookie"] = {k: (v if jwt_on and isinstance(v["value"], dict) else
                                                 {"value": "<set>" if v["value"] else "<empty>", "attrs": v["attrs"]})
                                             for k, v in set_cookies.items()}
-            result = _mask(result, mask)
+            if observe:
+                # e.g. count the SQL commands this request ran; whatever the command prints is compared too
+                ob = subprocess.run(observe, shell=True, capture_output=True, text=True)
+                if ob.returncode != 0:
+                    raise SystemExit(f"replay: --observe command failed ({ob.returncode}): {ob.stderr.strip()[:200]}")
+                result["observed"] = ob.stdout.strip()
+            result = _mask(result, mask_f, sent_at)
             info = f"{raw_r['method']} {raw_r['path']}"
             events.append({"step": step, "ev": "enter", "ms": 0, "info": info})
             events.append({"step": step, "ev": "exit", "ms": 0, "info": f"{status}",
                            "data": json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)})
         (out / f"{f.stem}.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
-        print(f"  {f.stem}: {len(sc['requests'])} requests -> {out / (f.stem + '.jsonl')}")
+        print(f"  {f.stem}: {len(events) // 2} requests -> {out / (f.stem + '.jsonl')}")
     return 0
 
 
@@ -404,13 +465,13 @@ def export(argv: list[str]) -> int:
         "title": cfg.get("title"),
         "contractHash": L.contract_hash(tree),
         "steps": [dict(id=n.id, title=n.title, parent=n.parent, children=n.children, depth=n.depth,
-                       inputs=n.inputs, outputs=n.outputs, effects=n.effects, how=n.steps, notes=n.notes, compare=n.compare, reads=n.reads, writes=n.writes,
+                       inputs=n.inputs, outputs=n.outputs, effects=n.effects, how=n.steps, notes=n.notes, compare=n.compare, reads=n.reads, writes=n.writes, calls=n.calls,
                        uses=n.uses, hash=n.hash, line=n.line) for n in tree.values()],
         "data": [dict(name=d.name, fields=[dict(name=k, description=v) for k, v in d.fields], rules=d.rules)
                  for d in tree.data.values()],
         "rules": tree.rules,
         "vocabulary": [dict(name=c.name, inputs=c.inputs, outputs=c.outputs, bindings=c.bindings,
-                            known=c.known, checks=c.checks) for c in vocab.values()],
+                            known=c.known, checks=c.checks, tests=c.tests) for c in vocab.values()],
     }
     text = json.dumps(data, indent=2)
     if len(argv) > 1:

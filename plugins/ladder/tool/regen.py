@@ -60,6 +60,7 @@ CTX: dict = {"tree": None, "vocab": None, "root": None, "lock": {}, "schemas": {
 
 def set_context(cfg: dict, root: Path, tree) -> None:
     CTX["tree"] = tree
+    CTX["cfg"] = cfg
     CTX["vocab"] = L.load_vocabulary(cfg, root)
     CTX["root"] = root
     try:
@@ -120,6 +121,9 @@ def context_text(build: dict, ids: list[str] | None = None, conventions: bool = 
     if CTX.get("schemas") and tree is not None:
         import ladder_schema as S
         out.append(S.prompt_text(ids or list(tree), tree, CTX["schemas"]))
+    if CTX.get("cfg", {}).get("links") and tree is not None:
+        import ladder_links as K
+        out.append(K.prompt_text(ids or list(tree), tree, CTX["cfg"], CTX["root"]))
     return "\n".join(out)
 
 
@@ -138,6 +142,8 @@ def step_block(n: L.Node) -> str:
         lines.append(f"  reads: {', '.join(n.reads)}")
     if getattr(n, "writes", None):
         lines.append(f"  writes: {', '.join(n.writes)}")
+    if getattr(n, "calls", None):
+        lines.append(f"  calls: {', '.join(n.calls)}")
     return "\n".join(lines)
 
 
@@ -362,11 +368,15 @@ def validate_and_splice(file: Path, lang: str, lines: list[str], r: L.Region, re
     body = [l for l in reply]
     while body and not body[0].strip():
         body.pop(0)
+    end_re = re.compile(rf"^\s*{re.escape(L.COMMENT[lang])}\s*@end\b")
+    ends = [i for i, l in enumerate(body) if end_re.match(l)]
+    if ends and ends[-1] < len(body) - 1 and not any(l.strip().startswith(L.COMMENT[lang]) and "@" in l
+                                                     for l in body[ends[-1] + 1:]):
+        body = body[:ends[-1] + 1]     # drop remarks the generator wrote after the region
     while body and not body[-1].strip():
         body.pop()
     if not body or body[0].strip() != want:
         return None, f"first line must be '{want}', got '{body[0].strip() if body else ''}'"
-    end_re = re.compile(rf"^\s*{re.escape(L.COMMENT[lang])}\s*@end\b")
     if not end_re.match(body[-1]):
         return None, "last line is not an @end marker"
     if expect_nested:
@@ -453,6 +463,10 @@ def body_from_reply(reply: str, marker: str, lang: str) -> tuple[list[str] | Non
     body = clean_reply(reply)
     while body and not body[0].strip():
         body.pop(0)
+    end_re = re.compile(rf"^\s*{re.escape(L.COMMENT[lang])}\s*@end\b")
+    ends = [i for i, l in enumerate(body) if end_re.match(l)]
+    if ends and ends[-1] < len(body) - 1:
+        body = body[:ends[-1] + 1]     # drop remarks the generator wrote after the region
     while body and not body[-1].strip():
         body.pop()
     if not body or body[0].strip() != marker:
@@ -604,11 +618,53 @@ def blinded(lines: list[str], regions: list, hide: set[int]) -> list[str]:
     return out
 
 
+def blinded_own(lines: list[str], regions: list, idxs: set[int]) -> list[str]:
+    """Hide the own lines of parent regions (the lines outside their nested regions), keeping the
+    nested regions visible."""
+    out = list(lines)
+    for idx in idxs:
+        r = regions[idx]
+        inner = set()
+        for rr in nested_regions(regions, idx):
+            inner.update(range(rr.start - 1, rr.end))
+        own = [k for k in range(r.start, r.end - 1) if k not in inner and lines[k].strip()]
+        if not own:
+            continue
+        ids = ", ".join(t for t, _ in r.tags)
+        indent = lines[own[0]][: len(lines[own[0]]) - len(lines[own[0]].lstrip())]
+        out[own[0]] = f"{indent}{L.COMMENT_FOR_HIDDEN} [hidden: {ids}'s own code will be written from the English]"
+        for k in own[1:]:
+            out[k] = ""
+    return out
+
+
+def leaked_lines(conv: str, lines: list[str], regions: list, idxs) -> list[tuple[str, int, int, str]]:
+    """Per region about to be hidden: how many of its own code lines also appear word for word in
+    the conventions (blind regeneration could copy them instead of writing them from the English),
+    as (region label, count, first line number, first line)."""
+    conv_flat = " ".join(conv.replace("`", " ").split())
+    out = []
+    for i in idxs:
+        r = regions[i]
+        inner = set()
+        for rr in nested_regions(regions, i):
+            inner.update(range(rr.start - 1, rr.end))
+        hits = []
+        for k in range(r.start, r.end - 1):
+            t = " ".join(lines[k].split())
+            if k not in inner and len(t) >= 30 and t in conv_flat and not t.startswith(("//", "#", "/*", "*")):
+                hits.append((k + 1, t))
+        if hits:
+            out.append((r.label, len(hits), hits[0][0], hits[0][1]))
+    return out
+
+
 def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_run: bool) -> list:
-    """Regenerate every @contract region and every innermost @node region of one build from the
-    English alone, keeping @support code and regions that hold other regions. The generator never
-    sees the code it replaces: regions not yet regenerated are hidden in every prompt. Runs one
-    region at a time, top of file first, so later regions see the names earlier ones chose."""
+    """Regenerate every @contract region and every @node region of one build from the English
+    alone, keeping @support code. The generator never sees the code it replaces: regions not yet
+    regenerated are hidden in every prompt. Innermost regions go first, one at a time, top of file
+    first, so later regions see the names earlier ones chose; then each region that holds others
+    has its own lines (class declarations, constructors, fields) rewritten around them."""
     results = []
     L.COMMENT_FOR_HIDDEN = L.COMMENT[b["lang"]]
     conv = conventions_text(b)
@@ -624,19 +680,29 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
                     if k and (r.kind == "contract" or (r.kind == "node" and i not in has_child
                               and all(in_scope(b, t) for t, _ in r.tags)))]
         pending = todo_keys(regions, keys)
-        for i, (r, k) in enumerate(zip(regions, keys)):
-            if r.kind == "node" and i in has_child:
-                results.append((f, r.label, "kept: holds nested regions (regenerate it afterwards with --redo)"))
-        for k in [k for k in pending if (f, k) in keep]:
+        parents = [k for r, k, i in zip(regions, keys, range(len(regions)))
+                   if k and r.kind == "node" and i in has_child and all(in_scope(b, t) for t, _ in r.tags)]
+        # deepest parents first, so an outer class is written around inner ones already rewritten
+        depth = lambda i: 0 if regions[i].parent is None else 1 + depth(regions[i].parent)
+        parents.sort(key=lambda k: -depth(keys.index(k)))
+        for k in [k for k in pending + parents if (f, k) in keep]:
             results.append((f, k, HAND_EDIT_MSG))
         pending = [k for k in pending if (f, k) not in keep]
+        parents = [k for k in parents if (f, k) not in keep]
+        for label, count, line, text in leaked_lines(conv, lines, regions, [keys.index(k) for k in pending + parents]):
+            results.append((f, label, f"WARNING: {count} of its lines appear word for word in the conventions, so blind "
+                                      f"regeneration can copy them instead of writing them from the English (first: "
+                                      f"line {line}: {text[:70]}). Fine for names the conventions fix on purpose; "
+                                      f"otherwise replace the example"))
         while pending:
             regions, _, lines, _ = L.parse_regions(fpath, b["lang"])
             keys = L.region_keys(regions)
             has_child = {rr.parent for rr in regions if rr.parent is not None and rr.kind in ("node", "contract")}
             idx = next(i for i, k in enumerate(keys) if k == pending[0])
             hide = {i for i, k in enumerate(keys) if k in pending}
-            view = blinded(lines, regions, hide)
+            # parents' own lines (constructors, fields) are hidden too: they are rewritten last
+            view = blinded_own(blinded(lines, regions, hide), regions,
+                               {i for i, k in enumerate(keys) if k in parents})
             r = regions[idx]
             key = pending.pop(0)
             tag = f"{b['name']}__blind-{key.replace(' ', '-')}"
@@ -672,6 +738,38 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
             new, notes = apply_support_adds(new, b["lang"], split_reply(reply)[1])
             fpath.write_text("\n".join(new) + "\n")
             results.append((f, key, f"written blind ({len(clean_reply(reply))} lines)"))
+            results += [(f, "support", n) for n in notes]
+        while parents:
+            regions, _, lines, _ = L.parse_regions(fpath, b["lang"])
+            keys = L.region_keys(regions)
+            key = parents.pop(0)
+            if key not in keys:
+                results.append((f, key, "REJECTED: region not found after the nested regions were rewritten"))
+                continue
+            idx = keys.index(key)
+            r = regions[idx]
+            view = blinded_own(lines, regions, {keys.index(k) for k in [key] + parents if k in keys})
+            nest = nested_regions(regions, idx)
+            REDO.update(t for t, _ in r.tags)
+            prompt = build_prompt(b, f, view, r, tree, lock, None, nested=nest)
+            prompt += ("\n\n=== BLIND REGENERATION: this region's own code (outside its nested regions) is hidden "
+                       "on purpose. Write it from the English, the conventions and the visible code only. The "
+                       "nested regions were just written from the English: keep their code as shown.")
+            tag = f"{b['name']}__blind-{key.replace(' ', '-')}"
+            (log_dir / f"{tag}.prompt.txt").write_text(SYSTEM + "\n\n" + prompt)
+            if dry_run:
+                results.append((f, key, "dry run: prompt written (own lines, around nested regions)"))
+                continue
+            reply = call_generator(gen + ["--system-prompt", SYSTEM], prompt, log_dir / "cwd")
+            (log_dir / f"{tag}.reply.txt").write_text(reply)
+            new, why = validate_and_splice(fpath, b["lang"], lines, r, clean_reply(reply), tree,
+                                           nested_markers(nest, tree, b))
+            if new is None:
+                results.append((f, key, f"REJECTED: {why}"))
+                continue
+            new, notes = apply_support_adds(new, b["lang"], split_reply(reply)[1])
+            fpath.write_text("\n".join(new) + "\n")
+            results.append((f, key, f"written blind around its nested regions ({len(clean_reply(reply))} lines)"))
             results += [(f, "support", n) for n in notes]
     return results
 
@@ -962,7 +1060,9 @@ its in:/out: lines are a contract, its > lines say how."""
 
 def in_scope(b: dict, nid: str) -> bool:
     scope = b.get("steps")
-    return not scope or any(fnmatch.fnmatchcase(nid, pat) for pat in scope)
+    if scope is None:
+        return True
+    return any(fnmatch.fnmatchcase(nid, pat) for pat in scope)
 
 
 def tree_for_prompt(tree: dict, lang: str, b: dict | None = None) -> str:

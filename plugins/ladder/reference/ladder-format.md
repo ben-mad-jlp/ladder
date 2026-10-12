@@ -53,9 +53,10 @@ A tree is indented plain text. Two spaces per level. `#` starts a comment line.
 | `note:` | Anything a reviewer or the generator should know. |
 | `uses:` | Capabilities from the vocabulary this step relies on, separated by `;` or `,`. |
 | `reads:` / `writes:` | Database entities the step reads or writes (section 3, schema references). |
+| `calls:` | Steps in another tree this step calls: `api [api.1.1]` (section 4, links between trees). |
 | `compare:` | Which differences between builds don't matter for this step (see 9). Verification only. |
 
-A step's **hash** covers its title, contract, `>` lines, notes and `uses:` (not its children, and
+A step's **hash** covers its title, contract, `>` lines, notes, `uses:`, `reads:`, `writes:` and `calls:` (not its children, and
 not `compare:` lines, which change how builds are compared, never the code).
 Changing any of them makes code generated from the old wording *stale*.
 
@@ -99,7 +100,7 @@ The project names where its schema lives, one entry per EF model (a DbContext) o
 
 `efcore-snapshot` reads the model snapshot the migrations maintain (tables, columns, types, keys,
 navigations, indexes). `json` reads an export for databases without migrations
-(`{"entities": [{"name", "table", "keys", "properties": [{"name", "column", "type", "required"}],
+(`{"entities": [{"name", "table", "keys", "properties": [{"name", "column", "type", "required", "maxLength", "generated"}],
 "navigations": [{"name", "target", "many", "foreignKey"}]}]}`). `ladder schema <ladder.json> [Entity]`
 prints what the English can refer to.
 
@@ -120,8 +121,16 @@ Steps refer to it two ways:
 `ladder check` reports references that don't exist (with a suggestion), ambiguous ones, and steps
 writing to two schemas (no single transaction; a warning). `stamp` records the facts each step relies
 on; a migration that changes one (a column's type, length, nullability or name) shows the step as
-`schema-changed` until it is re-read and approved. Generator prompts include the referenced entities
-exactly, and entity classes are never generated: tag them as support code.
+`schema-changed` until it is re-read and approved. A whole-entity reference (`reads: X`) also relies on
+every member of X: removing or retyping one flags the step, and for `writes:` so does a new required
+column the database doesn't fill in (inserts must now set it); new optional columns flag nothing.
+Before the first stamp, `ladder check --since=<git ref>` compares with the schema files as they were
+at that commit. Generator prompts include the referenced entities exactly, and entity classes are
+never generated: tag them as support code (a support-only build has `"steps": []`).
+
+No `ModelSnapshot.cs` (the database changes by SQL scripts, not EF migrations)? The plugin's
+`tool/exporters/efcore-schema` builds each DbContext's model offline and writes the `json` kind;
+see its README.
 
 ## 4. Vocabulary
 
@@ -152,6 +161,52 @@ capability current user
   only that language's builds (regenerate with `--redo=<step ids>`).
 - Framework plumbing (routing, DI, rendering) and small utilities are not capabilities; build
   profiles cover them. Keep the vocabulary to what the English actually needs to say.
+
+### Tests for claims
+
+A binding and its `known:` lines are claims about a library, and nothing in the English or the
+types can check them: a wrong claim generates code that compiles and passes `check`. Give each
+capability the steps rely on a `test:` line that exercises the real library:
+
+```
+capability HTTP client
+  in: a request
+  out: the response body, or an ApiException
+  typescript: (in-repo) src/core/http/client.ts | http.post(path, body)
+  known: a 401's message is always "Unauthorized"; the body is in responseData
+  test: typescript | npx vitest run ladder/auth/clients/vocab/http-client.test.ts
+```
+
+`test: <binding key> | <command>` (or just a command, for every binding). `ladder test` runs them
+(and link tests, below) and records each result in `ladder.code.json` against what it tested: the
+capability's in/out, binding, `known:` lines and command. `check` reports a failed test as a problem,
+and as warnings: a capability steps use with no test (`untested-capability`), a test never run, and a
+test whose subject changed since it ran (`test-stale`).
+
+### Links between trees
+
+When one tree calls another (a React client calling the API), the calling step says so:
+
+```
+[authsvc.1] Sign in from the app
+  calls: api [api.1.1]
+```
+
+and ladder.json names the other project, optionally with a test that runs both sides together:
+
+```json
+"links": {"api": {"project": "../api/ladder.json",
+                  "test": "npx vitest run ladder/auth/clients/harness/seam_login.test.tsx"}}
+```
+
+(`"links": {"api": "../api/ladder.json"}` without a test.) `check` resolves every `calls:` item.
+`stamp` records the called step's contract: its `in:`, `out:` and `effects:` lines and the data
+blocks they name. When that contract changes, the calling step shows as `linked-changed` until it
+is re-read and approved, so a change to the API's answer reaches the client's review. If the called
+project lists the caller in its own `"links"`, its `check` warns that an edited step has callers
+(`has-callers`). Generator prompts for a calling step include the called step's contract. A link
+with callers but no `"test"` is reported as `untested-link`: only running both sides catches a
+wrong assumption about the code between them.
 
 ## 5. Regions in code
 
@@ -228,7 +283,9 @@ instructions; when a step truly needs one, write `note: (csharp) reuse the buffe
 be merged in one region; must still tag every step it implements). `adopted: true` marks existing
 code that was transcribed (checked by `adopt-check`). `steps` (optional) lists glob patterns of the
 step ids a build implements (`["client.*"]`) when one tree is shared by builds that each do part of it;
-without it, every leaf step must be tagged in every build. `data` (optional) lists the data blocks (glob patterns) a build's `@contract` regions spell out; with
+without it, every leaf step must be tagged in every build. `"steps": []` means none: a support-only
+build (an entity class, a file of shared helpers) whose tags, hand edits and exports are still checked.
+`"data": []` likewise means no data blocks. `links` names other Ladder projects this tree calls (section 4). `data` (optional) lists the data blocks (glob patterns) a build's `@contract` regions spell out; with
 `steps` and `data`, a build's contract hash covers only its own steps' in/out lines, its data blocks,
 and the named rules they mention, so editing one file's types doesn't make every file's types stale
 (`ladder hashes` prints the hash per build). Data blocks no build lists describe types that live in
@@ -293,6 +350,9 @@ say which differences don't matter for it; each line holds one or more clauses s
 | `any timing` | the step may answer earlier or later relative to other steps (see strict order) |
 | `final result only` | only the step's last result is compared (retries, progress updates) |
 
+`check` lists every differing result of a step, with the request it answered (`#15 POST /login`) when
+the traces come from `ladder replay`; the first 10 per step, or all with `--all-differences`.
+
 `ladder check` rejects clauses it doesn't understand. Use them for differences that are truly
 harmless and that nobody can rely on; anything a caller or user can depend on belongs in the English
 as behavior instead.
@@ -311,13 +371,22 @@ Two ways to get traces:
 - **At the boundary**: `ladder replay` sends recorded HTTP requests to a running service and stores
   each response as a step result (use the request's `"step"` field to name it). This needs no
   change to the service, so it works for the existing system as the reference build.
+  `--mask name[:kind]` (or a scenario's `"mask": [...]`) handles values that differ every run:
+  `value` hides it, `presence` keeps whether it is null, empty or set, `time` keeps a date-time
+  relative to when the request was sent (`now+120m`; `time:s` to the second). `{"wait": 32}` alone
+  pauses between requests. `--observe "<command>"` runs after each request and its output is compared
+  too (a SQL command count, a queue length). `save` paths without a prefix read the body.
 
 ## 10. Commands
 
 ```
 ladder init <folder> --name NAME --build NAME:LANG[:FILE]... [--steps NAME=GLOB...] [--adopted]
-ladder check <ladder.json>                            tags, coverage, staleness, vocabulary, comparison
-                                                      exit 0 ok · 1 problems · 3 only awaiting approval
+ladder check <ladder.json> [--since=REF] [--all-differences]
+                                                      tags, coverage, staleness, vocabulary, links, tests,
+                                                      comparison; exit 0 ok · 1 problems · 3 only awaiting approval
+                                                      --since: schema and linked-step changes since a git ref
+                                                      (before the first stamp)
+ladder test <ladder.json> [NAME...]                   run capability and link tests; record the results
 ladder hashes <ladder.json>                           current hash of every step
 ladder export <ladder.json> [out.json]                the parsed tree as JSON
 ladder adopt-check <ladder.json> [--base REF]         transcription changed nothing but comments
@@ -330,11 +399,12 @@ ladder accept <ladder.json> [--build=NAME] [IDS]      accept hand edits (the Eng
 ladder retag <ladder.json> IDS [--build=NAME]         English reworded, behavior unchanged: update markers only
 ladder schema <ladder.json> [ENTITY]                  the database schema the English can refer to
               (generate, regen and repair take --discard-hand-edits to overwrite them anyway)
-ladder replay <scenarios> --base URL --out traces/<build> [--mask a,b] [--header "K: V"]
-              [--before-each "reset command"] [--record-headers a,b] [--jwt]
+ladder replay <scenarios> --base URL --out traces/<build> [--mask a,b:presence,c:time] [--header "K: V"]
+              [--before-each "reset command"] [--record-headers a,b] [--jwt] [--observe "command"]
                                                       (scenarios: {{env:X}}, save / {{var:x}}, wait, cookies)
 ladder regen <ladder.json> --build=NAME --blind       rewrite a build's regions from the English alone,
-                                                      old code hidden, @support kept (use a scratch copy)
+                                                      old code hidden, @support kept (use a scratch copy);
+                                                      innermost regions first, then each parent's own lines
 ladder stamp <ladder.json>                            approve the English as it is now
 ladder view <ladder.json> [out.html]                  side-by-side viewer
 ```

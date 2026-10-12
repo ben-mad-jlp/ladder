@@ -38,6 +38,13 @@ ladder/<area>/api/ladder.json            tree api.ladder; build "api" (csharp)
 ladder/<area>/clients/ladder.json        tree clients.ladder; builds "web" and "mobile" (typescript)
 ```
 
+Link the two: in each ladder.json, `"links": {"api": {"project": "../api/ladder.json", "test":
+"<command>"}}` (and `"clients"` the other way), and give every client step that calls the API a
+`calls: api [api.1.1]` line. The `"test"` is a test that runs the real client code against the
+running API on the test database (one sign-in that succeeds, one that fails, one missing
+permission); it is the only thing that catches a wrong assumption about the code between the two
+trees, like an HTTP client that rewrites error messages.
+
 ```
 ladder init ladder/<area>/api --name "<Area> API" --build api:csharp --adopted
 ladder init ladder/<area>/clients --name "<Area> clients" --build web:typescript --build mobile:typescript --adopted
@@ -99,9 +106,10 @@ Write `<area>.ladder` so it describes what the code **does today**, in plain Eng
   step's prose, so later changes to state are visible as data changes (see ladder-profile on giving
   state its own region).
 - Every number, message, limit, order and default appears exactly as the code has it.
-- Entities and their database configuration become `data` blocks: fields in words (whole
-  number, text up to 120 characters), plus `rule:` lines for unique indexes, required fields,
-  cascades. Repeated validation rules become named `rule`s.
+- Database entities are not described: the English refers to the schema (see "Entities and the
+  database" below). Shapes the code owns (DTOs, request and response bodies, in-memory state) become
+  `data` blocks: fields in words (whole number, text up to 120 characters), plus `rule:` lines.
+  Repeated validation rules become named `rule`s.
 - Libraries the steps rely on go in `uses:` lines and the vocabulary (use the
   ladder-vocabulary skill for that file). Do not name libraries or language types in the steps.
 - No C#, TypeScript or SQL in the English. "Kept between 1 and 50", not `Math.Clamp(x, 1, 50)`.
@@ -158,9 +166,17 @@ DbContext, usually one per database) to ladder.json `"schemas"` (format section 
 `ladder schema <ladder.json>` shows it, and refer to it: `reads:` / `writes:` on each step that touches
 the database, and `[[Entity.Property]]` where a sentence depends on an exact column (filters,
 ordering, what is loaded with each row). Tag entity classes and their configuration as `@support`:
-they belong to the EF model and its migrations, and are never generated. (In the API trial a
+they belong to the EF model and its migrations, and are never generated. To keep their tags and
+hand edits checked, give them a support-only build (`"steps": []`). (In the API trial a
 regenerated entity mapped every property to a camelCase column; every query failed on SQL Server
 while the tests, built from the same model, passed.)
+
+If the project has no `ModelSnapshot.cs` (its schema changes are SQL scripts), export the model with
+`dotnet run --project ${CLAUDE_PLUGIN_ROOT}/tool/exporters/efcore-schema -p:ModelsProject=<the
+project with the DbContexts> -- --context <Name> --out ladder/<area>/api/schemas/<name>.json` (one
+`--context`/`--out` pair per DbContext) and point `"schemas"` at the JSON with `"kind": "json"`.
+Re-export after each schema change and commit the JSON. Before anything is stamped,
+`ladder check --since=<base commit>` shows which steps a schema change affects.
 
 ## 6. Verify
 

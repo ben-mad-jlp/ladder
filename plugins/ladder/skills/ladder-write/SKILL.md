@@ -96,6 +96,13 @@ another tree? (Example: an API that creates stories at 1 point, and a front page
 under 5 points, means new stories never show. Each tree is fine alone; together they surprise.)
 Raise any interaction you find.
 
+When a step calls a step in another tree, say so with `calls: api [api.1.1]` (the alias is a
+`"links"` entry in ladder.json naming the other project). Then a change to the called step's
+`in:` / `out:` / `effects:` shows the calling step as `linked-changed` until it is re-read, and the
+generator sees the called step's contract. When you change a step that other trees call
+(`check` warns `has-callers` if this project links back to them), update the callers' English in the
+same change, or list them for the person.
+
 ## 5. Check and hand over
 
 ```

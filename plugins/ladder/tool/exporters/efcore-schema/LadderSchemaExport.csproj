@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Ladder schema exporter for EF Core: see README.md in this folder for how to run it. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework Condition="'$(TargetFramework)' == ''">net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <ProjectReference Include="$(ModelsProject)" Condition="'$(ModelsProject)' != ''" />
+  </ItemGroup>
+  <Target Name="LadderNeedsModels" BeforeTargets="Build" Condition="'$(ModelsProject)' == ''">
+    <Error Text="Pass -p:ModelsProject=/path/to/the/project/with/your/DbContexts.csproj" />
+  </Target>
+</Project>

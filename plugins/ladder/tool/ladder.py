@@ -2,8 +2,13 @@
 """ladder: keep an English step tree and generated code in sync.
 
 Commands
-  ladder check  <project.json> [--builds=A,B]   verify tags, coverage, staleness, vocabulary, comparisons
+  ladder check  <project.json> [--builds=A,B] [--all-differences] [--since=GIT_REF]
+                                   verify tags, coverage, staleness, vocabulary, links, comparisons
                                    exit 0 ok · 1 problems · 3 only awaiting a person's approval
+                                   --since: report schema and linked-step changes since GIT_REF
+                                   instead of since approval (before the first stamp)
+  ladder test   <project.json> [NAME...]   run the tests capabilities (test: lines) and links
+                                   ("test") declare, and record the results for check
   ladder hashes <project.json>   print each step's current hash (for whoever generates code)
   ladder stamp  <project.json>   approve the tree as it is now (writes ladder.lock.json)
   ladder view   <project.json> [out.html]   build the side-by-side viewer
@@ -14,11 +19,12 @@ Commands
                                    transcription check: tagged files differ from GIT_REF (default HEAD)
                                    only by added comment lines
   ladder adopt-check --original A --tagged B --lang LANG      same check for one pair of files
-  ladder replay <scenario.json|folder> --base URL --out traces/<build> [--mask id,time]
-                   [--header "K: V"] [--before-each "command to reset test data"]
+  ladder replay <scenario.json|folder> --base URL --out traces/<build> [--mask id,token:presence,at:time]
+                   [--header "K: V"] [--before-each "command to reset test data"] [--jwt]
+                   [--record-headers set-cookie] [--observe "command run after each request"]
                                    send recorded requests to a running service; save each response as
                                    a trace, so an existing API and a generated one can be compared
-  ladder regen  <project.json> [--build=NAME] [--dry-run]
+  ladder regen  <project.json> [--build=NAME] [--dry-run] [--blind]
                                    regenerate stale regions with the project's generator (an LLM)
   ladder generate <project.json> --build=NAME [--out=PATH]
                                    write a build's whole file from the tree (new build or language);
@@ -70,6 +76,7 @@ class Node:
     compare: list[str] = field(default_factory=list)   # how results are compared; not in the hash
     reads: list[str] = field(default_factory=list)     # schema entities the step reads
     writes: list[str] = field(default_factory=list)    # schema entities the step writes
+    calls: list[str] = field(default_factory=list)     # steps in other trees it calls: "api [api.1.1]"
 
     @property
     def is_leaf(self) -> bool:
@@ -83,6 +90,7 @@ class Node:
                  *("note:" + n for n in self.notes), *("uses:" + u for u in self.uses)]
         # reads:/writes: are behavior too, but only steps that have them hash them (older trees keep their hashes)
         parts += [*("reads:" + r for r in self.reads), *("writes:" + w for w in self.writes)]
+        parts += [*("calls:" + c for c in self.calls)]
         return "\n".join(" ".join(p.split()) for p in parts)
 
     @property
@@ -91,7 +99,7 @@ class Node:
 
 
 NODE_RE = re.compile(r"^(\s*)\[([A-Za-z0-9_.\-]+)\]\s+(.+?)\s*$")
-ATTR_RE = re.compile(r"^\s*(in|out|effects|note|uses|compare|reads|writes):\s*(.*)$")
+ATTR_RE = re.compile(r"^\s*(in|out|effects|note|uses|compare|reads|writes|calls):\s*(.*)$")
 STEP_RE = re.compile(r"^\s*>\s?(.*)$")
 DATA_RE = re.compile(r"^data\s+([A-Z][A-Za-z0-9_]*)\s*$")
 RULE_RE = re.compile(r"^rule\s+([A-Za-z][A-Za-z0-9_ -]*?)\s*:\s*(.+)$")
@@ -187,6 +195,8 @@ def parse_tree(path: Path) -> Tree:
                 current.uses.extend(split_uses(val))
             elif key == "compare":
                 current.compare.extend(c.strip() for c in val.split(";") if c.strip())
+            elif key == "calls":
+                current.calls.extend(x.strip() for x in re.split(r"[,;]", val) if x.strip())
             elif key in ("reads", "writes"):
                 getattr(current, key).extend(x.strip() for x in re.split(r"[,;]", val) if x.strip())
             else:
@@ -202,7 +212,7 @@ def parse_tree(path: Path) -> Tree:
 
 CAP_RE = re.compile(r"^capability\s+(.+?)\s*$")
 CAP_ATTR_RE = re.compile(r"^\s+([A-Za-z][A-Za-z0-9_+#.\-]*)\s*:\s*(.*)$")
-CAP_KEYS = {"in", "out", "known", "check", "note"}
+CAP_KEYS = {"in", "out", "known", "check", "note", "test"}
 
 
 @dataclass
@@ -215,6 +225,7 @@ class Capability:
     known: list[str] = field(default_factory=list)
     checks: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    tests: list[str] = field(default_factory=list)       # "typescript | npx vitest run x.test.ts"
 
     def contract_hash(self) -> str:
         t = f"{self.name}\nin:{' '.join(self.inputs.split())}\nout:{' '.join(self.outputs.split())}"
@@ -269,6 +280,8 @@ def parse_vocabulary(path: Path) -> dict[str, Capability]:
             cur.checks.append(val)
         elif key == "note":
             cur.notes.append(val)
+        elif key == "test":
+            cur.tests.append(val)
         else:
             cur.bindings[key] = val
     return caps
@@ -418,7 +431,9 @@ def build_data(tree, build: dict | None) -> dict:
 
 def build_in_scope(build: dict | None, nid: str) -> bool:
     scope = (build or {}).get("steps")
-    return not scope or any(fnmatch.fnmatchcase(nid, pat) for pat in scope)
+    if scope is None:
+        return True          # no "steps" key: every step
+    return any(fnmatch.fnmatchcase(nid, pat) for pat in scope)   # "steps": [] means none (support only)
 
 
 def contract_hash(tree: dict[str, Node], build: dict | None = None) -> str:
@@ -429,7 +444,7 @@ def contract_hash(tree: dict[str, Node], build: dict | None = None) -> str:
                      for n in tree.values() if build_in_scope(build, n.id))
     data = build_data(tree, build)
     rules = getattr(tree, "rules", {})
-    if build and (build.get("steps") or "data" in build):
+    if build and ("steps" in build or "data" in build):
         # A scoped build depends only on the named rules its steps or data blocks mention.
         text_in = "\n".join([n.own_text() for n in tree.values() if build_in_scope(build, n.id)]
                             + [d.text() for d in data.values()]).lower()
@@ -448,7 +463,8 @@ def data_texts(tree) -> dict[str, str]:
     return out
 
 
-def check(pj: Path, only_builds: list[str] | None = None) -> dict:
+def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | None = None,
+          links_since: str | None = None) -> dict:
     cfg, root, tree, lock, _ = load_project(pj)
     if only_builds:
         ref = cfg.get("compare", {}).get("reference")
@@ -507,14 +523,29 @@ def check(pj: Path, only_builds: list[str] | None = None) -> dict:
         sproblems, sfacts, swarn = S.check_refs(tree, schemas)
         report["tree"] += sproblems
         report["warnings"] += swarn
-        was_all = lock.get("@schema", {})
+        if schema_since:
+            # Compare with the schema as it was at a git ref, without needing a stamp.
+            _, was_all, _ = S.check_refs(tree, S.load_schemas_at(cfg, root, schema_since))
+            since = f"since {schema_since}"
+        else:
+            was_all, since = lock.get("@schema", {}), "since approval"
         for nid, now in sfacts.items():
             was = was_all.get(nid, {})
-            changed = [f"{k}: {was[k]} -> {v}" for k, v in now.items() if k in was and was[k] != v]
+            changed = [c for k, v in now.items() if k in was for c in S.fact_changes(k, was[k], v)]
             if changed:
                 report["tree"].append(dict(kind="schema-changed", node=nid,
-                                           msg="the schema it refers to changed since approval (" + "; ".join(changed)
+                                           msg=f"the schema it refers to changed {since} (" + "; ".join(changed)
                                                + "); re-read the step, then regenerate its code with --redo"))
+        if schema_since:
+            report["schema_since"] = schema_since
+    # Links to steps in other trees (calls:), and tests of claims that reading cannot check.
+    import ladder_links as K
+    lproblems, lapprovals, lwarn, _ = K.check_links(tree, cfg, root, lock, links_since)
+    report["tree"] += lproblems + lapprovals
+    report["warnings"] += lwarn
+    tproblems, twarn = K.check_tests(cfg, root, tree, load_code(root))
+    report["tree"] += tproblems
+    report["warnings"] += twarn
     if "@data" in lock:
         now = data_texts(tree)
         was_d = lock["@data"]
@@ -544,6 +575,10 @@ def check(pj: Path, only_builds: list[str] | None = None) -> dict:
         has_contract = False
         for f in b["files"]:
             fpath = root / f
+            if not fpath.exists():
+                br["problems"].append(dict(kind="missing-file", file=f, line=0,
+                                           msg="file not found (generate it with `ladder generate`, or fix the path in ladder.json)"))
+                continue
             regions, _, _, probs = parse_regions(fpath, b["lang"])
             br["problems"] += group_untagged(probs)
             for r in regions:
@@ -608,7 +643,7 @@ def check(pj: Path, only_builds: list[str] | None = None) -> dict:
         if vocab:
             for name, ids in users.items():
                 c = vocab.get(name)
-                ids = [i for i in ids if not b.get("steps") or any(fnmatch.fnmatchcase(i, pat) for pat in b["steps"])]
+                ids = [i for i in ids if build_in_scope(b, i)]
                 if not c or not ids:
                     continue
                 bind = c.binding_for(b)
@@ -624,7 +659,7 @@ def check(pj: Path, only_builds: list[str] | None = None) -> dict:
         scope = b.get("steps")   # optional: glob patterns of step ids this build implements
 
         def in_scope(nid: str) -> bool:
-            return not scope or any(fnmatch.fnmatchcase(nid, pat) for pat in scope)
+            return build_in_scope(b, nid)
 
         for nid, n in tree.items():
             br["coverage"][nid] = covered[nid]
@@ -657,7 +692,8 @@ def check(pj: Path, only_builds: list[str] | None = None) -> dict:
                                    msg="traces name steps that are not in the tree (a typo?); list harness-only "
                                        "names in compare.extra_steps"))
     approval_kinds = {"new", "edited", "parent-changed", "removed", "capability-changed",
-                      "data-new", "data-edited", "data-removed", "compare-edited", "schema-changed"}
+                      "data-new", "data-edited", "data-removed", "compare-edited", "schema-changed",
+                      "linked-changed"}
     real_tree = [p for p in report["tree"] if p["kind"] not in approval_kinds]
     real = (real_tree or any(b["problems"] for b in report["builds"])
             or any(v == 0 for v in report.get("mutants", {}).values())
@@ -755,20 +791,30 @@ def match_info(ref: str, val: str, tol: float) -> tuple[str, float]:
     return ("close" if worst <= tol else "different"), worst
 
 
-def trace_exits(path: Path, order: list[str] | None = None) -> dict[str, list[str]]:
+def trace_exits(path: Path, order: list[str] | None = None,
+                labels: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
     """Each step's results in order. If `order` is given, it receives the step of every result,
-    in the order the results happened (for the strict order check)."""
+    in the order the results happened (for the strict order check). If `labels` is given, it
+    receives, per step, where each result sits in the run ("#15 POST /login") for reports."""
     out: dict[str, list[str]] = {}
+    entered: dict[str, str] = {}
+    n = 0
     for l in path.read_text().splitlines():
         if not l.strip():
             continue
         e = json.loads(l)
+        if e["ev"] == "enter":
+            entered[e["step"]] = e.get("info", "")
         if e["ev"] == "exit":
+            n += 1
+            if labels is not None:
+                labels.setdefault(e["step"].split("+")[-1], []).append(
+                    f"#{n}" + (f" {entered.get(e['step'])}" if entered.get(e["step"]) else ""))
             # A fused span ("qr.1.1+qr.1.2") ends where its last step ends,
             # so its output is comparable with that step's output.
             # Builds that record the full value ("data") are compared on it; otherwise the summary.
             step = e["step"].split("+")[-1]
-            out.setdefault(step, []).append(e.get("data", e["info"]))
+            out.setdefault(step, []).append(e["data"] if "data" in e else e.get("info", ""))
             if order is not None:
                 order.append(step)
     return out
@@ -806,7 +852,8 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
         ref_path = root / "traces" / ref_b.get("traces", ref) / f"{run}.jsonl"
         entry = dict(run=run, reference=ref, tolerance=tol, builds=[])
         ref_order: list[str] = []
-        ref_ex = trace_exits(ref_path, ref_order) if ref_path.exists() else {}
+        ref_labels: dict[str, list[str]] = {}
+        ref_ex = trace_exits(ref_path, ref_order, ref_labels) if ref_path.exists() else {}
         entry["missing_reference"] = not ref_path.exists()
         if tree:
             allowed = set(c.get("extra_steps", [])) | {"http"}
@@ -854,9 +901,12 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
                 worst = max(r[1] for r in results)
                 # Show the first result that is not the same (the one to investigate), with its position.
                 at = next((i for i, r in enumerate(results) if r[0] != "same"), len(results) - 1)
+                lab = ref_labels.get(step, []) if len(pairs) == len(ref_labels.get(step, [])) and not (rl and rl["any_order"]) else []
+                diffs = [dict(at=i + 1, ref=pairs[i][0], val=pairs[i][1], status=r[0], label=lab[i] if lab else "")
+                         for i, r in enumerate(results) if r[0] != "same"]
                 rows.append(dict(step=step, ref=pairs[at][0], val=pairs[at][1], status=status, at=at + 1,
                                  count=len(pairs), same=sum(r[0] == "same" for r in results),
-                                 worst=None if worst == float("inf") else worst, note=note))
+                                 worst=None if worst == float("inf") else worst, note=note, diffs=diffs))
             if strict:
                 free = {nid for nid, rl in rules.items() if rl["any_timing"]}
                 final = {nid for nid, rl in rules.items() if rl["final_only"]}
@@ -882,6 +932,10 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
     return out
 
 
+SHOW_ALL = False    # --all-differences: list every differing result, not the first DIFF_LIMIT per step
+DIFF_LIMIT = 10
+
+
 def print_report(rep: dict, tree: dict[str, Node]) -> None:
     def where(p):
         return f"{p['file']}:{p['line']}  " if "file" in p else ""
@@ -893,13 +947,16 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
     for b in rep["builds"]:
         scope = b.get("scope")
         leaves = [n for n in tree.values() if n.is_leaf
-                  and (not scope or any(fnmatch.fnmatchcase(n.id, pat) for pat in scope))]
+                  and (scope is None or any(fnmatch.fnmatchcase(n.id, pat) for pat in scope))]
         direct = sum(1 for n in leaves if b["coverage"].get(n.id))
         print(f"\nBuild '{b['name']}' ({b['lang']}{', ' + b['mode'] if b['mode'] else ''})")
         if b.get("untagged_build"):
             print("  compared by behavior only (\"tagged\": false): no tag or coverage checks")
             continue
-        print(f"  {direct}/{len(leaves)} leaf steps {'in its scope ' if scope else ''}tagged directly")
+        if scope == []:
+            print("  support only (\"steps\": []): checks tags, hand edits and exports; implements no steps")
+        else:
+            print(f"  {direct}/{len(leaves)} leaf steps {'in its scope ' if scope else ''}tagged directly")
         if not b["problems"]:
             print("  ok: every line of code is tagged, every step is covered, nothing is stale")
         for p in b["problems"]:
@@ -962,9 +1019,16 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
                 if r["status"] == "close":
                     print(f"    {r['step']}: close ({where_}, off by {r['worst']:g}): {r['val'][:160]}")
                 else:
-                    print(f"    {r['step']}: DIFFERENT at {where_}")
-                    print(f"      {b['build']}: {r['val'][:200]}")
-                    print(f"      {run['reference']}: {r['ref'][:200]}")
+                    diffs = [d for d in r.get("diffs") or [dict(at=r["at"], ref=r["ref"], val=r["val"])]
+                             if d.get("status", "different") == "different"]
+                    shown_d = diffs if SHOW_ALL else diffs[:DIFF_LIMIT]
+                    print(f"    {r['step']}: DIFFERENT in {len(diffs)} of {r.get('count', '?')} results")
+                    for d in shown_d:
+                        print(f"      result {d['at']}" + (f" (request {d['label']})" if d.get("label") else "") + ":")
+                        print(f"        {b['build']}: {d['val'][:200]}")
+                        print(f"        {run['reference']}: {d['ref'][:200]}")
+                    if len(diffs) > len(shown_d):
+                        print(f"      ... {len(diffs) - len(shown_d)} more (ladder check --all-differences)")
                 if r.get("note"):
                     print(f"      ({r['note']})")
     if rep.get("mutants"):
@@ -1009,6 +1073,10 @@ def stamp(pj: Path) -> None:
         _, sfacts, _ = S.check_refs(tree, S.load_schemas(cfg, root))
         if sfacts:
             lock["@schema"] = sfacts
+    import ladder_links as K
+    _, _, _, lfacts = K.check_links(tree, cfg, root, {})
+    if lfacts:
+        lock["@links"] = lfacts
     lock_path.write_text(json.dumps(lock, indent=2) + "\n")
     print(f"approved {len(tree)} steps -> {lock_path}")
     n = record_code(root, cfg)
@@ -1319,6 +1387,9 @@ def main(argv: list[str]) -> int:
                     continue
                 print(f"[{sname}] " + e.describe() + "\n")
         return 0
+    if len(argv) >= 3 and argv[1] == "test":
+        import ladder_links as K
+        return K.run_tests(Path(argv[2]), [a for a in argv[3:] if not a.startswith("--")] or None)
     if len(argv) >= 3 and argv[1] == "retag":
         return retag(Path(argv[2]), argv[3:])
     if len(argv) >= 3 and argv[1] in {"generate", "repair", "regen"}:
@@ -1353,7 +1424,12 @@ def main(argv: list[str]) -> int:
     cmd, pj = argv[1], Path(argv[2])
     if cmd == "check":
         only = next((a.split("=", 1)[1].split(",") for a in argv[3:] if a.startswith("--builds=")), None)
-        rep = check(pj, only)
+        since = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--since=")), None)
+        schema_since = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--schema-since=")), since)
+        links_since = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--links-since=")), since)
+        global SHOW_ALL
+        SHOW_ALL = "--all-differences" in argv[3:]
+        rep = check(pj, only, schema_since, links_since)
         print_report(rep, load_project(pj)[2])
         # 0 ok · 1 problems · 3 only waiting for a person's approval
         return {"ok": 0, "problems": 1, "awaiting-approval": 3}[rep["status"]]
@@ -1361,7 +1437,7 @@ def main(argv: list[str]) -> int:
         cfg, _, tree, _, _ = load_project(pj)
         for n in tree.values():
             print(f"{'  ' * n.depth}{n.id}@{n.hash}  {n.title}")
-        scoped = [b for b in cfg["builds"] if b.get("steps") or "data" in b]
+        scoped = [b for b in cfg["builds"] if "steps" in b or "data" in b]
         if scoped:
             print("contract hash per build (for @contract regions):")
             for b in scoped:

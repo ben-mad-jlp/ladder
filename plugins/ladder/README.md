@@ -37,5 +37,7 @@ Runtimes for tracing steps inside generated code: `tool/runtimes/{csharp,typescr
 Commit `ladder.lock.json` (the approved English) and `ladder.code.json` (the code as last approved
 or generated) with the code, and run `ladder check <ladder.json>` on every change. It fails when code
 is untagged, stale or missing, when builds compare differently, and when generated code was edited by
-hand without the English changing (`hand-edited`). Exit code 3 means only a person's approval is
-pending, which you may choose to allow on branches.
+hand without the English changing (`hand-edited`), and when a recorded test failed. Run
+`ladder test <ladder.json>` first where the tests can run (the vocabulary's `test:` lines and the
+seam tests between linked trees need the libraries and, for seams, the services). Exit code 3 means
+only a person's approval is pending, which you may choose to allow on branches.

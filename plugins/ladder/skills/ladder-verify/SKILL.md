@@ -37,6 +37,10 @@ English. Put files in `scenarios/` and list their names in ladder.json `compare.
 - A fixed clock where the code allows it, otherwise `--mask` the time fields.
 - `--mask` ids that the database assigns if two builds might assign them differently.
 - Test credentials only; never point replay at production.
+- Seams between trees: when a client tree `calls:` the API tree, also write one test that runs the
+  real client code against the running API (a success, a failure, each error the client handles)
+  and put it in the link's `"test"` in ladder.json. Replaying the API alone can't see what the
+  client's HTTP layer does with an answer.
 
 ## 3. Record traces
 
@@ -46,7 +50,12 @@ English. Put files in `scenarios/` and list their names in ladder.json `compare.
   `"save"` a value (`{"token": "body.accessToken"}`) for later ones (`{{var:token}}`), cookies are
   kept per scenario like a browser, `--record-headers set-cookie,location` records them (cookie
   values hidden, attributes compared), `--jwt` replaces tokens by their claims (lifetime instead of
-  timestamps) so two runs compare, and `"wait": 31` sleeps before a request for time windows.
+  timestamps) so two runs compare, and `"wait": 31` sleeps before a request for time windows
+  (`{"wait": 31}` alone is a pause). Mask by kind: `--mask traceId,refreshToken:presence,expiresAt:time`
+  hides `traceId`, keeps whether `refreshToken` is null or set, and compares `expiresAt` as "now+120m".
+  `--observe "<command>"` runs after each request and compares what it prints (a SQL command count
+  from an Extended Events session, a queue length), so a build that answers the same with ten times
+  the queries shows up.
 - **Logic with in-code tracing** (builds that wrap steps with the Ladder runtime): run the project's
   scenario runner so each build writes `traces/<build>/<scenario>.jsonl`.
 - **Client logic that is not traced inside** (adopted React or React Native hooks and API clients):
@@ -96,9 +105,11 @@ the reference that later builds must match.
 ## 4. Compare and explain
 
 `ladder check <ladder.json>` compares each build with the reference on every run. For every step
-it prints how many results were identical and, for a difference, the first result that differs
-(its position and both values). Exit codes: 0 all good, 1 problems, 3 only waiting for a person's
-approval. For each difference, decide which kind it is, because each has a different fix:
+it prints how many results were identical and every result that differs (its position, the request
+it answered for replayed traces, and both values; the first 10 per step, all with
+`--all-differences`). Run `ladder test <ladder.json>` too: it runs the vocabulary's `test:` lines and
+the links' seam tests, and `check` reports failed ones. Exit codes: 0 all good, 1 problems, 3 only
+waiting for a person's approval. For each difference, decide which kind it is, because each has a different fix:
 
 | Difference | Fix |
 |---|---|

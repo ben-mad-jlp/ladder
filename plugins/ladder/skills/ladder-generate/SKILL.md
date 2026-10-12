@@ -51,9 +51,14 @@ missing import, and it repairs `@contract` regions (entities, DTOs) as well as s
 **Blind regeneration** (`ladder regen --build=<name> --blind`, in a scratch copy): rewrites every
 `@contract` region and every innermost step region of a build from the English and the profile, one
 at a time from the top of the file, with the old code of regions not yet rewritten hidden from the
-generator; `@support` code and regions that hold other regions are kept. Use it to test whether the
-English and profile are enough, especially for files only partly in the slice, where `generate` would
-drop everything outside it. Every region prompt now includes the build profile.
+generator; then each region that holds others (a class: its declaration, constructor and fields) has
+its own lines rewritten around the new inner regions. `@support` code is kept. Use it to test whether
+the English and profile are enough, especially for files only partly in the slice, where `generate`
+would drop everything outside it. It warns when a region's code appears word for word in the
+conventions: the generator could copy it rather than write it from the English. Replace such an
+example in the profile with a neutral one unless the profile fixes that line on purpose (a public
+signature). Every region prompt includes the build profile, and, for steps with `calls:`, the
+contract of the step they call in the other tree.
 
 `regen` exits 1 if any region's reply was rejected (that region keeps its old code; the reason is
 printed and the prompt and reply are logged), 0 otherwise. `generate` writes only the steps in the
