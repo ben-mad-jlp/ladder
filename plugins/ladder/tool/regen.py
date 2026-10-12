@@ -81,6 +81,7 @@ def set_context(cfg: dict, root: Path, tree) -> None:
 def new_log_dir(root: Path, suffix: str = "") -> Path:
     """A fresh folder for one run's prompts and replies; unique even for runs started in the same second."""
     import os
+    L.local_dir(root)   # .ladder/ holds only local files and ignores itself in git
     d = root / ".ladder" / "regen" / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}{suffix}"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -104,13 +105,24 @@ def context_text(build: dict, ids: list[str] | None = None, conventions: bool = 
         out += ["=== Conventions for this build (follow them exactly: names, signatures, layout):", conv, ""]
     if tree is not None and getattr(tree, "data", None):
         was = CTX["lock"].get("@data", {})
-        out += ["=== Data the English refers to:"]
-        for k, d in L.build_data(tree, build).items():
+        # The build's "data" list says which blocks its @contract regions spell out; the generator must
+        # also see every block the steps it writes name in their text (round 8: a step named
+        # MyAlertsSnapshot, the build listed no data, and the generator invented its own keys).
+        shown = dict(L.build_data(tree, build))
+        texts = [tree[n].own_text() + "\n" + "\n".join(getattr(tree[n], "steps", []))
+                 for n in (ids or list(tree)) if n in tree]
+        for name, d in tree.data.items():
+            if name not in shown and any(re.search(r"\b" + re.escape(name) + r"\b", t) for t in texts):
+                shown[name] = d
+        if shown:
+            out += ["=== Data the English refers to:"]
+        for k, d in shown.items():
             out.append(d.text())
             before = was.get(f"data {k}")
             if before is not None and before != d.text():
                 out += ["  (CHANGED since approval. Before:)", *("  | " + l for l in before.splitlines())]
-        out.append("")
+        if shown:
+            out.append("")
     if tree is not None and getattr(tree, "rules", None):
         out += ["=== Named rules:", *(f"rule {k}: {v}" for k, v in tree.rules.items()), ""]
     if vocab and tree is not None:
@@ -1045,7 +1057,9 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
     return 1 if bad else 0
 
 
-ERR_LOC = re.compile(r"""([\w./\\-]+\.(?:py|cpp|hpp|cs|ts))(?:"?, line |[:(])(\d+)""")
+# A source file and line in an error message: "Foo.cs(12,5)", "src/a.tsx(43,29)", "a.py", line 7", "x.go:12:3".
+SOURCE_EXTS = "py|cpp|cc|cxx|c|hpp|hh|h|cs|ts|tsx|mts|cts|js|jsx|mjs|cjs|java|kt|kts|go|rs|swift|rb|php|dart|scala|vue|svelte"
+ERR_LOC = re.compile(r"""([\w./\\-]+\.(?:""" + SOURCE_EXTS + r"""))(?:"?, line |[:(])(\d+)""")
 
 
 def repair(pj: Path, build_name: str, errors: str) -> int:
@@ -1090,6 +1104,10 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
             print(f"{build_name:<20} {f}  [{regions[idx].label}]  {HAND_EDIT_MSG}")
             status = 1
         hits = {i: v for i, v in hits.items() if (f, keys[i]) not in keep}
+        if not hits and status == 0:
+            located = [l for l in err_lines if ERR_LOC.search(l)]
+            print(f"{build_name:<20} {f}  no error points into this file ({len(err_lines)} error lines read, "
+                  f"{len(located)} with a file and line{'' if located else ': is the error format one Ladder reads?'})")
         # Repair bottom-up so line numbers stay valid; re-read between repairs.
         for idx in sorted(hits, key=lambda i: -regions[i].start):
             regions, _, lines, _ = L.parse_regions(fpath, b["lang"])

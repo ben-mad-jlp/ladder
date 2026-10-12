@@ -1329,6 +1329,25 @@ def stamp(pj: Path) -> None:
 # throw the edit away.
 
 CODE_FILE = "ladder.code.json"
+# What the generator wrote in THIS checkout (regen, repair), apart from what was approved (CODE_FILE):
+# local, never committed, so syncing a scratch copy from the working tree (git checkout) cannot
+# overwrite it, and code generated there is still recognised as generated (round 8).
+GEN_FILE = ".ladder/generated.json"
+
+
+def local_dir(root: Path) -> Path:
+    """The project's .ladder folder, which holds only local files (logs, generated.json): ignored by git."""
+    d = root / ".ladder"
+    d.mkdir(exist_ok=True)
+    gi = d / ".gitignore"
+    if not gi.exists():
+        gi.write_text("# Ladder's local files: logs and what was generated in this checkout. Never commit them.\n*\n")
+    return d
+
+
+def load_generated(root: Path) -> dict:
+    p = root / GEN_FILE
+    return json.loads(p.read_text()) if p.exists() else {}
 
 
 def region_keys(regions: list) -> list[str | None]:
@@ -1442,6 +1461,7 @@ def record_code(root: Path, cfg: dict, builds: list[str] | None = None, keys: se
     """Record fingerprints. builds: limit to these builds. keys: limit to (build, file, key).
     before: fingerprints taken before a generator run; only regions that run changed are recorded."""
     saved = load_code(root)
+    gen = load_generated(root) if before is not None else {}
     n = 0
     for b in cfg["builds"]:
         if b.get("tagged") is False or (builds and b["name"] not in builds):
@@ -1456,18 +1476,25 @@ def record_code(root: Path, cfg: dict, builds: list[str] | None = None, keys: se
                 if saved.get(b["name"], {}).get(f, {}).get(key) != fp:
                     saved.setdefault(b["name"], {}).setdefault(f, {})[key] = fp
                     n += 1
+                if before is not None:
+                    gen.setdefault(b["name"], {}).setdefault(f, {})[key] = fp
     (root / CODE_FILE).write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+    if before is not None:
+        local_dir(root)
+        (root / GEN_FILE).write_text(json.dumps(gen, indent=2, sort_keys=True) + "\n")
     return n
 
 
 def hand_edited(root: Path, b: dict) -> list[tuple[str, str, int]]:
-    """(file, region key, line) for regions whose code differs from the recorded fingerprint."""
+    """(file, region key, line) for regions whose code differs from the recorded fingerprint and from
+    what the generator last wrote in this checkout."""
     saved = load_code(root).get(b["name"], {})
+    gen = load_generated(root).get(b["name"], {})
     out = []
     for f, regs in code_fingerprints(root, b).items():
         for key, (fp, line) in regs.items():
             was = saved.get(f, {}).get(key)
-            if was is not None and was != fp:
+            if was is not None and was != fp and gen.get(f, {}).get(key) != fp:
                 out.append((f, key, line))
     return out
 
@@ -1574,6 +1601,9 @@ def accept_from(root: Path, cfg: dict, src_pj: Path, build: str | None, ids: set
     the scratch project recorded as generated (its ladder.code.json). Anything else stays hand-edited."""
     src_root = src_pj.parent if src_pj.suffix == ".json" else src_pj
     theirs = load_code(src_root)
+    for bn, files in load_generated(src_root).items():      # what scratch generated, even if a sync
+        for f, regs in files.items():                         # overwrote its ladder.code.json
+            theirs.setdefault(bn, {}).setdefault(f, {}).update(regs)
     if not theirs:
         print(f"no {CODE_FILE} in {src_root}: nothing was generated there")
         return 1

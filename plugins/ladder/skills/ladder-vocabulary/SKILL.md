@@ -62,6 +62,10 @@ capability save data
   being transcribed, name its file: `(in repository) src/common/defer.ts | defer<T>()`, and list that
   file in the build's `"reads"` so the generator sees it. Error classes and small types the code
   imports are not capabilities; the build profile says where they come from.
+- When a binding takes an object of callbacks or a configuration with a specific shape (a hook taking
+  `{ handlers: { name: { prefill } }, snapshot: () => ..., dataset: () => ... }`), write the shape in the
+  binding, not just the call: the generator cannot see the library's types, and in round 8 it passed
+  bare functions where `{ prefill }` objects were expected.
 - `known:` records quirks a generator or reviewer must not miss: transactional behavior, case
   sensitivity of SQL Server comparisons, retry semantics, timezone of returned dates, a decoder
   that reads some inputs another binding cannot.

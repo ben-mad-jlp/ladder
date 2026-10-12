@@ -157,6 +157,13 @@ before any tags (record it when you start; once the tags are committed, HEAD is 
 Re-running it after the tree changes is safe, the diff stays pure additions by construction, and
 `ladder adopt-check <ladder.json> --base <base>` proves it.
 
+**Shapes another system reads.** An object the code hands to another system (a snapshot for an
+assistant, an analytics event, a message on a queue, a log record a dashboard parses) is a contract
+even when nothing in the code declares its type: write it as a data block with its exact keys and say
+which step builds it ("the snapshot is a MyAlertsSnapshot"). In round 8 the English said "what is
+selected (the alert being deleted, ...)"; blind regeneration chose its own keys and the assistant's
+tests failed.
+
 **Large files.** When only part of a file belongs to the slice (8 members of a 1,700-line service),
 tag the rest as `@support` with a label and transcribe only the slice's members. To try regenerating
 such a file, don't use `generate` (it writes the whole file from the English and drops the support
