@@ -6,10 +6,13 @@
 //
 //   dotnet run --project <this folder> -p:ModelsProject=<path to the project with the DbContexts> \
 //       -- --context QbsDbContext --out ladder/auth/api/schemas/qbs.json [--context Other --out other.json]
+//          [--ctor-arg year=2025]
 //
 // The context is constructed with DbContextOptions<T> configured for the provider the models project
-// already references (SQL Server, PostgreSQL or SQLite), using a dummy connection string.
-// A context that only has a parameterless constructor is constructed with that one.
+// already references (SQL Server, PostgreSQL or SQLite), using a dummy connection string. A constructor
+// that takes more after the options (a per-year archive context) gets them from --ctor-arg name=value,
+// which applies to the --context before it. A context that only has a parameterless constructor is
+// constructed with that one.
 
 using System.Reflection;
 using System.Text.Json;
@@ -18,16 +21,24 @@ using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 
 var pairs = new List<(string Context, string Out)>();
+var ctorArgs = new Dictionary<string, Dictionary<string, string>>();
 for (int i = 0; i < args.Length; i++)
 {
     if (args[i] == "--context" && i + 1 < args.Length)
         pairs.Add((args[++i], ""));
     else if (args[i] == "--out" && i + 1 < args.Length && pairs.Count > 0)
         pairs[^1] = (pairs[^1].Context, args[++i]);
+    else if (args[i] == "--ctor-arg" && i + 1 < args.Length && pairs.Count > 0)
+    {
+        var (name, _, value) = args[++i].Partition('=');
+        if (!ctorArgs.TryGetValue(pairs[^1].Context, out var forCtx))
+            ctorArgs[pairs[^1].Context] = forCtx = new Dictionary<string, string>();
+        forCtx[name] = value;
+    }
 }
 if (pairs.Count == 0 || pairs.Any(p => p.Out == ""))
 {
-    Console.Error.WriteLine("usage: --context <DbContext class name> --out <file.json> [--context ... --out ...]");
+    Console.Error.WriteLine("usage: --context <DbContext class name> --out <file.json> [--ctor-arg name=value] [--context ... --out ...]");
     return 2;
 }
 
@@ -50,7 +61,10 @@ foreach (var (contextName, outPath) in pairs)
             string.Join(", ", types.Where(t => typeof(DbContext).IsAssignableFrom(t) && !t.IsAbstract).Select(t => t.Name)));
         return 1;
     }
-    using var ctx = Create(ctxType, types);
+    DbContext created;
+    try { created = Create(ctxType, types, ctorArgs.GetValueOrDefault(contextName) ?? new Dictionary<string, string>()); }
+    catch (InvalidOperationException e) { Console.Error.WriteLine(e.Message); return 1; }
+    using var ctx = created;
     IModel model;
     try { model = ctx.GetService<IDesignTimeModel>().Model; }
     catch { model = ctx.Model; }
@@ -109,20 +123,37 @@ static string SafeColumnType(IProperty p)
     catch { return p.ClrType.Name; }
 }
 
-static DbContext Create(Type ctxType, List<Type> types)
+static DbContext Create(Type ctxType, List<Type> types, Dictionary<string, string> extra)
 {
-    var withOptions = ctxType.GetConstructors().FirstOrDefault(c =>
-        c.GetParameters().Length == 1 && typeof(DbContextOptions).IsAssignableFrom(c.GetParameters()[0].ParameterType));
+    // Prefer (options); else (options, more...) with the rest from --ctor-arg; else ().
+    var withOptions = ctxType.GetConstructors()
+        .Where(c => c.GetParameters().Length >= 1 && typeof(DbContextOptions).IsAssignableFrom(c.GetParameters()[0].ParameterType))
+        .OrderBy(c => c.GetParameters().Length)
+        .FirstOrDefault(c => c.GetParameters().Skip(1).All(p => extra.ContainsKey(p.Name!) || p.HasDefaultValue));
     if (withOptions == null)
     {
-        var bare = ctxType.GetConstructor(Type.EmptyTypes)
-            ?? throw new InvalidOperationException($"{ctxType.Name} has neither a (DbContextOptions) nor a parameterless constructor");
-        return (DbContext)bare.Invoke(null);
+        var bare = ctxType.GetConstructor(Type.EmptyTypes);
+        if (bare != null)
+            return (DbContext)bare.Invoke(null);
+        var wants = ctxType.GetConstructors().Select(c => "(" + string.Join(", ", c.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}")) + ")");
+        throw new InvalidOperationException($"{ctxType.Name}: no usable constructor; it has {string.Join(" ", wants)}. "
+            + "Give the parameters after the options with --ctor-arg name=value after its --context.");
     }
     var builderType = typeof(DbContextOptionsBuilder<>).MakeGenericType(ctxType);
     var builder = (DbContextOptionsBuilder)Activator.CreateInstance(builderType)!;
     UseProvider(builder, types);
-    return (DbContext)withOptions.Invoke(new object[] { builder.Options });
+    var values = new List<object?> { builder.Options };
+    foreach (var p in withOptions.GetParameters().Skip(1))
+    {
+        if (extra.TryGetValue(p.Name!, out var text))
+        {
+            var t = Nullable.GetUnderlyingType(p.ParameterType) ?? p.ParameterType;
+            values.Add(t == typeof(string) ? text : Convert.ChangeType(text, t, System.Globalization.CultureInfo.InvariantCulture));
+        }
+        else
+            values.Add(p.DefaultValue);
+    }
+    return (DbContext)withOptions.Invoke(values.ToArray());
 }
 
 static void UseProvider(DbContextOptionsBuilder builder, List<Type> types)
@@ -153,4 +184,13 @@ static void UseProvider(DbContextOptionsBuilder builder, List<Type> types)
         return;
     }
     throw new InvalidOperationException("no EF Core relational provider found (UseSqlServer, UseNpgsql or UseSqlite)");
+}
+
+static class StringPartition
+{
+    public static (string Before, string Sep, string After) Partition(this string s, char sep)
+    {
+        var i = s.IndexOf(sep);
+        return i < 0 ? (s, "", "") : (s[..i], sep.ToString(), s[(i + 1)..]);
+    }
 }

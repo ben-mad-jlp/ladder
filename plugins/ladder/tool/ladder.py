@@ -82,7 +82,7 @@ class Node:
     def is_leaf(self) -> bool:
         return not self.children
 
-    def own_text(self) -> str:
+    def own_text(self, with_calls: bool = True) -> str:
         """Everything that defines this step, excluding its children.
         Whitespace is normalised so re-indenting never counts as an edit."""
         parts = [self.title, "in:" + self.inputs, "out:" + self.outputs,
@@ -90,11 +90,19 @@ class Node:
                  *("note:" + n for n in self.notes), *("uses:" + u for u in self.uses)]
         # reads:/writes: are behavior too, but only steps that have them hash them (older trees keep their hashes)
         parts += [*("reads:" + r for r in self.reads), *("writes:" + w for w in self.writes)]
-        parts += [*("calls:" + c for c in self.calls)]
+        if with_calls:
+            parts += [*("calls:" + c for c in self.calls)]
         return "\n".join(" ".join(p.split()) for p in parts)
 
     @property
     def hash(self) -> str:
+        """What the code is generated from (tags carry it). `calls:` lines are left out: declaring that a
+        step calls another tree changes what a person reviews, not what the code must do."""
+        return hashlib.sha1(self.own_text(with_calls=False).encode()).hexdigest()[:6]
+
+    @property
+    def review_hash(self) -> str:
+        """What a person approves: the step's whole text, `calls:` included."""
         return hashlib.sha1(self.own_text().encode()).hexdigest()[:6]
 
 
@@ -477,7 +485,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
         if was is None:
             report["tree"].append(dict(kind="new", node=n.id, msg="new step, not yet approved"))
             continue
-        if was["hash"] != n.hash:
+        if was.get("review_hash", was["hash"]) != (n.review_hash if "review_hash" in was else n.hash):
             report["tree"].append(dict(kind="edited", node=n.id, msg="edited since last approval"))
         if n.parent and was.get("parent_hash") != tree[n.parent].hash:
             report["tree"].append(dict(kind="parent-changed", node=n.id,
@@ -1058,7 +1066,7 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
 
 def stamp(pj: Path) -> None:
     cfg, root, tree, _, lock_path = load_project(pj)
-    lock = {n.id: {"hash": n.hash, "parent_hash": tree[n.parent].hash if n.parent else None,
+    lock = {n.id: {"hash": n.hash, "review_hash": n.review_hash, "parent_hash": tree[n.parent].hash if n.parent else None,
                    "text": n.own_text(), "compare": n.compare}
             for n in tree.values()}
     vocab = load_vocabulary(cfg, root)

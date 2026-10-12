@@ -56,9 +56,11 @@ A tree is indented plain text. Two spaces per level. `#` starts a comment line.
 | `calls:` | Steps in another tree this step calls: `api [api.1.1]` (section 4, links between trees). |
 | `compare:` | Which differences between builds don't matter for this step (see 9). Verification only. |
 
-A step's **hash** covers its title, contract, `>` lines, notes, `uses:`, `reads:`, `writes:` and `calls:` (not its children, and
-not `compare:` lines, which change how builds are compared, never the code).
-Changing any of them makes code generated from the old wording *stale*.
+A step's **hash** covers its title, contract, `>` lines, notes, `uses:`, `reads:` and `writes:` (not its children, and
+not `compare:` lines, which change how builds are compared, never the code, nor `calls:` lines, which
+say which other tree's step this one calls). Changing any of them makes code generated from the old
+wording *stale*. Approval (`stamp`) covers the whole step, `calls:` included: adding or removing a
+`calls:` line shows the step as edited, not its code as stale.
 
 Refer to another step as `[id]` inside text ("answered by [api.1.1]").
 
@@ -178,10 +180,15 @@ capability HTTP client
 ```
 
 `test: <binding key> | <command>` (or just a command, for every binding). `ladder test` runs them
-(and link tests, below) and records each result in `ladder.code.json` against what it tested: the
-capability's in/out, binding, `known:` lines and command. `check` reports a failed test as a problem,
-and as warnings: a capability steps use with no test (`untested-capability`), a test never run, and a
-test whose subject changed since it ran (`test-stale`).
+(and link tests, below) from the project's `check_cwd`, so paths in a command are relative to it, and
+records each result in `ladder.code.json` against what it tested: the capability's in/out, binding,
+`known:` lines and command. A project runs and checks only the tests of capabilities its own steps
+`use:`, for bindings its builds have (a build's name or language), so an API project and a client
+project can share one vocabulary. `check` reports a failed test as a problem (with the assertion's
+expected and received values when the output shows them), and as warnings: a capability with
+`known:` lines that steps use and no test checks (`untested-capability`), a test never run, and a test
+whose subject changed since it ran (`test-stale`). The test file's own contents are not part of that
+subject: after editing a test, run `ladder test` again.
 
 ### Links between trees
 

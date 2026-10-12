@@ -2,7 +2,10 @@
   <!-- Ladder schema exporter for EF Core: see README.md in this folder for how to run it. -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework Condition="'$(TargetFramework)' == ''">net8.0</TargetFramework>
+    <!-- NuGet's restore drops a global TargetFramework, so the framework is its own property:
+         -p:LadderTargetFramework=net9.0 to match a models project that targets net9.0. -->
+    <LadderTargetFramework Condition="'$(LadderTargetFramework)' == ''">net8.0</LadderTargetFramework>
+    <TargetFramework>$(LadderTargetFramework)</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>

@@ -225,16 +225,29 @@ def link_test_hash(tree: L.Tree, alias: str, linked, cmd: str) -> str:
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:8]
 
 
+def build_keys(cfg: dict) -> set[str]:
+    """The binding keys this project's builds answer to: each build's name and language."""
+    return {k for b in cfg.get("builds", []) if b.get("tagged", True) is not False
+            for k in (b.get("name"), b.get("lang")) if k}
+
+
 def all_tests(cfg: dict, root: Path, tree: L.Tree) -> list[dict]:
-    """Every test this project declares: {key, what, cmd, hash, users}."""
+    """Every test this project declares: {key, what, cmd, hash, users}. A capability's tests count only
+    when this project's steps use it, and only for bindings its builds have ("*" for all): with a
+    vocabulary shared by an API and a client project, each runs and reports its own."""
     out = []
     vocab = L.load_vocabulary(cfg, root) or {}
     users: dict[str, list[str]] = {}
     for nid, n in tree.items():
         for u in n.uses:
             users.setdefault(u, []).append(nid)
+    keys = build_keys(cfg)
     for name, cap in vocab.items():
+        if name not in users:
+            continue
         for key, cmd in capability_tests(cap):
+            if key != "*" and key not in keys:
+                continue
             out.append(dict(key=f"capability {name} [{key}]", what=f"capability '{name}' ({key})", cmd=cmd,
                             hash=capability_test_hash(cap, key, cmd), users=users.get(name, [])))
     linked = load_linked(cfg, root) if cfg.get("links") else {}
@@ -256,7 +269,8 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
     vocab = L.load_vocabulary(cfg, root) or {}
     used = {u for n in tree.values() for u in n.uses}
     for name in sorted(used & set(vocab) - tested_caps):
-        if vocab[name].known or vocab[name].bindings:
+        # Only claims need a test: a capability with no known: lines has nothing beyond its binding to check.
+        if vocab[name].known:
             warnings.append(dict(kind="untested-capability", node=name,
                                  msg="nothing checks that the binding behaves as its known: lines say; add a "
                                      "`test: <build or language> | <command>` line and run `ladder test`"))
@@ -276,8 +290,26 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
                                  msg=f"what it tests changed since it last ran ({r.get('at', '?')}); run `ladder test`"))
         elif not r.get("ok"):
             problems.append(dict(kind="test-failed", node=t["key"],
-                                 msg=f"failed when last run ({r.get('at', '?')}): {r.get('tail', '')[:200]}"))
+                                 msg=f"failed when last run ({r.get('at', '?')}): {r.get('tail', '')[:600]}"))
     return problems, warnings
+
+
+ASSERT_RE = re.compile(r"(AssertionError|Assert\.|expected|Expected|received|Received|Actual|actual:|"
+                       r"\bFAIL\b|FAILED|^Failed |Error:|Exception:|✗|×)")
+
+
+def failure_lines(output: str, limit: int = 10) -> list[str]:
+    """The lines that say why a test failed: assertion messages with their expected and received
+    values (vitest, jest, xunit, pytest), then the last lines of output. Source excerpts are skipped."""
+    noise = re.compile(r"^(\d*\s*\||❯|at |[-+] (Expected|Received)$|[⎯─=\-\s\[\]\d/]+$)")
+    lines = [l.strip() for l in output.strip().splitlines() if l.strip() and not noise.match(l.strip())]
+    picked = [l for l in lines if ASSERT_RE.search(l)]
+    seen, out = set(), []
+    for l in picked + lines[-3:]:
+        if l not in seen:
+            seen.add(l)
+            out.append(l)
+    return out[:limit]
 
 
 def run_tests(pj: Path, only: list[str] | None = None) -> int:
@@ -296,14 +328,14 @@ def run_tests(pj: Path, only: list[str] | None = None) -> int:
     for t in tests:
         print(f"{t['what']}: {t['cmd']}")
         res = subprocess.run(t["cmd"], shell=True, cwd=cwd, capture_output=True, text=True)
-        tail = (res.stdout + res.stderr).strip().splitlines()[-8:]
+        tail = failure_lines(res.stdout + res.stderr)
         ok = res.returncode == 0
         failed += not ok
         print(f"  {'ok' if ok else 'FAILED (exit ' + str(res.returncode) + ')'}")
         if not ok:
             print("    " + "\n    ".join(tail))
         results[t["key"]] = dict(hash=t["hash"], ok=ok, at=datetime.date.today().isoformat(),
-                                 tail=" / ".join(tail)[-400:] if not ok else "")
+                                 tail=" / ".join(tail)[:600] if not ok else "")
     (root / L.CODE_FILE).write_text(json.dumps(code, indent=2, sort_keys=True) + "\n")
     print(f"\n{len(tests) - failed} of {len(tests)} passed; results recorded in ladder.code.json")
     return 1 if failed else 0
