@@ -19,7 +19,7 @@ A scenario is one JSON file with an ordered list of requests run against a fresh
 
 - `env` (top level): default values for `{{env:NAME}}`; real secrets come from the environment.
 - `save` (per request): `{"name": "body.a.b" | "status" | "header.location" | "cookie.refresh"}`, used
-  later as `{{var:name}}`. `{{now}}`, `{{now+30s}}`, `{{now-2d}}` give ISO times.
+  later as `{{var:name}}`. `{{now}}`, `{{now+30s}}`, `{{now-2d}}` give ISO times (`{{now:+30s}}` works too).
 - `wait` (per request): seconds to sleep before sending it. `record_headers`: names to record.
 - `step`: the step id that answers the request; `ladder replay` uses it to name the result in the
   trace (requests without it are recorded under `http`). In-process runners name results by the

@@ -646,8 +646,9 @@ def regen_contracts(b: dict, root: Path, tree, gen, log_dir) -> list:
         tried: set[str] = set()
         while True:   # re-read after each splice: line numbers move
             regions, _, lines, _ = L.parse_regions(fpath, b["lang"])
-            todo = [(r, key) for r, key in zip(regions, L.region_keys(regions))
-                    if r.kind == "contract" and not (r.tags and r.tags[0][1] == want_hash) and key not in tried]
+            todo = [(r, key) for i, (r, key) in enumerate(zip(regions, L.region_keys(regions)))
+                    if r.kind == "contract" and not (r.tags and L.contract_region_ok(
+                        tree, b, r.tags[0][1], L.region_own_code(regions, lines, i))) and key not in tried]
             if not todo:
                 break
             r, key = todo[0]

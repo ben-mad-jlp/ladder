@@ -116,7 +116,8 @@ def adopt_check(argv: list[str]) -> int:
 def _mask_one(v, kind: str, sent_at):
     """How a masked value is written to the trace. value: hidden entirely. presence: only whether it
     is null, empty or set (and its JSON type). time: a date-time made relative to when the request
-    was sent, rounded to the minute (time:s for seconds), e.g. "now+120m"."""
+    was sent, rounded to the minute (time:s for seconds), e.g. "now+120m"; a time without a zone is
+    read as local time (time:utc reads it as UTC)."""
     if kind == "presence":
         if v is None:
             return "<null>"
@@ -126,6 +127,7 @@ def _mask_one(v, kind: str, sent_at):
         return f"<{names.get(type(v), 'set')}>"
     if kind.startswith("time"):
         from datetime import datetime, timezone
+        opts_ = set(kind.split(":")[1:])          # s: to the second; utc: zone-less times are UTC
         if not isinstance(v, str):
             return "<null>" if v is None else "<not a time>"
         try:
@@ -133,9 +135,11 @@ def _mask_one(v, kind: str, sent_at):
         except ValueError:
             return "<not a time>"
         if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
+            # no zone given: the time of the machine running replay (usually where the API runs),
+            # or UTC with time:utc
+            t = t.replace(tzinfo=timezone.utc) if "utc" in opts_ else t.astimezone()
         secs = (t - sent_at).total_seconds()
-        if kind == "time:s":
+        if "s" in opts_:
             return f"now{'+' if secs >= 0 else '-'}{abs(round(secs))}s"
         return f"now{'+' if secs >= 0 else '-'}{abs(round(secs / 60))}m"
     return "<masked>"
@@ -151,6 +155,34 @@ def _mask(v, keys, sent_at=None):
     return v
 
 
+def _mask_text(v, patterns: list[tuple]):
+    """Replace regex matches inside every string of a result: a time inside a message
+    ("Already clocked in since 10:55" with \\d\\d:\\d\\d=<hh:mm>) that no key mask can reach."""
+    if not patterns:
+        return v
+    if isinstance(v, dict):
+        return {k: _mask_text(x, patterns) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_mask_text(x, patterns) for x in v]
+    if isinstance(v, str):
+        for rx, rep_ in patterns:
+            v = rx.sub(rep_, v)
+    return v
+
+
+def _parse_mask_text(items: list[str]) -> list[tuple]:
+    out = []
+    for it in items:
+        pat, sep, repl = it.rpartition("=")
+        if not sep or not pat:
+            raise SystemExit(f"replay: --mask-text '{it}': write PATTERN=REPLACEMENT, e.g. '\\d\\d:\\d\\d=<hh:mm>'")
+        try:
+            out.append((re.compile(pat), repl))
+        except re.error as e:
+            raise SystemExit(f"replay: --mask-text '{it}': {e}")
+    return out
+
+
 def _parse_mask(text: str) -> dict:
     out = {}
     for item in (x.strip() for x in text.split(",")):
@@ -158,14 +190,16 @@ def _parse_mask(text: str) -> dict:
             continue
         name, _, kind = item.partition(":")
         kind = kind or "value"
-        if kind not in ("value", "presence", "time", "time:s"):
-            raise SystemExit(f"replay: --mask {item}: kinds are value (default), presence, time, time:s")
+        if kind not in ("value", "presence") and not (kind.split(":")[0] == "time"
+                                                      and set(kind.split(":")[1:]) <= {"s", "utc"}):
+            raise SystemExit(f"replay: --mask {item}: kinds are value (default), presence, time "
+                             f"(time:s for seconds, time:utc when zone-less times are UTC)")
         out[name] = kind
     return out
 
 
 JWT_RE = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$")
-VAR_RE = re.compile(r"\{\{\s*(env|var|now)\s*(?::\s*([^}]*?))?\s*\}\}")
+VAR_RE = re.compile(r"\{\{\s*(env|var|now)\s*(?::\s*([^}]*?)|([+-][^}]*?))?\s*\}\}")   # {{now+90m}} or {{now:+90m}}
 
 
 def _jwt_claims(token: str) -> dict | None:
@@ -211,7 +245,7 @@ def _subst(v, env: dict, saved: dict):
     from datetime import datetime, timedelta, timezone
 
     def one(m):
-        kind, arg = m.group(1), (m.group(2) or "").strip()
+        kind, arg = m.group(1), (m.group(2) or m.group(3) or "").strip()
         if kind == "env":
             if arg not in os.environ and arg not in env:
                 raise SystemExit(f"replay: environment variable {arg} is not set (scenarios read secrets from the environment)")
@@ -275,12 +309,13 @@ def replay(argv: list[str]) -> int:
     import time as _time
     if not argv or argv[0].startswith("--"):
         raise SystemExit("usage: ladder replay <scenario.json|folder> --base URL --out traces/<build> "
-                         "[--mask a,b:presence,c:time] [--header 'K: V'] [--before-each 'command'] [--record-headers a,b] [--jwt] "
-                         "[--observe 'command']")
+                         "[--mask a,b:presence,c:time] [--mask-text 'PATTERN=REPLACEMENT'] [--header 'K: V'] "
+                         "[--before-each 'command'] [--record-headers a,b] [--jwt] [--observe 'command'] [--force]")
     src = Path(argv[0])
     base = opt(argv, "--base", required=True).rstrip("/")
     out = Path(opt(argv, "--out", required=True))
     mask = _parse_mask(opt(argv, "--mask", default=""))
+    mask_text = _parse_mask_text(opts(argv, "--mask-text"))
     observe = opt(argv, "--observe")
     before_each = opt(argv, "--before-each")
     record_default = [h.strip().lower() for h in opt(argv, "--record-headers", default="").split(",") if h.strip()]
@@ -290,6 +325,18 @@ def replay(argv: list[str]) -> int:
         k, _, v = h.partition(":")
         headers[k.strip()] = v.strip()
     files = sorted(src.glob("*.json")) if src.is_dir() else [src]
+    if "--force" not in argv:
+        # Committed traces are usually the reference build's: re-recording them against a changed
+        # database or build silently replaces the thing every comparison is measured against.
+        existing = [out / f"{f.stem}.jsonl" for f in files if (out / f"{f.stem}.jsonl").exists()]
+        if existing:
+            tracked = subprocess.run(["git", "ls-files", "--", *[str(p.resolve()) for p in existing]],
+                                     capture_output=True, text=True, cwd=str(out.resolve()) if out.exists() else ".")
+            if tracked.returncode == 0 and tracked.stdout.strip():
+                raise SystemExit(f"replay: {out} holds traces committed to git ({len(tracked.stdout.split())} "
+                                 f"would be overwritten). If this is the reference build, re-recording it against a "
+                                 f"changed database or build replaces what every comparison is measured against. "
+                                 f"Record into a new folder, or pass --force to replace them.")
     out.mkdir(parents=True, exist_ok=True)
     for f in files:
         if before_each:
@@ -305,6 +352,7 @@ def replay(argv: list[str]) -> int:
                                              urllib.request.HTTPRedirectHandler())
         events = []
         mask_f = {**mask, **_parse_mask(",".join(sc.get("mask", [])))}
+        text_f = mask_text + _parse_mask_text(sc.get("mask_text", []))
         for raw_r in sc["requests"]:
             if raw_r.get("wait"):
                 _time.sleep(float(raw_r["wait"]))
@@ -359,7 +407,7 @@ def replay(argv: list[str]) -> int:
                 if ob.returncode != 0:
                     raise SystemExit(f"replay: --observe command failed ({ob.returncode}): {ob.stderr.strip()[:200]}")
                 result["observed"] = ob.stdout.strip()
-            result = _mask(result, mask_f, sent_at)
+            result = _mask_text(_mask(result, mask_f, sent_at), text_f)
             info = f"{raw_r['method']} {raw_r['path']}"
             events.append({"step": step, "ev": "enter", "ms": 0, "info": info})
             events.append({"step": step, "ev": "exit", "ms": 0, "info": f"{status}",

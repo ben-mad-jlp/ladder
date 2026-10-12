@@ -220,7 +220,7 @@ def parse_tree(path: Path) -> Tree:
 
 CAP_RE = re.compile(r"^capability\s+(.+?)\s*$")
 CAP_ATTR_RE = re.compile(r"^\s+([A-Za-z][A-Za-z0-9_+#.\-]*)\s*:\s*(.*)$")
-CAP_KEYS = {"in", "out", "known", "check", "note", "test"}
+CAP_KEYS = {"in", "out", "known", "check", "note", "test", "reads", "writes"}
 
 
 @dataclass
@@ -234,6 +234,7 @@ class Capability:
     checks: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     tests: list[str] = field(default_factory=list)       # "typescript | npx vitest run x.test.ts"
+    tables: list[str] = field(default_factory=list)      # reads:/writes: schema entities its tests touch
 
     def contract_hash(self) -> str:
         t = f"{self.name}\nin:{' '.join(self.inputs.split())}\nout:{' '.join(self.outputs.split())}"
@@ -290,6 +291,8 @@ def parse_vocabulary(path: Path) -> dict[str, Capability]:
             cur.notes.append(val)
         elif key == "test":
             cur.tests.append(val)
+        elif key in ("reads", "writes"):
+            cur.tables.extend(x.strip() for x in re.split(r"[,;]", val) if x.strip())
         else:
             cur.bindings[key] = val
     return caps
@@ -464,6 +467,86 @@ def contract_hash(tree: dict[str, Node], build: dict | None = None) -> str:
     return hashlib.sha1(text.encode()).hexdigest()[:6]
 
 
+CONTRACT_DECL_RE = re.compile(r"\b(?:class|interface|record|struct|type|enum)\s+([A-Z][A-Za-z0-9_]*)\b")
+
+
+def region_contract_hash(tree, build: dict | None, code: list[str]) -> str:
+    """The hash a @contract region carries: from the data blocks its code declares (a region that
+    declares ClockInRequest depends on data ClockInRequest and the rules it names), so editing one
+    block marks only the regions that spell it out stale. A region that declares no data block
+    depends on the whole build contract (contract_hash)."""
+    data = build_data(tree, build)
+    def base(t: str) -> str:   # ICircuitOptions / ClockInRequestDto / ClockInRequestDTO -> the block name
+        t = re.sub(r"(Dto|DTO)$", "", t)
+        return t[1:] if len(t) > 2 and t[0] == "I" and t[1].isupper() and t[1:] in data else t
+    declared = sorted({base(m.group(1)) for l in code for m in CONTRACT_DECL_RE.finditer(l)} & set(data))
+    if not declared:
+        return contract_hash(tree, build)
+    text = "\n".join(data[k].text() for k in declared).lower()
+    rules = {k: v for k, v in getattr(tree, "rules", {}).items() if k.lower() in text}
+    t = "\n".join([data[k].text() for k in declared] + [f"rule {k}: {' '.join(v.split())}" for k, v in rules.items()])
+    return "d" + hashlib.sha1(t.encode()).hexdigest()[:5]
+
+
+def contract_region_ok(tree, build, tag_hash: str, code: list[str]) -> bool:
+    """A @contract region is current when its tag matches what its code depends on now (per region),
+    or the whole build contract (regions written before per-region hashes)."""
+    return tag_hash in (region_contract_hash(tree, build, code), contract_hash(tree, build))
+
+
+def restamp_contracts(root: Path, cfg: dict) -> int:
+    """After generation: give each @contract region carrying the build-wide hash its per-region hash."""
+    n = 0
+    for b in cfg.get("builds", []):
+        if b.get("tagged") is False:
+            continue
+        whole = None
+        for f in b.get("files", []):
+            fpath = root / f
+            if not fpath.exists():
+                continue
+            regions, _, lines, _ = parse_regions(fpath, b["lang"])
+            changed = False
+            for r in regions:
+                if r.kind != "contract" or not r.tags:
+                    continue
+                whole = whole or contract_hash(root_tree(root, cfg), b)
+                if r.tags[0][1] != whole:
+                    continue
+                own = region_own_code(regions, lines, regions.index(r))
+                h = region_contract_hash(root_tree(root, cfg), b, own)
+                if h != whole:
+                    lines[r.start - 1] = lines[r.start - 1].replace(f"@{whole}", f"@{h}", 1)
+                    changed = True
+                    n += 1
+            if changed:
+                fpath.write_text("\n".join(lines) + "\n")
+    return n
+
+
+_TREES: dict = {}
+
+
+def root_tree(root: Path, cfg: dict):
+    key = (str(root), cfg["tree"])
+    if key not in _TREES:
+        _TREES[key] = parse_tree(root / cfg["tree"])
+    return _TREES[key]
+
+
+def region_own_code(regions: list, lines: list[str], idx: int) -> list[str]:
+    """A region's lines, without its marker lines and without nested regions."""
+    r = regions[idx]
+    inner = set()
+    for j, rr in enumerate(regions):
+        p = rr.parent
+        while p is not None and p != idx:
+            p = regions[p].parent
+        if p == idx:
+            inner.update(range(rr.start - 1, rr.end))
+    return [lines[k] for k in range(r.start, r.end - 1) if k not in inner]
+
+
 def data_texts(tree) -> dict[str, str]:
     """Data blocks and named rules by name ("data Note", "rule tag name"), as approved text."""
     out = {f"data {k}": d.text() for k, d in getattr(tree, "data", {}).items()}
@@ -487,7 +570,7 @@ def baseline_lock(cfg: dict, root: Path, ref: str) -> dict | None:
 
 
 def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | None = None,
-          links_since: str | None = None) -> dict:
+          links_since: str | None = None, review_since: str | None = None) -> dict:
     cfg, root, tree, lock, _ = load_project(pj)
     if only_builds:
         ref = cfg.get("compare", {}).get("reference")
@@ -496,16 +579,20 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
     # Nothing approved yet? Compare with the project's baseline commit instead of a lock, so a review
     # shows what changed, not every step as new. An explicit --since wins; a stamp always wins.
     base = None
-    if not any(not k.startswith("@") for k in lock) and cfg.get("baseline") and not (schema_since or links_since):
+    if review_since:
+        base = review_since          # --since: review everything against that commit, stamp or not
+    elif not any(not k.startswith("@") for k in lock) and cfg.get("baseline") and not (schema_since or links_since):
         base = cfg["baseline"]
+    if base:
         old = baseline_lock(cfg, root, base)
         if old is None:
             report["tree"].append(dict(kind="baseline", node=base,
-                                       msg=f"\"baseline\": {base} is not a commit git knows here, or the tree did not exist "
+                                       msg=f"{base} is not a commit git knows here, or the tree did not exist "
                                            f"there; every step shows as new (git fetch, or fix the ref)"))
         else:
-            lock = old
-            schema_since = links_since = base
+            lock = {**{k: v for k, v in lock.items() if k.startswith("@") and k not in ("@data",)}, **old}
+            schema_since = schema_since or base
+            links_since = links_since or base
             report["baseline"] = base
 
     # Tree review: what changed since the tree was last approved?
@@ -566,9 +653,24 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
             since = f"since {schema_since}"
         else:
             was_all, since = lock.get("@schema", {}), "since approval"
+        writers_seen: set = set()
+        known = S.attrs_known(was_all)     # attributes the old facts never carry are not compared
         for nid, now in sfacts.items():
             was = was_all.get(nid, {})
-            changed = [c for k, v in now.items() if k in was for c in S.fact_changes(k, was[k], v)]
+            changed = [c for k, v in now.items() if k in was for c in S.fact_changes(k, was[k], v, known)]
+            for c in changed:
+                if "inserts must now set it" in c:
+                    ent_key = c.split(" added", 1)[0].rsplit(".", 1)[0]          # qbs:Dbo_Timeclock
+                    sname, _, ename = ent_key.partition(":")
+                    e = schemas.get(sname, {}).get(ename)
+                    if e is not None and ent_key not in writers_seen:
+                        writers_seen.add(ent_key)
+                        found = S.other_writers(root, cfg, e)
+                        if found:
+                            report["warnings"].append(dict(
+                                kind="other-writers", node=ename,
+                                msg=f"code outside this project creates {ename} rows and must set the new required "
+                                    f"column too (tests and seeders included): {', '.join(found)}"))
             if changed:
                 report["tree"].append(dict(kind="schema-changed", node=nid,
                                            msg=f"the schema it refers to changed {since} (" + "; ".join(changed)
@@ -616,15 +718,16 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                 br["problems"].append(dict(kind="missing-file", file=f, line=0,
                                            msg="file not found (generate it with `ladder generate`, or fix the path in ladder.json)"))
                 continue
-            regions, _, _, probs = parse_regions(fpath, b["lang"])
+            regions, _, flines, probs = parse_regions(fpath, b["lang"])
             br["problems"] += group_untagged(probs)
             for r in regions:
                 if r.kind == "contract":
                     h = r.tags[0][1] if r.tags else ""
                     has_contract = True
-                    if h != contract_hash(tree, b):
+                    own = region_own_code(regions, flines, regions.index(r))
+                    if not contract_region_ok(tree, b, h, own):
                         br["problems"].append(dict(kind="stale-contract", file=f, line=r.start,
-                                                   msg=f"contract types were generated from older in:/out: lines or data blocks (tag {h}, now {contract_hash(tree, b)}); regenerate this region"))
+                                                   msg=f"contract types were generated from older in:/out: lines or data blocks (tag {h}, now {region_contract_hash(tree, b, own)}); regenerate this region"))
                     continue
                 if r.kind != "node":
                     continue
@@ -636,12 +739,14 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                     covered[nid].append(f"{f}:{r.start}")
                     if h != tree[nid].hash:
                         br["problems"].append(dict(kind="stale", file=f, line=r.start, node=nid,
-                                                   msg=f"generated from an older [{nid}] (tag {h}, tree now {tree[nid].hash}); regenerate this region"))
+                                                   msg=f"generated from an older [{nid}] (tag {h}, tree now {tree[nid].hash}); regenerate this region, "
+                                                       f"or, if the English was only reworded, `ladder retag <ladder.json> {nid}`"))
                 if r.code_lines == 0 and not any(
                         rr.parent == regions.index(r) for rr in regions):
                     br["problems"].append(dict(kind="empty", file=f, line=r.start,
                                                msg=f"region '{r.label}' contains no code"))
 
+        br["has_contract"] = has_contract
         if b.get("data") and not has_contract:
             br["problems"].append(dict(kind="missing-contract", node="data",
                                        msg=f"no @contract region spells out the data blocks this build lists "
@@ -990,7 +1095,7 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
     def where(p):
         return f"{p['file']}:{p['line']}  " if "file" in p else ""
     base = rep.get("baseline")
-    print("Tree" + (f" (nothing approved yet: compared with the baseline, {base})" if base else ""))
+    print("Tree" + (f" (compared with {base}, not with the last approval)" if base else ""))
     if not rep["tree"]:
         print("  ok: " + (f"no changes since {base}" if base else "matches the last approved version"))
     for p in rep["tree"]:
@@ -1007,7 +1112,9 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
         if b.get("untagged_build"):
             print("  compared by behavior only (\"tagged\": false): no tag or coverage checks")
             continue
-        if scope == []:
+        if scope == [] and b.get("has_contract"):
+            print("  contract only (\"steps\": []): its @contract regions spell out data blocks; implements no steps")
+        elif scope == []:
             print("  support only (\"steps\": []): checks tags, hand edits and exports; implements no steps")
         else:
             print(f"  {direct}/{len(leaves)} leaf steps {'in its scope ' if scope else ''}tagged directly")
@@ -1472,6 +1579,7 @@ def main(argv: list[str]) -> int:
             status = R.regen(pj, only=build, dry_run="--dry-run" in argv)
         if "--dry-run" not in argv and not any(a.startswith("--out=") for a in argv):
             run_formatter(root, cfg, before)
+            restamp_contracts(root, cfg)
             # Regions the generator just wrote are its code now, not hand edits.
             record_code(root, cfg, before=before)
         return status
@@ -1486,7 +1594,7 @@ def main(argv: list[str]) -> int:
         links_since = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--links-since=")), since)
         global SHOW_ALL
         SHOW_ALL = "--all-differences" in argv[3:]
-        rep = check(pj, only, schema_since, links_since)
+        rep = check(pj, only, schema_since, links_since, since)
         print_report(rep, load_project(pj)[2])
         # 0 ok · 1 problems · 3 only waiting for a person's approval
         return {"ok": 0, "problems": 1, "awaiting-approval": 3}[rep["status"]]

@@ -60,11 +60,17 @@ Every profile also answers:
 
 - `conventions/shared.md`: what holds for every build (wire format camelCase JSON, error body shape,
   time in UTC ISO-8601, ids are whole numbers).
-- `conventions/<lang>.md` (or `<build>.md` when two builds of one language differ, like web vs android).
+- `conventions/<lang>.md` (or `<build>.md` when two builds of one language differ, like web vs android):
+  the language's general rules, written once for the whole codebase, in a folder every area shares
+  (`ladder/conventions/csharp.md`).
+- `conventions/<area>-<lang>.md` next to the area's projects: only what is specific to that slice
+  (its services and their methods, which step maps to which method, names of its DbSets). Keep these
+  out of the general file, or the next area copies auth's names (round 6 had to fork the whole
+  profile for the timeclock).
 
 Keep each profile short and concrete: rules plus one real example each, about 60 to 150 lines. A
 generator follows examples more reliably than prose. List the files in each build's `"conventions"`
-array in ladder.json, shared first.
+array in ladder.json, general first, slice-specific last.
 
 ## 4. Check it
 

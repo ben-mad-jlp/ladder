@@ -92,6 +92,8 @@ foreach (var (contextName, outPath) in pairs)
                 // set by the database: identity keys and columns with a SQL default
                 generated = (p.ValueGenerated == ValueGenerated.OnAdd && p.IsPrimaryKey() && p.ClrType != typeof(Guid))
                             || p.GetDefaultValueSql() != null,
+                // the value an insert gets when it leaves the column out (SQL default or HasDefaultValue)
+                @default = DefaultText(p),
             }).ToList(),
             navigations = e.GetNavigations().Select(n => (object)new
             {
@@ -111,11 +113,23 @@ foreach (var (contextName, outPath) in pairs)
         });
     }
     Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outPath))!);
-    File.WriteAllText(outPath, JsonSerializer.Serialize(new { context = ctxType.Name, entities },
+    File.WriteAllText(outPath, JsonSerializer.Serialize(new { exporter = "ladder efcore-schema 2", context = ctxType.Name, entities },
         new JsonSerializerOptions { WriteIndented = true }));
     Console.WriteLine($"{ctxType.Name}: {entities.Count} entities -> {outPath}");
 }
 return 0;
+
+static string? DefaultText(IProperty p)
+{
+    try
+    {
+        var sql = p.GetDefaultValueSql();
+        if (sql != null) return sql;
+        var v = p.GetDefaultValue();
+        return v switch { null => null, string str => $"'{str}'", bool b => b ? "1" : "0", _ => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture) };
+    }
+    catch { return null; }
+}
 
 static string SafeColumnType(IProperty p)
 {

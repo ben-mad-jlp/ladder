@@ -95,11 +95,56 @@ def contract_text(tree: L.Tree, nid: str) -> str:
     for key, val in (("in", n.inputs), ("out", n.outputs), ("effects", n.effects)):
         if val:
             lines.append(f"  {key}: {' '.join(val.split())}")
-    said = " ".join([n.inputs, n.outputs, n.effects])
-    for name, d in getattr(tree, "data", {}).items():
-        if re.search(rf"\b{re.escape(name)}\b", said):
-            lines.append(d.text())
+    for name, d in contract_data(tree, nid).items():
+        lines.append(f"  data {name}")
+        lines += [f"  {name}.{k}: {' '.join(v.split())}" for k, v in d.fields]
+        lines += [f"  {name} rule: {' '.join(r.split())}" for r in d.rules]
     return "\n".join(lines)
+
+
+def contract_data(tree: L.Tree, nid: str) -> dict:
+    """The data blocks a step's in:/out:/effects: lines name (its request and answer shapes)."""
+    n = tree[nid]
+    said = " ".join([n.inputs, n.outputs, n.effects])
+    return {name: d for name, d in getattr(tree, "data", {}).items()
+            if re.search(rf"\b{re.escape(name)}\b", said)}
+
+
+TYPE_DECL_RE = re.compile(r"\b(?:interface|type|class|record|struct|enum)\s+([A-Z][A-Za-z0-9_]*)")
+
+
+def hand_written_types(cfg: dict, root: Path, name: str) -> list[tuple[str, str, int]]:
+    """(file, type name, line) for types in this project's hand-written files (builds' "reads") whose
+    name starts with a data block's name: ClockInRequestDTO for data ClockInRequest."""
+    out = []
+    for b in cfg.get("builds", []):
+        for f in b.get("reads", []):
+            try:
+                lines = (root / f).read_text().splitlines()
+            except OSError:
+                continue
+            for i, l in enumerate(lines, 1):
+                for m in TYPE_DECL_RE.finditer(l):
+                    t = m.group(1)
+                    if t == name or (t.startswith(name) and t[len(name):] in ("DTO", "Dto", "Model", "Body", "Type", "Data")):
+                        out.append((f, t, i))
+    return out
+
+
+def only_block(text: str, name: str) -> str:
+    return "\n".join(l for l in text.splitlines()
+                     if l.strip().startswith((f"{name}.", f"{name} rule:", f"data {name}")))
+
+
+def changed_data(was: str, now: str) -> list[str]:
+    """Names of data blocks whose lines differ between two contract texts."""
+    a, b = set(was.splitlines()), set(now.splitlines())
+    names = set()
+    for l in a ^ b:
+        m = re.match(r"^\s+(?:data )?([A-Z][A-Za-z0-9_]*)[. ]", l)
+        if m:
+            names.add(m.group(1))
+    return sorted(names)
 
 
 def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | None = None):
@@ -111,6 +156,7 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
         if isinstance(v, str):
             problems.append(dict(kind="link", node=alias, msg=v))
     old_trees: dict[str, L.Tree | None] = {}
+    drift_seen: set = set()
     was_all = lock.get("@links", {})
     for nid, calls in callers.items():
         for alias, tid, written in calls:
@@ -146,8 +192,18 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                 approvals.append(dict(kind="linked-changed", node=nid,
                                       msg=f"calls {key}, whose contract changed {when}: " + diff_text(was, now)
                                           + "; re-read this step (and the code that handles the answer), then approve"))
-    # Steps in this tree that rely on a linked-changed step: they name it ("signs in through
-    # [authsvc.1]"), or they are its parent. They handle the same answer, one step removed.
+                for name in changed_data(was, now):
+                    for f, tname, line in hand_written_types(cfg, root, name):
+                        if (f, tname) in drift_seen:
+                            continue
+                        drift_seen.add((f, tname))
+                        warnings.append(dict(kind="type-drift", node=f"{f}:{line}",
+                                             msg=f"declares {tname}, which looks like the {alias} tree's data {name} "
+                                                 f"({diff_text(only_block(was, name), only_block(now, name))}). This file is read, not "
+                                                 f"generated, so nothing updates it: change it by hand, or give it a "
+                                                 f"build whose data blocks follow the {alias} tree's"))
+    # Steps in this tree that rely on a linked-changed step: their English names it ("signs in
+    # through [authsvc.1]"). They handle the same answer, one step removed.
     flagged = {a["node"]: a for a in approvals}
     frontier = list(flagged)
     while frontier:
@@ -156,8 +212,8 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
             if nid in flagged:
                 continue
             text = " ".join([n.title, n.inputs, n.outputs, n.effects, *n.steps, *n.notes])
-            if f"[{src}]" in text or tree[src].parent == nid:
-                why = "is its parent" if tree[src].parent == nid else f"refers to [{src}]"
+            if f"[{src}]" in text:     # its English names the step (not merely its parent: round 6's F9)
+                why = f"refers to [{src}]"
                 flagged[nid] = dict(kind="linked-changed", node=nid,
                                     msg=f"{why}, which is affected by a change in another tree "
                                         f"({flagged[src]['msg'].split(',')[0].replace('calls ', 'it calls ')}); "
@@ -197,15 +253,28 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
 
 
 def diff_text(was: str, now: str) -> str:
-    a, b = was.splitlines(), now.splitlines()
-    gone = [l.strip() for l in a if l not in b]
-    new = [l.strip() for l in b if l not in a]
+    """What changed between two contract texts, line by line: `out: A -> B`, `added
+    ClockInRequest.source: ...` (a new field of a data block the step takes or answers)."""
+    def keyed(text):
+        out = {}
+        for l in text.splitlines():
+            t = l.strip()
+            k = t.split(": ", 1)[0] if ": " in t else t
+            out[k] = t.split(": ", 1)[1] if ": " in t else ""
+        return out
+    a, b = keyed(was), keyed(now)
     parts = []
-    if gone:
-        parts.append("was " + " | ".join(gone))
-    if new:
-        parts.append("now " + " | ".join(new))
-    return "; ".join(parts) or "reordered"
+    for k in a:
+        if k in b and a[k] != b[k]:
+            parts.append(f"{k}: was {a[k]}; now {b[k]}")
+        elif k not in b:
+            parts.append(f"removed {k}" + (f": {a[k]}" if a[k] else ""))
+    for k in b:
+        if k not in a and not k.startswith("data "):
+            field = re.match(r"^([A-Z][A-Za-z0-9_]*)\.(\w+)$", k)
+            what = f"data {field.group(1)} gained field {field.group(2)}" if field else f"added {k}"
+            parts.append(what + (f": {b[k]}" if b[k] else ""))
+    return " | ".join(parts) or "reordered"
 
 
 def prompt_text(ids: list[str], tree: L.Tree, cfg: dict, root: Path) -> str:
@@ -257,9 +326,10 @@ def command_files_hash(cmd: str, cwd: Path | None) -> str:
     return h.hexdigest()[:8]
 
 
-def capability_test_hash(cap, key: str, cmd: str, cwd: Path | None = None) -> str:
+def capability_test_hash(cap, key: str, cmd: str, cwd: Path | None = None, schema_facts: str = "") -> str:
     t = "\n".join([cap.inputs, cap.outputs, cap.bindings.get(key, "") if key != "*" else
-                   json.dumps(cap.bindings, sort_keys=True), *cap.known, cmd, command_files_hash(cmd, cwd)])
+                   json.dumps(cap.bindings, sort_keys=True), *cap.known, cmd, command_files_hash(cmd, cwd),
+                   schema_facts])
     return hashlib.sha1(" ".join(t.split()).encode()).hexdigest()[:8]
 
 
@@ -293,14 +363,28 @@ def all_tests(cfg: dict, root: Path, tree: L.Tree) -> list[dict]:
         for u in n.uses:
             users.setdefault(u, []).append(nid)
     keys = build_keys(cfg)
+    schemas = None
     for name, cap in vocab.items():
         if name not in users:
             continue
         for key, cmd in capability_tests(cap):
             if key != "*" and key not in keys:
                 continue
+            facts = ""
+            if cap.tables and cfg.get("schemas"):
+                # a test that touches tables goes stale when their schema changes (round 6: a new
+                # required column broke the test's own insert)
+                import ladder_schema as S
+                if schemas is None:
+                    schemas = S.load_schemas(cfg, root)
+                for t in cap.tables:
+                    m = S.ENTITY_REF_RE.match(t)
+                    if m:
+                        sname, e, _, _ = S.resolve(S.Ref(t, m.group(1), m.group(2), None, "reads"), schemas)
+                        if e is not None:
+                            facts += f"{sname}:{e.name} {S.members_fact(e)}\n"
             out.append(dict(key=f"capability {name} [{key}]", what=f"capability '{name}' ({key})", cmd=cmd,
-                            hash=capability_test_hash(cap, key, cmd, cwd), users=users.get(name, [])))
+                            hash=capability_test_hash(cap, key, cmd, cwd, facts), users=users.get(name, [])))
     linked = load_linked(cfg, root) if cfg.get("links") else {}
     for alias in (cfg.get("links") or {}):
         spec = link_spec(cfg, alias)
@@ -338,7 +422,9 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
             warnings.append(dict(kind="test-not-run", node=t["key"], msg=f"never run; `ladder test` runs `{t['cmd']}`"))
         elif r.get("hash") != t["hash"]:
             warnings.append(dict(kind="test-stale", node=t["key"],
-                                 msg=f"what it tests changed since it last ran ({r.get('at', '?')}); run `ladder test`"))
+                                 msg=f"what it tests changed since it last ran ({r.get('at', '?')}): the capability or link, its test "
+                                     f"files, or the schema of tables it touches (after a Ladder upgrade, possibly only "
+                                     f"how that is recorded); run `ladder test`"))
         elif not r.get("ok"):
             problems.append(dict(kind="test-failed", node=t["key"],
                                  msg=f"failed when last run ({r.get('at', '?')}): {r.get('tail', '')[:600]}"))
@@ -346,7 +432,8 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
 
 
 ASSERT_RE = re.compile(r"(AssertionError|Assert\.|expected|Expected|received|Received|Actual|actual:|"
-                       r"\bFAIL\b|FAILED|^Failed |Error:|Exception:|✗|×)")
+                       r"\bFAIL\b|FAILED|^Failed |Error:|Exception:|\w+Exception\b|Error Number|Cannot insert|"
+                       r"violat|constraint failed|✗|×)")
 
 
 def failure_lines(output: str, limit: int = 10) -> list[str]:

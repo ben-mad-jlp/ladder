@@ -1,5 +1,8 @@
 # EF Core schema exporter
 
+Records, per column: name, type, required, max length, `generated` (identity keys, SQL defaults)
+and `default` (what an insert that leaves the column out gets).
+
 For projects whose database changes are not EF migrations (no `ModelSnapshot.cs` to point
 `"kind": "efcore-snapshot"` at). It builds each DbContext's model offline, without opening a
 database connection, and writes Ladder's `"kind": "json"` schema.
