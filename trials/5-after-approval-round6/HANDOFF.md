@@ -1,6 +1,6 @@
 # Ladder round 6 handoff: after approval, on a second slice
 
-2026-10-12 · from Ben (drafted by Claude for Ben to edit)
+2026-10-12 · from Ben (drafted by Claude)
 
 ## Goal
 
@@ -92,9 +92,9 @@ Each phase ends with `ladder check` on every project and a line in the report.
       scenario, or relative (`{{now}}`).
     - Run `ladder test` on every project.
     - Retag the auth `[authsvc.1]` once if v0.5.1 shows it stale (the upgrade note in PR #3), and record it.
-2. **Stop: Ben stamps** the auth trees (`ladder/auth/api`, `ladder/auth/clients`) and the timeclock trees.
-   List in the report exactly what he approved (commit and projects). After the stamp, `check` on every
-   project should be clean except for warnings you can explain. Record each remaining warning.
+2. **Stop: Ben stamps the timeclock trees only.** The auth trees stay unstamped. List in the report
+   exactly what he approved (commit and projects). After the stamp, `check` on every timeclock project
+   should be clean except for warnings you can explain. Record each remaining warning.
 3. **Change (a), across the trees, with no `--since`.**
     - Edit only the API English: a failed clock-in answers 409 for "already clocked in" (`code`
       `ALREADY_CLOCKED_IN`, the clock-in time) and 400 for an invalid clock type (`code`
@@ -121,19 +121,16 @@ Each phase ends with `ladder check` on every project and a line in the report.
       stamps.
     - After the stamp, `check` must be clean of `linked-changed`, `has-callers`, `schema-changed` and
       `edited`. Record anything left.
-6. **Auth, unchanged since the stamp.** Run `check` and `ladder test` on both auth projects with v0.5.1.
-   Record any warning that wasn't there in round 5 and any that disappeared.
+6. **Auth, still unstamped.** Run `check` (with `--since=<round 5's last commit>`) and `ladder test` on both
+   auth projects with v0.5.1. Record any warning that wasn't there in round 5 and any that disappeared.
 7. **Report.** Leave everything awaiting Ben's next approval; do not stamp.
 
-## Decisions for Ben before the round starts
+## Decisions (Ben, 2026-10-12)
 
-- **Indirect callers (round 5's F9).** Should `check` flag a step that calls a `linked-changed` step in its own
-  tree (the scanner's wrapper calling the library's `clockIn`)?
-  - If yes, v0.5.2 needs that before round 6.
-  - If no, round 6 records what happens and leaves it to the link test.
-- **What to stamp in phase 2.** The auth trees as they stand after round 5 (their working files are stale by
-  design: the regenerated code is only in scratch), or only the timeclock trees. Stamping auth tests
-  `has-callers` on a tree with history; stamping only timeclock keeps the round small.
+- **What to stamp:** only the timeclock trees. The auth trees stay unstamped.
+- **Indirect callers (round 5's F9):** no tool change before this round. Round 6 records whether the scanner's
+  wrapper is flagged when the library step it calls is `linked-changed`, and relies on the link test
+  otherwise. The report should say whether flagging it would have helped.
 
 ## What to report
 
