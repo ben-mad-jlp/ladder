@@ -318,6 +318,8 @@ def _parse_mask(text: str) -> dict:
 
 
 JWT_RE = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$")
+# A JWT anywhere in a text (its header always starts "eyJ": base64 of '{"').
+TOKEN_RE = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 VAR_RE = re.compile(r"\{\{\s*(env|var|now)\s*(?::\s*([^}]*?)|([+-][^}]*?))?\s*\}\}")   # {{now+90m}} or {{now:+90m}}
 
 
@@ -469,7 +471,7 @@ def replay(argv: list[str]) -> int:
     if not argv or argv[0].startswith("--"):
         raise SystemExit("usage: ladder replay <scenario.json|folder> --base URL --out traces/<build> "
                          "[--mask a,b:presence,c:time] [--mask-text 'PATTERN=REPLACEMENT'] [--header 'K: V'] "
-                         "[--before-each 'command'] [--record-headers a,b] [--jwt] [--observe 'command'] [--project ladder.json] [--force]")
+                         "[--before-each 'command'] [--record-headers a,b] [--jwt] [--keep-tokens] [--observe 'command'] [--project ladder.json] [--force]")
     src = Path(argv[0])
     base = opt(argv, "--base", required=True).rstrip("/")
     out = Path(opt(argv, "--out", required=True))
@@ -479,6 +481,8 @@ def replay(argv: list[str]) -> int:
     before_each = opt(argv, "--before-each")
     record_default = [h.strip().lower() for h in opt(argv, "--record-headers", default="").split(",") if h.strip()]
     jwt_on = "--jwt" in argv
+    keep_tokens = "--keep-tokens" in argv
+    tokens_hidden = 0
     headers = {"Content-Type": "application/json"}
     for h in opts(argv, "--header"):
         k, _, v = h.partition(":")
@@ -573,9 +577,18 @@ def replay(argv: list[str]) -> int:
             result = _mask_text(_mask(_mask_echoes(result, mask_f), mask_f, sent_at), here + text_f)
             info = f"{raw_r['method']} {raw_r['path']}"
             events.append({"step": step, "ev": "enter", "ms": 0, "info": info})
-            events.append({"step": step, "ev": "exit", "ms": 0, "info": f"{status}",
-                           "data": json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)})
+            data = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            if not keep_tokens:
+                # Signed tokens (a sign-in's access token, a token inside a header or a text) are secrets: never written
+                # to a trace that may be committed. Round 18: a recorder without --jwt wrote the login tokens as they were.
+                data, n = TOKEN_RE.subn("<token>", data)
+                tokens_hidden += n
+            events.append({"step": step, "ev": "exit", "ms": 0, "info": f"{status}", "data": data})
         (out / f"{f.stem}.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+        if tokens_hidden:
+            print(f"  {f.stem}: {tokens_hidden} values that look like signed tokens (JWT) were written as <token>; "
+                  f"--jwt records their claims instead (comparable across runs), --keep-tokens keeps them (never in committed traces)")
+            tokens_hidden = 0
         _write_replay_meta(out, mask, mask_text, jwt_on, record_default, observe, _replay_project(out, opt(argv, "--project")))
         print(f"  {f.stem}: {len(events) // 2} requests -> {out / (f.stem + '.jsonl')}")
     return 0

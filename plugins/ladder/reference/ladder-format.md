@@ -503,6 +503,9 @@ Two ways to get traces:
   `<project>/traces/<build>`, or `--project <ladder.json>`), and `check` warns `reference-stale` when the reference
   was recorded from other code than is there now: re-record it from that code, built, or `ladder reference --from`.
   The `--observe` command is recorded relative to its git repository, so two checkouts record the same settings.
+  A value that looks like a signed token (a JWT, also inside a text such as `Bearer ...`) is written as `<token>`:
+  traces are committed, tokens are secrets. `--jwt` records a token's claims instead (comparable across runs);
+  `--keep-tokens` keeps them as they are, for traces that are never committed (round 18).
   `check` warns (`replay-settings`) when a build's traces were recorded differently from the
   reference's, since the difference may then be the recording's. In requests, `{{now}}`, `{{now+90m}}` and `{{now-2d}}`
   give ISO times. Replay refuses to overwrite traces that are committed to git (usually the reference

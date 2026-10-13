@@ -61,3 +61,12 @@ so two builds on two ports compare equal.
 Values the database or the clock decides (ids, timestamps, ETags) can differ between two correct
 builds. Mask them by key with `--mask id,createdUtc,updatedUtc`; masked values become `"<masked>"`
 everywhere in the body. Mask as little as possible: a masked field is no longer compared.
+
+## Pushed events (SignalR, websockets, server-sent events)
+
+`replay` speaks HTTP, so a push the service sends to clients is recorded through `--observe`: start a listener before
+the replay that connects as each recipient and appends every event it receives to a file ("<recipient> <event>
+<payload>"), and make the observe command wait briefly, print the file sorted (delivery order across recipients is not
+behaviour) and clear it. Each request's trace then holds the events it caused, and who did not get one shows by
+absence. Mask times in payloads with `--mask-text`, and give every recording the same events file name, or
+`replay-settings` reports the recordings as made differently (round 18).
