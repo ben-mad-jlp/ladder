@@ -46,6 +46,9 @@ English. Put files in `scenarios/` and list their names in ladder.json `compare.
 - One runner script per repository (reset the test data, start the API on 127.0.0.1, run one test file
   of a given app, stop the API), taking the app folder, the reset command and the port as arguments, so
   every area's link and behaviour tests use it rather than a copy.
+- A consumer that compiles against a built package (an app importing a library's `dist`) does not see a
+  regenerated library until the package is built again: build it before the consumer's check and tests
+  (in its `check_command` or the runner), or a regenerated library goes untested by its callers.
 - The slice's own tests (the existing unit tests for those files, and behaviour tests you write for the
   states the English describes) go in ladder.json `"tests"`, so `ladder test` runs and records them and
   `check` sees when the code changed after they ran. A generated build that compiles can still use the

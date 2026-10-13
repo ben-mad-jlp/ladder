@@ -25,7 +25,8 @@ A scenario is one JSON file with an ordered list of requests run against a fresh
   trace (requests without it are recorded under `http`). In-process runners name results by the
   spans the code records, so there the field is just documentation.
 - `method`, `path`: as sent. `body`: any JSON (an object, or a string or list to test bad input);
-  omit it to send none. `headers`: extra headers for this request; an empty value removes a default
+  omit it to send none. `raw`: text sent as it is, for a body that is not JSON at all (`"raw": "{not json"`,
+  still with the JSON content type unless `headers` changes it). `headers`: extra headers for this request; an empty value removes a default
   header (`"Authorization": ""` tests a signed-out request when `--header` sets a token).
 - Other top-level keys (`"note"` describing the scenario) are allowed and ignored.
 - `now`: used by in-process runners with a fixable clock; `ladder replay` ignores it, so mask time

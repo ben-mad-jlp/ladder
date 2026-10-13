@@ -636,12 +636,24 @@ def contract_prompt(build, file_rel, lines, r: L.Region, tree, conv: str) -> str
                           if L.build_in_scope(build, n.id))
     numbered = "\n".join(f"{i + 1:4d}  {l}" for i, l in enumerate(lines))
     marker_name = lines[r.start - 1].split("@contract", 1)[1].strip().rpartition("@")[0]
+    # Which data blocks this region holds, and where the build's others live: without this, a region labelled with
+    # one block got every block of the build, and the build declared each type twice.
+    holds = []
+    mine = L.label_blocks(tree, build, r.label)
+    if mine and CTX.get("root") is not None:
+        others = [(f, lab, blks) for f, lab, blks in L.contract_layout(CTX["root"], build, tree)
+                  if blks and not (f == file_rel and lab == r.label)]
+        holds = [f"=== This region holds only the type(s) for: {', '.join(mine)}."]
+        if others:
+            holds.append("The build's other data blocks have their own regions; do not declare them here, refer to "
+                         "them by name: " + "; ".join(f"{', '.join(blks)} in {f}" for f, lab, blks in others) + ".")
+        holds.append("")
     return "\n".join([
         f"LANGUAGE: {build['lang']}    BUILD: {build['name']}    FILE: {file_rel}",
         "This region holds the data types that spell out the steps' in:/out: contracts (the names in "
         "backticks are field names). One or more contracts changed. Update the types so they match the "
         "contracts exactly: add, remove or rename fields as the English now says. Keep imports, constants "
-        "and anything else in the region unless the contract change requires otherwise.", "",
+        "and anything else in the region unless the contract change requires otherwise.", "", *holds,
         "=== Conventions:", conv, "",
         "=== Every step's contract, as it is now:", contracts, "",
         context_text(build, conventions=False),
@@ -1243,6 +1255,24 @@ def read_files_text(root: Path, b: dict) -> str:
     for f in b.get("reads", []):
         parts += ["", f"=== {f} (exists already; read only, do not repeat or change it):", (root / f).read_text()]
     return "\n".join(parts)
+
+
+def project_check_errors(cfg: dict, root: Path) -> str | None:
+    """Run the project's "check_command" and return its error lines ("" when it builds; None when no command is
+    configured). Used by `regen --repair=N` between repair rounds."""
+    cmd = cfg.get("check_command")
+    if not cmd:
+        return None
+    cwd = (root / cfg.get("check_cwd", ".")).resolve()
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=900)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"(check command failed to run: {e})"
+    if res.returncode == 0:
+        return ""
+    lines = list(dict.fromkeys(l.strip() for l in (res.stdout + res.stderr).splitlines()
+                               if re.search(r"\berror\b|Error|FAIL", l)))
+    return "\n".join(lines) if lines else (res.stdout + res.stderr)[-2000:]
 
 
 def run_build_check(cfg: dict, root: Path, target: Path) -> str:

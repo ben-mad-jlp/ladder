@@ -111,7 +111,9 @@ checks below.
 ## 2. Build, then repair
 
 Right after generating, build and run the fast tests for each changed build (`dotnet build`,
-`npx tsc --noEmit`, the project's test command). Save the compiler or test output to a file and run
+`npx tsc --noEmit`, the project's test command). `ladder regen ... --repair=3` does the build part for
+you: it runs the project's `check_command`, repairs what it reports and builds again, at most three
+rounds, and says whether the code builds. Otherwise save the compiler or test output to a file and run
 `ladder repair` with it. It maps each error to the region it points at and regenerates only that
 region, with the error in the prompt. It may add imports or declarations to `@support` regions
 through `@add-to-support` requests; these are listed in its output, so review them.
