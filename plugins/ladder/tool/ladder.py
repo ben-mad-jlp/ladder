@@ -7,6 +7,9 @@ Commands
                                    exit 0 ok · 1 problems · 3 only awaiting a person's approval
                                    --since: report schema and linked-step changes since GIT_REF
                                    instead of since approval (before the first stamp)
+  ladder check --all [FOLDER] [--since=GIT_REF]
+                                   every project the nearest ladder.repo.json lists ("projects"):
+                                   one line each, then a count by kind
   ladder test   <project.json> [NAME...]   run the tests capabilities (test: lines) and links
                                    ("test") declare, and record the results for check
   ladder hashes <project.json>   print each step's current hash (for whoever generates code)
@@ -61,9 +64,12 @@ the LLM writes code and tags it, this tool decides whether the tags hold up.
 """
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
+import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -491,8 +497,144 @@ def parse_regions(path: Path, lang: str):
 # ---------------------------------------------------------------- checks
 
 
+REPO_FILE = "ladder.repo.json"
+_REPO: dict = {}
+
+
+def find_repo(start: Path) -> tuple[dict, Path] | None:
+    """The nearest ladder.repo.json at or above `start` (settings every project below it shares), with its folder."""
+    d = start.resolve()
+    if d.is_file():
+        d = d.parent
+    for folder in [d, *d.parents]:
+        f = folder / REPO_FILE
+        if f in _REPO:
+            return _REPO[f]
+        if f.exists():
+            try:
+                _REPO[f] = (json.loads(f.read_text()), folder)
+            except ValueError as e:
+                raise SystemExit(f"{f}: {e}")
+            return _REPO[f]
+    return None
+
+
+PROJECT_ONLY = {"title", "tree", "builds", "baseline"}
+BUILD_ONLY = {"name", "files"}
+
+
+def with_repo_defaults(raw: dict, root: Path) -> dict:
+    """A project's ladder.json with the repository's shared settings filled in (round 20: 28 trial projects repeated the
+    same generator, vocabulary and schemas). ladder.repo.json `defaults` fill project keys the project does not set;
+    `build_defaults` fill build keys, "*" for every tagged build, then one per language. Paths in them (vocabulary, check_cwd,
+    schemas' source, conventions, reads) are written relative to ladder.repo.json; commands are taken as written."""
+    found = find_repo(root)
+    if not found:
+        return raw
+    repo, rdir = found
+
+    def rebase(p: str) -> str:
+        return os.path.relpath(os.path.normpath(os.path.join(rdir.resolve(), p)), root.resolve())
+
+    cfg: dict = {}
+    for k, v in (repo.get("defaults") or {}).items():
+        if k in PROJECT_ONLY:
+            raise SystemExit(f"{rdir / REPO_FILE}: defaults.{k} belongs in each project's ladder.json")
+        if k in ("vocabulary", "check_cwd"):
+            v = rebase(v)
+        elif k == "schemas":
+            v = {name: ({**s, "source": rebase(s["source"])} if isinstance(s, dict) and "source" in s else s)
+                 for name, s in v.items()}
+        cfg[k] = v
+    cfg.update(raw)
+    layers = repo.get("build_defaults") or {}
+    builds = []
+    for b in raw.get("builds", []):
+        nb: dict = {}
+        # A build compared by behaviour only ("tagged": false: a recording, an outside implementation) is never tagged
+        # or generated, so the defaults for builds (mode, conventions, adopted...) do not apply to it.
+        for layer in ((layers.get("*") or {}, layers.get(b.get("lang"), {}) or {}) if b.get("tagged") is not False else ()):
+            for k, v in layer.items():
+                if k in BUILD_ONLY:
+                    raise SystemExit(f"{rdir / REPO_FILE}: build_defaults.{k} belongs in each build")
+                nb[k] = [rebase(x) for x in v] if k in ("conventions", "reads") else v
+        nb.update(b)
+        builds.append(nb)
+    cfg["builds"] = builds
+    return cfg
+
+
+def read_config(pj: Path) -> dict:
+    """ladder.json with the repository's shared settings (ladder.repo.json) filled in. Every command reads a project's
+    settings through this; only commands that rewrite ladder.json read the raw file."""
+    try:
+        raw = json.loads(pj.read_text())
+    except ValueError as e:
+        raise SystemExit(f"{pj}: {e}")
+    return with_repo_defaults(raw, pj.parent)
+
+
+def repo_projects(repo: dict, rdir: Path) -> list[Path]:
+    """The ladder.json files ladder.repo.json's "projects" globs name, relative to its folder."""
+    pats = repo.get("projects")
+    if not pats:
+        raise SystemExit(f"{rdir / REPO_FILE} has no \"projects\" (globs of the ladder.json files, like "
+                         f"\"ladder/**/ladder.json\")")
+    found: set[Path] = set()
+    for pat in pats:
+        found.update(p for p in rdir.glob(pat) if p.name == "ladder.json")
+    return sorted(found)
+
+
+def check_all(start: Path, since: str | None = None) -> int:
+    """`ladder check --all [FOLDER]`: check every project ladder.repo.json lists, in one run, and print one line each
+    (round 20: a repository of 500 projects took 500 separate checks and gave no overview). Exit as the worst
+    project: 1 when any has problems, 3 when the rest only await approval, 0 when all are ok."""
+    found = find_repo(start)
+    if not found:
+        raise SystemExit(f"ladder check --all: no {REPO_FILE} at or above {start}")
+    repo, rdir = found
+    projects = repo_projects(repo, rdir)
+    if not projects:
+        raise SystemExit(f"ladder check --all: the \"projects\" of {rdir / REPO_FILE} match no ladder.json")
+    counts = {"ok": 0, "awaiting-approval": 0, "problems": 0, "error": 0}
+    kinds: dict[str, int] = {}
+    width = max(len(str(p.parent.relative_to(rdir))) for p in projects)
+    print(f"{len(projects)} projects in {rdir / REPO_FILE}")
+    for pj in projects:
+        name = str(pj.parent.relative_to(rdir))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):   # some checks print notes as they go
+                rep = check(pj, None, since, since, since)
+        except SystemExit as e:
+            counts["error"] += 1
+            print(f"  {name:<{width}}  error     {e}")
+            continue
+        status = rep["status"]
+        counts[status] += 1
+        found_kinds: dict[str, int] = {}
+        for p in rep["tree"] + [p for b in rep["builds"] for p in b["problems"]]:
+            found_kinds[p["kind"]] = found_kinds.get(p["kind"], 0) + 1
+        if status == "problems" and not found_kinds:
+            found_kinds["comparison"] = 1
+        for k, n in found_kinds.items():
+            kinds[k] = kinds.get(k, 0) + n
+        if status != "ok":
+            what = ", ".join(f"{k} x{n}" if n > 1 else k for k, n in sorted(found_kinds.items(), key=lambda kv: -kv[1]))
+            label = {"problems": "problems", "awaiting-approval": "approval"}[status]
+            print(f"  {name:<{width}}  {label:<9} {what}")
+    print(f"\n{counts['ok']} ok, {counts['awaiting-approval']} awaiting approval, {counts['problems']} with problems"
+          + (f", {counts['error']} could not be read" if counts["error"] else ""))
+    if kinds:
+        print("by kind: " + ", ".join(f"{k} {n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])))
+        print("details: ladder check <folder>/ladder.json")
+    if counts["problems"] or counts["error"]:
+        return 1
+    return 3 if counts["awaiting-approval"] else 0
+
+
 def load_project(pj: Path):
-    cfg = json.loads(pj.read_text())
+    cfg = read_config(pj)
     root = pj.parent
     tree = parse_tree(root / cfg["tree"])
     lock_path = root / "ladder.lock.json"
@@ -656,6 +798,44 @@ def restamp_contracts(root: Path, cfg: dict) -> int:
             if changed:
                 fpath.write_text("\n".join(lines) + "\n")
     return n
+
+
+_LINKED: dict = {}
+
+
+def linked_tree(path: Path) -> Tree:
+    """Another project's tree, read for its links: parsed once per run while the file is unchanged (round 20: a check
+    following links three levels deep parsed the same trees hundreds of times). Read only; a project's own tree is
+    parsed fresh by load_project."""
+    key = ("tree",) + _stamp(path)
+    if key not in _LINKED:
+        _LINKED[key] = parse_tree(path)
+    return _LINKED[key]
+
+
+def _stamp(path: Path):
+    st = path.stat()
+    return (str(path.resolve()), st.st_mtime_ns, st.st_size)
+
+
+def linked_config(pj: Path) -> dict:
+    """Another project's ladder.json (with the repository's defaults), read for its links: read once per run while the
+    file is unchanged. Read only; a project's own settings come fresh from load_project."""
+    key = ("cfg",) + _stamp(pj)
+    if key not in _LINKED:
+        _LINKED[key] = read_config(pj)
+    return _LINKED[key]
+
+
+def linked_lock(root: Path) -> dict:
+    """Another project's ladder.lock.json, read once per run while unchanged ({} when it has none)."""
+    p = root / "ladder.lock.json"
+    if not p.exists():
+        return {}
+    key = ("lock",) + _stamp(p)
+    if key not in _LINKED:
+        _LINKED[key] = json.loads(p.read_text())
+    return _LINKED[key]
 
 
 _TREES: dict = {}
@@ -1805,7 +1985,7 @@ def foreign_ids(root: Path, b: dict) -> set[str]:
         p = (root / rel).resolve()
         if p not in _SHARED:
             try:
-                other = json.loads(p.read_text())
+                other = read_config(p)
                 _SHARED[p] = set(parse_tree(p.parent / other["tree"]).keys())
             except (OSError, ValueError, KeyError, SystemExit) as e:
                 raise SystemExit(f"shared_with: cannot read {rel}: {e}")
@@ -1947,7 +2127,7 @@ def export_changes(root: Path, b: dict) -> list[tuple[str, list[str], list[str]]
             # two exported props interfaces a barrel re-exports, and nothing said so before the first stamp).
             import ladder_extra as X
             pj = root / "ladder.json"
-            ref = (json.loads(pj.read_text()).get("baseline") if pj.exists() else None) or "HEAD"
+            ref = (read_config(pj).get("baseline") if pj.exists() else None) or "HEAD"
             try:
                 orig = X._git_original(root, f, ref)
             except SystemExit:
@@ -2247,7 +2427,7 @@ def make_reference(pj: Path, src: str | None, retire: list[str] | None = None) -
     move to traces/history/ too and they leave ladder.json's builds."""
     import shutil
     from datetime import datetime
-    cfg, root = json.loads(pj.read_text()), pj.parent
+    cfg, root = read_config(pj), pj.parent
     c = cfg.get("compare") or {}
     if not c.get("reference"):
         raise SystemExit("ladder reference: this project has no compare.reference")
@@ -2265,7 +2445,9 @@ def make_reference(pj: Path, src: str | None, retire: list[str] | None = None) -
                 shutil.move(str(d), str(dest))
                 print(f"moved   traces/{d.name} -> {dest.relative_to(root)}")
         cfg["builds"] = [b for b in cfg["builds"] if b["name"] not in retire]
-        pj.write_text(json.dumps(cfg, indent=2) + "\n")
+        raw = json.loads(pj.read_text())          # rewrite the file as written, without the repository's defaults
+        raw["builds"] = [b for b in raw.get("builds", []) if b["name"] not in retire]
+        pj.write_text(json.dumps(raw, indent=2) + "\n")
         print(f"retired {', '.join(retire)} (removed from ladder.json builds)")
 
     if retire and not src:
@@ -2360,7 +2542,7 @@ def main(argv: list[str]) -> int:
         return accept(Path(argv[2]), argv[3:])
     if len(argv) >= 3 and argv[1] == "schema":
         import ladder_schema as S
-        cfg, root = json.loads(Path(argv[2]).read_text()), Path(argv[2]).parent
+        cfg, root = read_config(Path(argv[2])), Path(argv[2]).parent
         schemas = S.load_schemas(cfg, root)
         want = argv[3] if len(argv) > 3 else None
         for sname, ents in schemas.items():
@@ -2383,7 +2565,7 @@ def main(argv: list[str]) -> int:
     if len(argv) >= 3 and argv[1] in {"generate", "repair", "regen"}:
         import regen as R
         pj = Path(argv[2])
-        cfg, root = json.loads(pj.read_text()), pj.parent
+        cfg, root = read_config(pj), pj.parent
         R.DISCARD_HAND_EDITS = "--discard-hand-edits" in argv
         R.OUT = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--out=")), None)
         build = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--build=")), None)
@@ -2416,6 +2598,10 @@ def main(argv: list[str]) -> int:
         if "--dry-run" not in argv and not any(a.startswith("--out=") for a in argv) and snapshot(root, cfg) != before:
             status = max(status, run_after_generate(cfg, root))
         return status
+    if len(argv) >= 3 and argv[1] == "check" and argv[2] == "--all":
+        start = next((a for a in argv[3:] if not a.startswith("--")), ".")
+        since = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--since=")), None)
+        return check_all(Path(start), since)
     if len(argv) < 3 or argv[1] not in {"check", "hashes", "stamp", "view"}:
         print(__doc__)
         return 2
