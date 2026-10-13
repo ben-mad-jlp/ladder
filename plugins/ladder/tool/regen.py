@@ -648,6 +648,10 @@ def contract_prompt(build, file_rel, lines, r: L.Region, tree, conv: str) -> str
     # Which data blocks this region holds, and where the build's others live: without this, a region labelled with
     # one block got every block of the build, and the build declared each type twice.
     holds = []
+    rname = r.label.replace("contract ", "", 1)[5:].strip() if r.label.replace("contract ", "", 1).startswith("rule ") else ""
+    if rname in getattr(tree, "rules", {}):
+        holds = [f"=== This region holds the code for rule {rname}: {' '.join(tree.rules[rname].split())}",
+                 "Write only that (a named constant or two), keeping the names the file and the conventions use.", ""]
     mine = L.label_blocks(tree, build, r.label)
     if mine and CTX.get("root") is not None:
         others = [(f, lab, blks) for f, lab, blks in L.contract_layout(CTX["root"], build, tree)
@@ -778,6 +782,16 @@ def leaked_lines(conv: str, lines: list[str], regions: list, idxs) -> list[tuple
     return out
 
 
+def public_names_note(regions: list, lines: list[str], idx: int, lang: str) -> str:
+    """The names a hidden region exports (its own lines), which other files import: a blind run must keep them.
+    Round 11: two exported props interfaces came back unexported and the folder's index.ts no longer compiled."""
+    names = L.text_export_names("\n".join(L.region_own_code(regions, lines, idx)), lang)
+    if not names:
+        return ""
+    return ("\n\n=== This region's public names (other files import them): " + ", ".join(names)
+            + ". Keep each one exported, with this name.")
+
+
 def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_run: bool, skip: set | None = None) -> list:
     """Regenerate every @contract region and every @node region of one build from the English
     alone, keeping @support code. The generator never sees the code it replaces: regions not yet
@@ -848,6 +862,7 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
             prompt += ("\n\n=== BLIND REGENERATION: the region's old code is hidden on purpose. Write it from "
                        "the English, the conventions and the visible code only. Hidden regions elsewhere will "
                        "be written later; call what the English and the conventions name, not what you guess.")
+            prompt += public_names_note(regions, lines, idx, b["lang"])
             (log_dir / f"{tag}.prompt.txt").write_text(SYSTEM + "\n\n" + prompt)
             if dry_run:
                 results.append((f, key, "dry run: prompt written"))
@@ -884,6 +899,7 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
             nest = nested_regions(regions, idx)
             REDO.update(t for t, _ in r.tags)
             prompt = build_prompt(b, f, view, r, tree, lock, None, nested=nest)
+            prompt += public_names_note(regions, lines, idx, b["lang"])
             prompt += ("\n\n=== BLIND REGENERATION: this region's own code (outside its nested regions) is hidden "
                        "on purpose. Write it from the English, the conventions and the visible code only. The "
                        "nested regions were just written from the English: keep their code as shown.")
@@ -914,6 +930,9 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
     if not gen and not dry_run:
         print("no generator.command in project file")
         return 2
+    if not BLIND:
+        # steps citing a rule that changed since approval are rewritten too (their own text did not change)
+        REDO.update(c for r in L.changed_rules(tree, lock) for c in L.rule_citers(tree, r))
     ref_name = cfg.get("compare", {}).get("reference")
     builds = sorted(cfg["builds"], key=lambda b: b["name"] != ref_name)
     if only:

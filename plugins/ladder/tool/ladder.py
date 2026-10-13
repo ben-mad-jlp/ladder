@@ -547,6 +547,12 @@ def region_contract_hash(tree, build: dict | None, code: list[str], label: str =
     declares ClockInRequest depends on data ClockInRequest and the rules it names), so editing one
     block marks only the regions that spell it out stale. A region that declares no data block
     depends on the whole build contract (contract_hash)."""
+    # A region labelled "rule <name>" holds a named rule's code (a constant): it follows that rule's text.
+    if label.replace("contract ", "", 1).startswith("rule "):
+        rname = label.replace("contract ", "", 1)[5:].strip()
+        rtext = getattr(tree, "rules", {}).get(rname)
+        if rtext is not None:
+            return "r" + hashlib.sha1(f"rule {rname}: {' '.join(rtext.split())}".encode()).hexdigest()[:5]
     data = build_data(tree, build)
     def base(t: str) -> str:   # ICircuitOptions / ClockInRequestDto / ClockInRequestDTO -> the block name
         t = re.sub(r"(Dto|DTO)$", "", t)
@@ -650,6 +656,56 @@ def region_own_code(regions: list, lines: list[str], idx: int) -> list[str]:
         if p == idx:
             inner.update(range(rr.start - 1, rr.end))
     return [lines[k] for k in range(r.start, r.end - 1) if k not in inner]
+
+
+def rule_citers(tree, name: str) -> list[str]:
+    """Steps whose English cites a named rule ("(rule message limit)")."""
+    rx = re.compile(r"\brule\s+" + re.escape(name) + r"\b", re.I)
+    return [n.id for n in tree.values() if rx.search(n.own_text())]
+
+
+def changed_rules(tree, lock: dict) -> list[str]:
+    """Named rules whose text differs from the approved text (new ones included)."""
+    was = (lock or {}).get("@data")
+    if was is None:
+        return []
+    return [k for k, v in getattr(tree, "rules", {}).items() if was.get(f"rule {k}") != " ".join(v.split())]
+
+
+def rule_in_support_warnings(root: Path, cfg: dict, tree, lock: dict | None = None) -> list[dict]:
+    """A value a named rule states (a number, a quoted text) written in a @support region of a build that implements
+    steps citing the rule: regeneration never rewrites support code, so a change to the rule cannot reach it (round 11:
+    the 5000-character limit lived in support constants in both apps)."""
+    out = []
+    was = (lock or {}).get("@data", {})
+    for name, text in getattr(tree, "rules", {}).items():
+        text = text + " " + was.get(f"rule {name}", "")   # the approved value too: support code keeps the old one
+        # numbers of three digits or more, and quoted texts of more than one word (a key name like "message" is not one)
+        values = set(re.findall(r"\b\d{3,}\b", text)) | {q for q in re.findall(r'"([^"]{4,})"', text) if re.search(r"[\s.]", q)}
+        users = rule_citers(tree, name)
+        if not values or not users:
+            continue
+        for b in cfg.get("builds", []):
+            if b.get("tagged") is False:      # any build: a constant in one file is imported by another's steps
+                continue
+            for f in b.get("files", []):
+                if not (root / f).exists():
+                    continue
+                regions, _, lines, _ = parse_regions(root / f, b["lang"])
+                for i, r in enumerate(regions):
+                    if r.kind != "support":
+                        continue
+                    cm = COMMENT[b["lang"]]
+                    own = "\n".join(l for l in region_own_code(regions, lines, i)
+                                    if not l.lstrip().startswith((cm, "/*", "*", '"""')))
+                    hit = sorted(v for v in values if re.search(r"(?<![\w.])" + re.escape(v) + r"(?![\w.])", own))
+                    if hit:
+                        out.append(dict(kind="rule-in-support", node=name,
+                                        msg=f"rule {name}'s value {', '.join(hit)} is written in the @support region "
+                                            f"'{r.label}' of {f} (line {r.start}): regeneration never rewrites support "
+                                            f"code, so a change to the rule cannot reach it. Tag that code with a step "
+                                            f"that cites the rule ({', '.join(users[:3])})"))
+    return out
 
 
 def data_texts(tree) -> dict[str, str]:
@@ -829,6 +885,15 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                 report["tree"].append(dict(kind="data-new", node=name, msg="added since last approval; any @contract region is now stale"))
             elif was_d[name] != now[name]:
                 report["tree"].append(dict(kind="data-edited", node=name, msg="edited since last approval; any @contract region is now stale, and steps that use it may need --redo"))
+        # A step's code follows the rules it cites, but a rule's text is not in the step's hash: name the steps
+        # (round 11: a limit changed in a rule reached no code until --redo named them).
+        for rule in changed_rules(tree, lock):
+            citers = rule_citers(tree, rule)
+            if citers:
+                report["tree"].append(dict(
+                    kind="rule-changed", node=",".join(citers),
+                    msg=f"cite rule {rule}, which changed since approval: `ladder regen` rewrites them (or --redo="
+                        f"{','.join(citers)}); read their code against the new rule before approving"))
         for name in was_d:
             if name not in now:
                 report["tree"].append(dict(kind="data-removed", node=name, msg="removed since last approval"))
@@ -913,7 +978,8 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
             parts = ([f"adds {', '.join(added)}"] if added else []) + ([f"removes {', '.join(removed)}"] if removed else [])
             br["problems"].append(dict(
                 kind="exports-changed", file=f, line=1,
-                msg=f"the file's exports changed since approval: {'; '.join(parts)}. Generated code must not add or drop "
+                msg=f"the file's exports changed since approval (before the first stamp: since the git baseline): "
+                    f"{'; '.join(parts)}. Generated code must not add or drop "
                     f"public names the English doesn't ask for; if the English does, `ladder accept --exports` (or stamp)"))
             for cf in b.get("consumers", []):
                 text = (root / cf).read_text() if (root / cf).exists() else ""
@@ -1000,6 +1066,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                         f"code would be written twice. Give the separate part its own step (a helper the English "
                         f"names), or tag it as @support if no step owns it"))
         report["builds"].append(br)
+    report["warnings"] += rule_in_support_warnings(root, cfg, tree, lock)
     report["compare"] = compare_runs(root, cfg, tree)
     report["warnings"] += replay_settings_warnings(root, cfg)
     report["warnings"] += unused_trace_warnings(root, cfg)
@@ -1026,7 +1093,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
         report["tree"].append(dict(kind="trace-steps", node=", ".join(unknown[:8]),
                                    msg="traces name steps that are not in the tree (a typo?); list harness-only "
                                        "names in compare.extra_steps"))
-    approval_kinds = {"new", "baseline-new", "edited", "parent-changed", "removed", "capability-changed",
+    approval_kinds = {"new", "baseline-new", "edited", "rule-changed", "parent-changed", "removed", "capability-changed",
                       "data-new", "data-edited", "data-removed", "compare-edited", "schema-changed",
                       "linked-changed"}
     real_tree = [p for p in report["tree"] if p["kind"] not in approval_kinds]
@@ -1635,6 +1702,18 @@ EXPORT_CS = re.compile(r"^\s*public\s+(?:(?:static|sealed|abstract|partial|reado
 EXPORT_PY = re.compile(r"^(?:async\s+)?(?:def|class)\s+([A-Za-z]\w*)|^([A-Za-z]\w*)\s*(?::[^=]*)?=", re.M)
 
 
+def text_export_names(text: str, lang: str) -> list[str]:
+    """The names a piece of code exports (see export_names), for one region's lines."""
+    names: set[str] = set()
+    if lang in ("typescript", "javascript"):
+        names |= set(EXPORT_TS.findall(text))
+        if EXPORT_TS_DEFAULT.search(text):
+            names.add("default")
+    elif lang == "csharp":
+        names |= set(EXPORT_CS.findall(text))
+    return sorted(names)
+
+
 def export_names(path: Path, lang: str) -> list[str] | None:
     """The names a file makes available to other files: its export surface. None when the
     language has no simple notion of it here (the check is skipped)."""
@@ -1681,6 +1760,24 @@ def export_changes(root: Path, b: dict) -> list[tuple[str, list[str], list[str]]
     was = load_code(root).get("@exports", {}).get(b["name"], {})
     out = []
     for f in b.get("files", []):
+        if f not in was and b.get("adopted"):
+            # Nothing approved yet: an adopted file's surface is the one git has (round 11: blind regeneration dropped
+            # two exported props interfaces a barrel re-exports, and nothing said so before the first stamp).
+            import ladder_extra as X
+            pj = root / "ladder.json"
+            ref = (json.loads(pj.read_text()).get("baseline") if pj.exists() else None) or "HEAD"
+            try:
+                orig = X._git_original(root, f, ref)
+            except SystemExit:
+                orig = None
+            if orig is not None:
+                tmp = root / ".ladder" / "exports-base.tmp"
+                local_dir(root)
+                tmp.write_text(orig)
+                try:
+                    was = {**was, f: export_names(tmp, b["lang"]) or []}
+                finally:
+                    tmp.unlink()
         if f not in was:
             continue
         now = export_names(root / f, b["lang"]) or []
@@ -1926,10 +2023,10 @@ def make_reference(pj: Path, src: str | None, retire: list[str] | None = None) -
     if not c.get("reference"):
         raise SystemExit("ladder reference: this project has no compare.reference")
     folder = {b["name"]: b.get("traces", b["name"]) for b in cfg.get("builds", [])}
-    if retire:
+    def retire_builds() -> None:
         stamp_ = f"{datetime.now():%Y%m%d-%H%M%S}"
         for name in retire:
-            if name not in folder or name in (c["reference"], src):
+            if name not in folder or name == c["reference"]:
                 raise SystemExit(f"ladder reference: cannot retire '{name}' (not a build, or the reference)")
             d = root / "traces" / folder[name]
             if d.exists() and not any(b.get("traces", b["name"]) == folder[name]
@@ -1941,8 +2038,10 @@ def make_reference(pj: Path, src: str | None, retire: list[str] | None = None) -
         cfg["builds"] = [b for b in cfg["builds"] if b["name"] not in retire]
         pj.write_text(json.dumps(cfg, indent=2) + "\n")
         print(f"retired {', '.join(retire)} (removed from ladder.json builds)")
-        if not src:
-            return 0
+
+    if retire and not src:
+        retire_builds()
+        return 0
     if src not in folder:
         raise SystemExit(f"ladder reference: no build '{src}' (builds: {', '.join(folder)})")
     ref_dir, src_dir = root / "traces" / folder.get(c["reference"], c["reference"]), root / "traces" / folder[src]
@@ -1957,12 +2056,30 @@ def make_reference(pj: Path, src: str | None, retire: list[str] | None = None) -
         print(f"moved   traces/{ref_dir.name} -> {dest.relative_to(root)}")
     shutil.copytree(src_dir, ref_dir)
     print(f"copied  traces/{src_dir.name} -> traces/{ref_dir.name} (the reference now)")
+    if retire:
+        retire_builds()   # after the copy, so the build the reference came from can be retired too
     print("Other builds are now compared with this run: re-record any whose recording came from the old code, or, when\n"
           "that code is gone (an earlier scratch copy), retire them: `ladder reference <ladder.json> --retire=A,B`.")
     return 0
 
 
 # ---------------------------------------------------------------- main
+
+
+def run_after_generate(cfg: dict, root: Path) -> int:
+    """ladder.json "after_generate": commands that rebuild files derived from the code (an API's committed OpenAPI
+    contract, client types generated from it), run from check_cwd once generation changed code. Round 11: a change to
+    a message limit regenerated the API, and only the contract snapshot test said the contract was now stale."""
+    cmds = cfg.get("after_generate") or []
+    cwd = (root / cfg.get("check_cwd", ".")).resolve()
+    bad = 0
+    for c in cmds:
+        res = subprocess.run(c, shell=isinstance(c, str), cwd=cwd, capture_output=True, text=True)
+        shown = c if isinstance(c, str) else " ".join(c)
+        print(f"after_generate: {shown}: " + ("ok" if res.returncode == 0 else
+              f"FAILED (exit {res.returncode}): {(res.stderr or res.stdout).strip()[-300:]}"))
+        bad += res.returncode != 0
+    return 1 if bad else 0
 
 
 def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, rounds: int) -> int:
@@ -2050,6 +2167,8 @@ def main(argv: list[str]) -> int:
         rounds = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--repair=")), None)
         if argv[1] == "regen" and rounds and "--dry-run" not in argv:
             status = max(status, repair_until_builds(pj, cfg, root, build, int(rounds)))
+        if "--dry-run" not in argv and not any(a.startswith("--out=") for a in argv) and snapshot(root, cfg) != before:
+            status = max(status, run_after_generate(cfg, root))
         return status
     if len(argv) < 3 or argv[1] not in {"check", "hashes", "stamp", "view"}:
         print(__doc__)

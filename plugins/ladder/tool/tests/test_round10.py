@@ -176,6 +176,11 @@ class Tag(unittest.TestCase):
                 # re-running rebuilds from the base: the same result, no doubled markers
                 X.tag([str(pj), str(root / "regions.json")])
             self.assertEqual((root / "Svc.cs").read_text(), svc)
+            git(root, "add", "-A")
+            git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "tagged")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(X.tag([str(pj), str(root / "regions.json")]), 1)   # HEAD is tagged now
+            self.assertIn("already has regions for o.2", out.getvalue())
 
 
 class NewTopLevelStep(unittest.TestCase):
@@ -263,6 +268,18 @@ class SharedWith(unittest.TestCase):
             self.assertEqual(unknown("a") + unknown("b"), [])
             fp = L.code_fingerprints(root / "a", json.loads((root / "a" / "ladder.json").read_text())["builds"][0])
             self.assertEqual(list(fp["../src/api.ts"]), ["node a.1"])
+
+
+class AfterGenerate(unittest.TestCase):
+    def test_after_generate_commands_run_from_check_cwd(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "app").mkdir()
+            cfg = {"check_cwd": "app", "after_generate": ["echo derived > contract.json", ["false"]]}
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(L.run_after_generate(cfg, root), 1)
+            self.assertEqual((root / "app" / "contract.json").read_text().strip(), "derived")
+            self.assertIn("after_generate: false: FAILED", out.getvalue())
 
 
 if __name__ == "__main__":
