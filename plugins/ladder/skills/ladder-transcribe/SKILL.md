@@ -179,7 +179,14 @@ which step builds it ("the snapshot is a MyAlertsSnapshot"). In round 8 the Engl
 selected (the alert being deleted, ...)"; blind regeneration chose its own keys and the assistant's
 tests failed. The same goes for attributes another system finds on the page (`data-sofia-target`,
 `data-testid` a test runner uses): name the attribute in the English or in the vocabulary. In round 10
-the English said "the assistant's target"; regeneration wrote `data-assistant-target`.
+the English said "the assistant's target"; regeneration wrote `data-assistant-target`. Accessibility labels and roles
+are the same kind of contract (screen readers and tests find controls by them): list them in the step that renders.
+
+**Name the exact signal.** When the code decides on one particular field and the English says something looser
+("while signed in", "once loaded", "when valid"), name the field: "while the auth store holds an employee (its
+`isAuthenticated` flag is not read)". In round 11 "signed in" was regenerated as `isAuthenticated` twice, where the
+code read the employee id; only a test that set one and not the other told them apart. The same goes for a field
+a mapping reads from: write `requiresAcknowledgement` its `requireAcknowledgement`, not just the target name.
 
 **Files several areas share.** A file another project already tags (an app's API module, where each area added
 its own functions) gets this area's regions too: tag them inside the other project's `@support` region with
