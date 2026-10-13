@@ -596,11 +596,22 @@ def link_test_hash(tree: L.Tree, alias: str, linked, cmd: str, cwd: Path | None 
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:8]
 
 
+MARKER_LINE = re.compile(r"^\s*(?://|#|--)\s*@(?:node|contract|support|end)\b")
+
+
+def code_hash(p: Path) -> str:
+    """A code file's hash for test records: without Ladder's marker lines and with line endings normalised, so a
+    retag or a stamp (markers only) does not make a passed test stale (shipping round: twice in one project)."""
+    text = p.read_text(errors="surrogateescape")
+    kept = "\n".join(l for l in text.splitlines() if not MARKER_LINE.match(l))
+    return hashlib.sha1(kept.encode(errors="surrogateescape")).hexdigest()
+
+
 def project_test_hash(root: Path, cmd: str, files: list[str], cwd: Path | None = None) -> str:
     parts = [cmd, command_files_hash(cmd, cwd)]
     for f in sorted(files):
         p = root / f
-        parts.append(f + ":" + (hashlib.sha1(p.read_bytes()).hexdigest() if p.exists() else "missing"))
+        parts.append(f + ":" + (code_hash(p) if p.exists() else "missing"))
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:8]
 
 
@@ -709,6 +720,10 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
         elif not r.get("ok"):
             problems.append(dict(kind="test-failed", node=t["key"],
                                  msg=f"failed when last run ({r.get('at', '?')}): {r.get('tail', '')[:600]}"))
+        elif r.get("silent"):
+            warnings.append(dict(kind="test-silent", node=t["key"],
+                                 msg=f"passed with no output ({r.get('at', '?')}): nothing shows that any test ran (a filter "
+                                     f"that matches nothing exits 0); make `{t['cmd']}` print its runner's summary"))
     return problems, warnings
 
 
@@ -755,6 +770,21 @@ def _git_root(path: Path) -> Path | None:
     return Path(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else None
 
 
+NO_TESTS_RE = re.compile(r"No test files found[^\n]*|No test matches the given testcase filter[^\n]*|"
+                         r"Total tests: 0\b|no tests ran[^\n]*|0 tests? (?:collected|found)", re.I)
+COUNT_RES = [re.compile(r"Tests\s+(\d+) passed"), re.compile(r"Total tests:\s*(\d+)"),
+             re.compile(r"Passed!\s*-\s*Failed:\s*\d+,\s*Passed:\s*(\d+)"), re.compile(r"\b(\d+) passed\b")]
+
+
+def tests_run(out: str) -> int | None:
+    """How many tests a run reports (vitest, jest, dotnet test, pytest summaries; summed over several), or None."""
+    for rx in COUNT_RES:
+        hits = rx.findall(out)
+        if hits:
+            return sum(int(h) for h in hits)
+    return None
+
+
 def run_tests(pj: Path, only: list[str] | None = None) -> int:
     import datetime
     cfg, root, tree, _, _ = L.load_project(pj)
@@ -767,6 +797,9 @@ def run_tests(pj: Path, only: list[str] | None = None) -> int:
     code = L.load_code(root)
     results = code.setdefault("@tests", {})
     cwd = root / cfg.get("check_cwd", ".")
+    found = L.find_repo(root)
+    also = [root] + ([found[1]] if found else []) + [g for g in [_git_root(root)] if g]
+    ran_info: dict[str, tuple[int | None, bool]] = {}
     failed = 0
     ran: dict[str, tuple[bool, int, list[str]]] = {}   # one run per distinct command (round 9: one link test named
     first: dict[str, str] = {}                          # by five subjects started the API five times)
@@ -776,17 +809,32 @@ def run_tests(pj: Path, only: list[str] | None = None) -> int:
             print(f"{t['what']}: same command as {first[t['cmd']]}, not run again")
         else:
             print(f"{t['what']}: {t['cmd']}")
+            gone = missing_files(t["cmd"], cwd, also)
+            if gone:
+                # check reports these as test-missing; running them only fails on the missing file (shipping round)
+                print(f"  not run: names {', '.join(gone)}, which does not exist")
+                continue
             res = subprocess.run(t["cmd"], shell=True, cwd=cwd, capture_output=True, text=True)
-            tail = failure_lines(res.stdout + res.stderr)
+            out = res.stdout + res.stderr
+            tail = failure_lines(out)
             ok, rc = res.returncode == 0, res.returncode
+            none_ran = NO_TESTS_RE.search(out)
+            if ok and none_ran:
+                # a filter that matches nothing exits 0 (shipping round: a misspelt class name recorded as a pass)
+                ok, tail = False, [f"no tests ran: {none_ran.group(0).strip()}"]
+            count = tests_run(out)
             ran[t["cmd"]] = (ok, rc, tail)
+            ran_info[t["cmd"]] = (count, not out.strip())
             first[t["cmd"]] = t["what"]
         failed += not ok
-        print(f"  {'ok' if ok else 'FAILED (exit ' + str(rc) + ')'}")
+        count, silent = ran_info.get(t["cmd"], (None, False))
+        print(f"  {'ok' if ok else 'FAILED (exit ' + str(rc) + ')'}" + (f", {count} tests" if ok and count else "")
+              + (" (no output: nothing shows that a test ran)" if ok and silent else ""))
         if not ok:
             print("    " + "\n    ".join(tail))
         results[t["key"]] = dict(hash=t["hash"], ok=ok, at=datetime.date.today().isoformat(),
-                                 tail=" / ".join(tail)[:600] if not ok else "")
+                                 tail=" / ".join(tail)[:600] if not ok else "",
+                                 **({"count": count} if count else {}), **({"silent": True} if ok and silent else {}))
     (root / L.CODE_FILE).write_text(json.dumps(code, indent=2, sort_keys=True) + "\n")
     print(f"\n{len(tests) - failed} of {len(tests)} passed; results recorded in ladder.code.json")
     return 1 if failed else 0
