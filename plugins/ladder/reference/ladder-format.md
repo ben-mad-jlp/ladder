@@ -430,6 +430,12 @@ ladder.json (the nearest one wins):
 - `ladder init` under a ladder.repo.json leaves out of the new ladder.json (and does not create) what the
   repository supplies.
 - Commands that rewrite ladder.json (`reference --retire`) keep the file as written, without the defaults.
+- `"generated"` (globs relative to ladder.repo.json; a project's own `"generated"` is relative to the project) names
+  files another tool writes. `tag` refuses them and `check` reports a tagged one as `generated-file`: take it out of
+  the build, and put the tool in `after_generate` when Ladder's code feeds it.
+- `"extra_vocabulary"` (a project key, a list of files) adds an area's capabilities to the shared `"vocabulary"`
+  instead of replacing it. A capability defined again with different text is an error (change the shared one, or
+  give the area's its own name); a word-for-word copy is a `vocabulary-copy` warning (delete it).
 
 ## 8. Approval and the lock
 
@@ -529,7 +535,9 @@ Two ways to get traces:
   relative to when the request was sent (`now+120m`; `time:s` to the second; a time without a zone
   is read as local time, `time:utc` reads it as UTC). A masked value that also appears inside another field's text
 (an incident id in its message, a time in a sentence) is replaced there too, by `<name>` or, for a time, by its
-relative form. A value under a `time` mask that is not a date-time is written `<not a time>` and `replay` says so:
+relative form. A fixed date in the data (a timestamp a scenario sent) also reads as relative, so it moves by the time
+between two recordings: `.replay.json` records when each run started, and `check` counts two relative times as the
+same when they differ by exactly that gap. A value under a `time` mask that is not a date-time is written `<not a time>` and `replay` says so:
 it compares equal whatever it holds, so mask that field another way. (Before v0.7.1 every `time` mask wrote
 `<not a time>`: re-record references made with v0.6.4 to v0.7.0 that mask times.) A path is written as it reads
 (`/groups/Ladder Group/alerts`); characters a URL cannot carry are percent-encoded. For a value inside text ("Already clocked in
@@ -578,6 +586,7 @@ ladder check <ladder.json> [--since=REF] [--all-differences]
                                                       comparison; exit 0 ok · 1 problems · 3 only awaiting approval
                                                       --since: review steps, schema and linked steps against a
                                                       git ref instead of the last approval
+ladder --version                                      the plugin's version
 ladder check --all [FOLDER] [--since=REF]             every project ladder.repo.json lists, one line each and a
                                                       count by kind; exit 1 if any has problems, 3 if the rest
                                                       only await approval

@@ -142,6 +142,12 @@ behavior wins; transcription only reports.
 
 ## 5. Tag the code (comments only)
 
+Do not tag a file another tool writes (an OpenAPI client, a generated contract check, anything a script rewrites):
+its markers are lost the next time the tool runs, and the tool's own check then sees a changed file. List such
+files in ladder.repo.json's `"generated"` (or the project's) and `tag` and `check` refuse them; if code Ladder
+generates feeds the tool, add the tool's command to the project's `after_generate`.
+
+
 1. Print the hashes for the finished tree: `ladder hashes ladder/<area>/ladder.json`.
 2. In every adopted file, wrap the code for each step in `@node <id>@<hash>` ... `@end` comment
    lines, using the file's line comment (`//` or `#`). Wrap everything that belongs to no step
@@ -232,6 +238,12 @@ they belong to the EF model and its migrations, and are never generated. To keep
 hand edits checked, give them a support-only build (`"steps": []`). (In the API trial a
 regenerated entity mapped every property to a camelCase column; every query failed on SQL Server
 while the tests, built from the same model, passed.)
+
+**What an insert leaves out is behaviour.** For every row the code adds, say which columns it sets. A required column
+it leaves unset makes the insert fail, and that failure is what the code does today: write it (with a QUESTION
+note), or the generator, seeing the schema, will fill the column in and "fix" it. (Pilot: a new alert definition
+left its required description unset and answered 500; the English said nothing, the blind run set it to empty, and
+only the replay showed the difference.)
 
 If the project has no `ModelSnapshot.cs` (its schema changes are SQL scripts), export the model with
 `dotnet run --project ${CLAUDE_PLUGIN_ROOT}/tool/exporters/efcore-schema -p:ModelsProject=<the

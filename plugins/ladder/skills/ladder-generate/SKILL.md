@@ -77,7 +77,12 @@ generator calls it rather than a similar-sounding method (round 5 found a blind 
 queries, only `--observe` saw it). A step that uses an in-repository capability gets the binding's
 source file in its prompt, so it calls what exists; `check` warns `binding-not-called` when a build
 calls none of a binding's calls (round 9: `storageService.getItem` for `storageService.get`, then a
-repair that imported the storage library directly).
+repair that imported the storage library directly). Each region's prompt also lists the names its old code makes
+public (exported functions, types and constants; in C#, public and internal members, constants included) with
+each one's whole declaration, so callers in other files keep compiling (pilot: a test's `IsScheduledDue`, a
+controller's `ScreenAuthorization` constant and a multi-line `alertsDataset(name, input)` signature came back
+renamed or reshaped). If you restore the approved code of a file after a bad run (`git checkout`), regen does not
+take it for a hand edit.
 
 **New steps in an approved tree.** `ladder regen --build=<name> --blind --redo=<changed and new step ids>`
 first writes each new step (one with no code yet, top-level ones included) after the step before it,
@@ -123,7 +128,10 @@ you: it runs the project's `check_command`, repairs what it reports and builds a
 rounds, and says whether the code builds. Otherwise save the compiler or test output to a file and run
 `ladder repair` with it. It maps each error to the region it points at and regenerates only that
 region, with the error in the prompt. It may add imports or declarations to `@support` regions
-through `@add-to-support` requests; these are listed in its output, so review them.
+through `@add-to-support` requests; these are listed in its output, so review them. When the errors name types
+(`missing ... from type 'MeasureDecl'`), the repair prompt shows their declarations, found under `check_cwd`.
+Errors are matched to files by path: an error in another folder's file of the same name is not this build's, and
+`--repair` stops and says so when no error is in the build's own files.
 
 **Failing tests that assert the old behavior are not repair material.** When the English changed
 on purpose, a test that checks the old behavior should fail. Don't feed it to `ladder repair` (that
