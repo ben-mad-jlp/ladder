@@ -37,12 +37,23 @@ import ladder as L
 CALL_RE = re.compile(r"^\s*([A-Za-z][\w-]*)\s*\[([A-Za-z0-9_.\-]+)\]\s*$")
 
 
+MULTI_CALL_RE = re.compile(r"^\s*([A-Za-z][\w-]*)\s*((?:\[[A-Za-z0-9_.\-]+\]\s*)+)$")
+
+
 def parse_calls(n) -> list[tuple[str, str, str]]:
-    """(alias, step id, as written) for each item of a step's calls: lines."""
+    """(alias, step id, as written) for each item of a step's calls: lines. An item may name several steps of one
+    tree: `scanner [shc.20.13] [shc.20.14]` (shipping round: the natural way to write it was refused)."""
     out = []
     for item in getattr(n, "calls", []):
         m = CALL_RE.match(item)
-        out.append((m.group(1), m.group(2), item) if m else ("", "", item))
+        if m:
+            out.append((m.group(1), m.group(2), item))
+            continue
+        mm = MULTI_CALL_RE.match(item)
+        if mm:
+            out += [(mm.group(1), tid, item) for tid in re.findall(r"\[([A-Za-z0-9_.\-]+)\]", mm.group(2))]
+            continue
+        out.append(("", "", item))
     return out
 
 
@@ -89,8 +100,24 @@ def tree_at(cfg2: dict, root2: Path, ref: str) -> L.Tree | None:
         Path(f.name).unlink()
 
 
+def is_target(tree, tid: str) -> bool:
+    """Whether a calls: target exists in a tree: a step, or a data block (a type the caller uses: shipping round)."""
+    return tid in tree or tid in getattr(tree, "data", {})
+
+
+def data_text(tree, name: str) -> str:
+    d = tree.data[name]
+    lines = [f"data {name}"]
+    lines += [f"  {name}.{k}: {' '.join(v.split())}" for k, v in d.fields]
+    lines += [f"  {name} rule: {' '.join(r.split())}" for r in d.rules]
+    return "\n".join(lines)
+
+
 def contract_text(tree: L.Tree, nid: str) -> str:
-    """What a caller relies on: the called step's in:/out:/effects: lines and the data blocks they name."""
+    """What a caller relies on: the called step's in:/out:/effects: lines and the data blocks they name; for a data
+    block named in calls:, the block itself."""
+    if nid not in tree and nid in getattr(tree, "data", {}):
+        return data_text(tree, nid)
     n = tree[nid]
     lines = [f"[{n.id}] {n.title}"]
     for key, val in (("in", n.inputs), ("out", n.outputs), ("effects", n.effects)):
@@ -210,8 +237,7 @@ def link_shape_warnings(tree: L.Tree, cfg: dict, root: Path) -> list[dict]:
     - link-unused: a link that no `calls:` line uses, in either direction."""
     out: list[dict] = []
     linked = {a: v for a, v in load_linked(cfg, root).items() if not isinstance(v, str)}
-    if not linked:
-        return out
+    # (no early return without links: a project that links to nothing may still name other projects' steps)
     norm = lambda t: " ".join(t.split()).lower()
     rules = getattr(tree, "rules", {})
     # every project reachable through links (an API and its scanner are often linked only through the library)
@@ -244,7 +270,7 @@ def link_shape_warnings(tree: L.Tree, cfg: dict, root: Path) -> list[dict]:
     for nid, n in tree.items():
         targets = {tid for _, tid, _ in parse_calls(n)}
         called_aliases |= {a for a, _, _ in parse_calls(n) if a}
-        foreign = []
+        foreign, unlinked = [], []
         # what the step does (not its notes, which may point at another tree to explain something)
         said = "\n".join([n.title, n.inputs, n.outputs, n.effects, *n.steps])
         for ref in dict.fromkeys(STEP_REF_RE.findall(said)):
@@ -253,6 +279,16 @@ def link_shape_warnings(tree: L.Tree, cfg: dict, root: Path) -> list[dict]:
             owner = next((a for a, (_, _, t2) in linked.items() if ref in t2), None)
             if owner:
                 foreign.append(f"{owner} [{ref}]")
+            elif ref not in tree:
+                # a step of a project this one does not link to yet (shipping round: ~100 calls were invisible
+                # until the first link existed)
+                where = repo_step_owner(root, ref)
+                if where:
+                    unlinked.append(f"[{ref}] of {where}")
+        if unlinked:
+            out.append(dict(kind="uncalled-reference", node=nid,
+                            msg=f"[{nid}] names {', '.join(unlinked)}, a project this one does not link to: changes there "
+                                f"are never reported here; add a \"links\" entry and a `calls:` line"))
         if foreign:
             out.append(dict(kind="uncalled-reference", node=nid,
                             msg=f"[{nid}] names {', '.join(foreign)} without a `calls:` line: changes there are never "
@@ -299,9 +335,11 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
             if isinstance(got, str):
                 continue
             c2, r2, t2 = got
-            if tid not in t2:
-                problems.append(dict(kind="link", node=nid, msg=f"calls: {written}: the {alias} tree has no step [{tid}]"))
+            if not is_target(t2, tid):
+                problems.append(dict(kind="link", node=nid, msg=f"calls: {written}: the {alias} tree has no step or "
+                                                                 f"data block [{tid}]"))
                 continue
+            is_data = tid not in t2
             key = f"{alias}:{tid}"
             if alias not in callee_locks:
                 lp = r2 / "ladder.lock.json"
@@ -310,7 +348,7 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                 except ValueError:
                     callee_locks[alias] = {}
             approved = callee_locks[alias].get(tid, {}).get("hash")
-            if approved is None or not t2[tid].tag_matches(approved):
+            if not is_data and (approved is None or not t2[tid].tag_matches(approved)):
                 warnings.append(dict(kind="linked-unapproved", node=nid,
                                      msg=f"calls {key}, which the {alias} project has "
                                          + ("never approved" if approved is None else "changed since its approval")
@@ -318,13 +356,13 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                                            f"after {alias} is approved"))
             now = contract_text(t2, tid)
             facts.setdefault(nid, {})[key] = now
-            now_behind = behind_hashes(t2, tid)
+            now_behind = behind_hashes(t2, tid) if not is_data else {}
             facts[nid][key + "#behind"] = json.dumps(now_behind, sort_keys=True)
             if since:
                 if alias not in old_trees:
                     old_trees[alias] = tree_at(c2, r2, since)
                 ot = old_trees[alias]
-                was = contract_text(ot, tid) if ot is not None and tid in ot else None
+                was = contract_text(ot, tid) if ot is not None and is_target(ot, tid) else None
                 was_behind = behind_hashes(ot, tid) if ot is not None and tid in ot else None
                 when = f"since {since}"
             else:
@@ -476,6 +514,31 @@ def caller_projects(cfg: dict, root: Path, linked: dict) -> list[tuple[str, dict
     return out
 
 
+_STEP_OWNERS: dict = {}
+
+
+def repo_step_owner(root: Path, ref: str) -> str | None:
+    """The project (folder, relative to this one) whose tree has step `ref`, among those ladder.repo.json lists."""
+    found = L.find_repo(root)
+    if not found or not found[0].get("projects"):
+        return None
+    repo, rdir = found
+    if rdir not in _STEP_OWNERS:
+        owners: dict[str, Path] = {}
+        for pj in L.repo_projects(repo, rdir):
+            try:
+                c2 = L.linked_config(pj)
+                for sid in L.linked_tree(pj.parent / c2["tree"]):
+                    owners.setdefault(sid, pj.parent.resolve())
+            except (SystemExit, OSError, KeyError, ValueError):
+                continue
+        _STEP_OWNERS[rdir] = owners
+    owner = _STEP_OWNERS[rdir].get(ref)
+    if owner is None or owner == root.resolve():
+        return None
+    return os.path.relpath(owner, root.resolve())
+
+
 _REVERSE: dict = {}
 
 
@@ -539,7 +602,7 @@ def prompt_text(ids: list[str], tree: L.Tree, cfg: dict, root: Path) -> str:
     seen = set()
     for nid, (alias, tid, _) in wanted:
         got = linked.get(alias)
-        if isinstance(got, tuple) and tid in got[2] and (alias, tid) not in seen:
+        if isinstance(got, tuple) and is_target(got[2], tid) and (alias, tid) not in seen:
             seen.add((alias, tid))
             out.append(f"--- {alias} {contract_text(got[2], tid)}")
     return "\n".join(out) + "\n"
@@ -591,7 +654,7 @@ def link_test_hash(tree: L.Tree, alias: str, linked, cmd: str, cwd: Path | None 
         for a, tid, _ in parse_calls(n):
             if a == alias:
                 parts.append(f"{nid}@{n.hash}")
-                if isinstance(got, tuple) and tid in got[2]:
+                if isinstance(got, tuple) and is_target(got[2], tid):
                     parts.append(contract_text(got[2], tid))
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:8]
 
