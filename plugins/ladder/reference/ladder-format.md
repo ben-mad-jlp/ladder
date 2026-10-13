@@ -527,7 +527,12 @@ Two ways to get traces:
   `--mask name[:kind]` (or a scenario's `"mask": [...]`) handles values that differ every run:
   `value` hides it, `presence` keeps whether it is null, empty or set, `time` keeps a date-time
   relative to when the request was sent (`now+120m`; `time:s` to the second; a time without a zone
-  is read as local time, `time:utc` reads it as UTC). For a value inside text ("Already clocked in
+  is read as local time, `time:utc` reads it as UTC). A masked value that also appears inside another field's text
+(an incident id in its message, a time in a sentence) is replaced there too, by `<name>` or, for a time, by its
+relative form. A value under a `time` mask that is not a date-time is written `<not a time>` and `replay` says so:
+it compares equal whatever it holds, so mask that field another way. (Before v0.7.1 every `time` mask wrote
+`<not a time>`: re-record references made with v0.6.4 to v0.7.0 that mask times.) A path is written as it reads
+(`/groups/Ladder Group/alerts`); characters a URL cannot carry are percent-encoded. For a value inside text ("Already clocked in
   since 10:55"), `--mask-text 'PATTERN=REPLACEMENT'` (or `"mask_text": [...]`) replaces regex matches
   in every string: `'\d\d:\d\d=<hh:mm>'`. Patterns apply in the order given, so put the longer one
   first (an ISO date-time pattern before an `hh:mm` one, or the time inside the date is replaced

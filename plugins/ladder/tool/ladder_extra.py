@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -249,29 +250,32 @@ def _mask(v, keys, sent_at=None):
 MASK_ECHO_MIN = 4   # shorter masked values (an id like 3) are too likely to occur by chance; use --mask-text
 
 
-def _masked_values(v, kinds: dict, found: dict) -> None:
+def _masked_values(v, kinds: dict, found: dict, sent_at=None) -> None:
     """The values a key mask hides, {text: what it is written as}, so the same value inside another field's text
-    (an incident id inside its message) can be hidden too."""
+    (an incident id inside its message) can be hidden too. A time is written as its masked form (now+5m)."""
     if isinstance(v, dict):
         for k, x in v.items():
             if k in kinds and isinstance(x, (str, int)) and not isinstance(x, bool) and len(str(x)) >= MASK_ECHO_MIN:
-                found[str(x)] = f"<{k}>"
+                found[str(x)] = _mask_one(x, kinds[k], sent_at) if kinds[k].startswith("time") else f"<{k}>"
             else:
-                _masked_values(x, kinds, found)
+                _masked_values(x, kinds, found, sent_at)
     elif isinstance(v, list):
         for x in v:
-            _masked_values(x, kinds, found)
+            _masked_values(x, kinds, found, sent_at)
 
 
-def _mask_echoes(v, kinds: dict):
-    """Mask key values, and replace each masked value (of at least MASK_ECHO_MIN characters) wherever it appears
-    inside the result's other strings."""
+def _mask_echoes(v, kinds: dict, sent_at=None):
+    """Mask key values, then replace each masked value (of at least MASK_ECHO_MIN characters) wherever it appears
+    inside the result's other strings. The key masks run first: replacing echoes first also replaced the masked
+    field's own value, so every time mask saw "<timestamp>" and wrote "<not a time>" (pilot; since v0.6.4)."""
+    kinds = kinds if isinstance(kinds, dict) else {k: "value" for k in kinds}
     found: dict = {}
-    _masked_values(v, kinds if isinstance(kinds, dict) else {k: "value" for k in kinds}, found)
+    _masked_values(v, kinds, found, sent_at)
+    masked = _mask(v, kinds, sent_at)
     if not found:
-        return v
+        return masked
     pats = [(re.compile(r"(?<![\w-])" + re.escape(t) + r"(?![\w-])"), rep_) for t, rep_ in found.items()]
-    return _mask_text(v, pats)
+    return _mask_text(masked, pats)
 
 
 def _mask_text(v, patterns: list[tuple]):
@@ -529,7 +533,10 @@ def replay(argv: list[str]) -> int:
             data = (r["raw"].encode() if "raw" in r else None if "body" not in r else json.dumps(r["body"]).encode())
             # A request's own headers override the defaults; an empty value removes that header.
             hdrs = {k: v for k, v in {**_subst(headers, env, saved), **r.get("headers", {})}.items() if v != ""}
-            req = urllib.request.Request(base + r["path"], data=data, method=r["method"], headers=hdrs)
+            # A path is written as a person reads it (`/groups/Ladder Group/alerts`): characters a URL cannot carry are
+            # percent-encoded; what is already encoded (%20) and the query's own syntax stay (pilot: a space crashed it).
+            url = base + urllib.parse.quote(r["path"], safe="/?&=%:@!$'()*+,;~#[]")
+            req = urllib.request.Request(url, data=data, method=r["method"], headers=hdrs)
             try:
                 resp = opener.open(req, timeout=60)
                 status, rawb, rh = resp.status, resp.read(), resp.headers
@@ -574,7 +581,7 @@ def replay(argv: list[str]) -> int:
             # The service's own address (a Location header, a link in a body) says where it ran, not how it behaved:
             # two builds on two ports must compare equal (round 11).
             here = [(re.compile(re.escape(base.rstrip("/"))), "<base>")]
-            result = _mask_text(_mask(_mask_echoes(result, mask_f), mask_f, sent_at), here + text_f)
+            result = _mask_text(_mask_echoes(result, mask_f, sent_at), here + text_f)
             info = f"{raw_r['method']} {raw_r['path']}"
             events.append({"step": step, "ev": "enter", "ms": 0, "info": info})
             data = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -591,6 +598,11 @@ def replay(argv: list[str]) -> int:
             tokens_hidden = 0
         _write_replay_meta(out, mask, mask_text, jwt_on, record_default, observe, _replay_project(out, opt(argv, "--project")))
         print(f"  {f.stem}: {len(events) // 2} requests -> {out / (f.stem + '.jsonl')}")
+        not_times = sum(e.get("data", "").count("<not a time>") for e in events if isinstance(e.get("data"), str))
+        if not_times:
+            # A time mask whose value is not a date-time compares equal whatever it holds: say so.
+            print(f"  {f.stem}: {not_times} values under a :time mask were not date-times (written \"<not a time>\", "
+                  f"so they compare equal whatever they hold); mask that field another way (value, presence)")
     return 0
 
 
