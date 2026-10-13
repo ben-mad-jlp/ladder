@@ -227,7 +227,7 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                 except ValueError:
                     callee_locks[alias] = {}
             approved = callee_locks[alias].get(tid, {}).get("hash")
-            if approved != t2[tid].hash:
+            if approved is None or not t2[tid].tag_matches(approved):
                 warnings.append(dict(kind="linked-unapproved", node=nid,
                                      msg=f"calls {key}, which the {alias} project has "
                                          + ("never approved" if approved is None else "changed since its approval")
@@ -321,7 +321,7 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                     when = f"since {since}"
                 else:
                     was = lock.get(tid, {}).get("hash") if isinstance(lock.get(tid), dict) else None
-                    changed = bool(was) and was != tree[tid].hash
+                    changed = bool(was) and not tree[tid].tag_matches(was)
                     when = "since approval"
                 if not changed:
                     # a step the called step relies on changed: callers see a different answer too
@@ -330,7 +330,7 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                             moved = own_old is not None and (x not in own_old or own_old[x].hash != tree[x].hash)
                         else:
                             wx = lock.get(x, {}).get("hash") if isinstance(lock.get(x), dict) else None
-                            moved = bool(wx) and wx != tree[x].hash
+                            moved = bool(wx) and not tree[x].tag_matches(wx)
                         if moved:
                             warnings.append(dict(kind="has-callers", node=x,
                                                  msg=f"edited {when}, and [{tid}] relies on it "

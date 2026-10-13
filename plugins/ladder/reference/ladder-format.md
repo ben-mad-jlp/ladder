@@ -86,6 +86,13 @@ rule tag name: 1 to 24 characters from a-z, 0-9 and dashes
   a message) that the code keeps in a constant goes in a `@contract rule <name>@<hash>` region: its hash is the
   rule's text, so changing the rule makes it stale and `regen` rewrites it. `check` warns `rule-in-support` when such
   a value sits in `@support` code, which no change to the rule can reach.
+- A step's tag hash covers the text of every rule the step cites, so code generated under another version of a rule
+  is stale, also when the rule is changed back before anyone stamps (round 13). Tags written before v0.6.8 hold while
+  the rules they cite are as approved. Cite the rule ("(rule weight range)") in **every** step whose code uses its
+  value: `check` warns `rule-uncited` when a rule's value (a number of three digits or more, a quoted text of several
+  words) is in the code of a step that does not cite it. A change to the rule would regenerate the citing steps and
+  leave that code with the old value (round 13: two of three scale parsers kept the old weight limit, and every check
+  and test passed).
 - Data blocks and rules are part of the **contract hash**: changing them makes `@contract`
   regions stale (see 5), and builds regenerate their entity/DTO types first.
 - Describe fields in words (whole number, text, Unix seconds, list of X), not language types.
@@ -407,7 +414,9 @@ generated here, so syncing the English into a scratch copy (which brings the wor
 changed, new and removed steps, data blocks or rules added, edited or removed, and steps whose
 `compare:` lines changed (`compare-edited`: loosening a comparison needs approval like any edit). It also flags
 tree lines that parse but are indented wrongly (`format`). Regeneration prompts show the generator the approved wording
-next to the new wording. Only a person approves, after reading the English and the code.
+next to the new wording. Only a person approves, after reading the English and the code. `stamp` refuses while a
+region is stale (its code was generated from another version of the English): regenerate it, or `ladder retag` it
+when the English was only reworded; `stamp --force` stamps anyway.
 
 **Hand edits.** `stamp` also records a fingerprint of every `@node` and `@contract` region's own code
 in `ladder.code.json` (nested regions, comment lines, blank lines and spacing are left out, so
@@ -544,6 +553,6 @@ ladder regen <ladder.json> --build=NAME --blind       rewrite a build's regions 
                                                       with --redo=IDS only the regions of those steps, after
                                                       writing the new steps among them (a change to an
                                                       approved tree)
-ladder stamp <ladder.json>                            approve the English as it is now
+ladder stamp <ladder.json> [--force]                  approve the English as it is now (refused while a region is stale)
 ladder view <ladder.json> [out.html]                  side-by-side viewer
 ```

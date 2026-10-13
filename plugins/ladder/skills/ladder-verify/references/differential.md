@@ -47,7 +47,9 @@ Rules that keep it honest:
 ## Feeding `ladder check`
 
 Write each seed as `traces/<build>/s0001.jsonl`, one line per logged event, naming each event after
-the step of the English that produces it:
+the step of the English that produces it. Every line is a step result, `"ev": "exit"`: `check` compares only those
+and ignores other events (put the event's kind in `info` and first in `data`, e.g. `["threw", "..."]`). Harness
+bookkeeping steps (setup, time ticks) go in `"extra_steps"`.
 
 ```json
 {"step": "pq.1.28", "ev": "exit", "ms": 91, "info": "", "data": "{\"e\":\"boom-1\",\"onError\":\"#7\"}"}
