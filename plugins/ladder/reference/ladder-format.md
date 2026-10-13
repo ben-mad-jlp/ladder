@@ -222,8 +222,14 @@ and ladder.json names the other project, optionally with a test that runs both s
 (`"links": {"api": "../api/ladder.json"}` without a test.) `check` resolves every `calls:` item.
 `stamp` records the called step's contract: its `in:`, `out:` and `effects:` lines and the data
 blocks they name. When that contract changes, the calling step shows as `linked-changed` until it
-is re-read and approved, so a change to the API's answer reaches the client's review. Steps in the
-calling tree that rely on that step are flagged too: any step whose English names it
+is re-read and approved, so a change to the API's answer reaches the client's review. A caller also
+relies on every step the called step's English names, transitively (`out: what [sa.4] answers`, then
+`[sa.4]` uses `[as.2]`, which checks the name with `[as.11]`): `stamp` records those steps' hashes too,
+and when one changes while the contract text does not (a new refusal three steps down), the caller
+shows `linked-changed` naming the changed step and the path to it, and the called project warns
+`has-callers` on the changed step. A called step that is itself waiting on a change in a further tree
+flags its callers as well, so a change in the API reaches a screen that calls it through a library.
+Steps in the calling tree that rely on that step are flagged too: any step whose English names it
 (`> signs in through [authsvc.1]`), and so on outward. So name the step you use, in the English.
 The message lists what changed line by line (`out: was ...; now ...`, `data ClockInRequest gained
 field source: ...`). When a data block of the called step changed and a file the calling project
@@ -347,6 +353,13 @@ With no stamp, `check` compares the tree with the tree file at that commit inste
 since then show as `edited`, schema and linked-step changes are measured from it (as with
 `--since`), and regeneration prompts show the baseline's wording as "Before". A stamp, once made,
 takes over; an explicit `--since=<ref>` reviews against that ref for one run, stamp or not.
+
+**Local files.** `.ladder/` in a project holds only local files: prompt and reply logs, and
+`.ladder/generated.json`, what the generator wrote in this checkout. It ignores itself in git. A region
+is hand-edited when its code matches neither the approved record (`ladder.code.json`) nor what was
+generated here, so syncing the English into a scratch copy (which brings the working tree's
+`ladder.code.json` with it) does not make the scratch copy's own generated code look hand-edited, and
+`accept --from=<scratch>` reads what the scratch copy generated.
 
 `ladder stamp` records the current English (step hashes and text, data blocks and rules, vocabulary hashes) in
 `ladder.lock.json`. `ladder check` then reports steps edited since approval, steps whose parent

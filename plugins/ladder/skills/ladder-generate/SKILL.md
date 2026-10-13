@@ -40,11 +40,21 @@ regions are regenerated first, all of them.
 Set `"check_command"` to build what callers and tests see, not just the project: for .NET the whole
 solution including test projects (`["dotnet", "build", "My.sln", "--nologo", "-v", "q"]`), because a
 renamed method or a reordered constructor compiles alone and breaks every caller. Errors in other files
-are passed back to the generator too, marked as possibly caused by the file it wrote.
+are passed back to the generator too, marked as possibly caused by the file it wrote. If the package
+type-checks against another package's build output (a web app whose tsconfig maps the shared library
+to its `dist/`), the check must build that package first (`["sh", "-c", "cd ../lib && npm run build && cd - && npx tsc --noEmit -p tsconfig.app.json"]`),
+and must pass on the untouched code before you regenerate: errors that are there before regeneration
+send `repair` chasing problems it cannot fix. A fresh scratch copy has no build output; build it there.
+
+Every prompt shows the data blocks the build's `"data"` lists and also every data block the steps
+being written name in their English, so a step that says "the snapshot is a MyAlertsSnapshot" gets
+that block's exact fields even when the build spells out no contracts. `repair` reads error locations
+in the usual compiler and runtime formats for C#, TypeScript/TSX, JavaScript/JSX, Python, C/C++, Java,
+Kotlin, Go, Rust, Swift and Dart; when no error line points into the build's files it says so.
 
 If ladder.json sets `"check_command"` (`["npx", "tsc", "--noEmit"]`), `generate` builds after writing
 and retries once with the compile errors; `"format_command"` runs the formatter over every file the
-generator changed. `generate --out=<file>` writes somewhere else, to try a regeneration safely. When code regenerated in a scratch copy is copied back, run `ladder accept <ladder.json> --from=<scratch>/ladder.json` so the copied regions are not reported as hand-edited.
+generator changed. `generate --out=<file>` writes somewhere else, to try a regeneration safely. When code regenerated in a scratch copy is copied back, run `ladder accept <ladder.json> --from=<scratch>/ladder.json` so the copied regions are not reported as hand-edited. Bring later English changes into the scratch copy with git as usual: what the scratch copy generated is kept in its local `.ladder/generated.json`, which a sync does not touch.
 `repair` can open an `@support imports` region at the top of a file that has none when the fix is a
 missing import, and it repairs `@contract` regions (entities, DTOs) as well as step regions.
 

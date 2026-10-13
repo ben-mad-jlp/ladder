@@ -102,6 +102,30 @@ def contract_text(tree: L.Tree, nid: str) -> str:
     return "\n".join(lines)
 
 
+STEP_REF = re.compile(r"\[([A-Za-z0-9_.\-]+)\]")
+
+
+def behind(tree: L.Tree, nid: str) -> dict[str, list[str]]:
+    """The steps a step's English relies on, transitively ("answers what [sa.4] answers", "checks it with
+    [as.9]"), each with the path that reaches it: {step: [nid, ..., step]}. The called step's own contract is
+    compared separately; these are what produce its answer."""
+    paths: dict[str, list[str]] = {}
+    frontier = [(nid, [nid])]
+    while frontier:
+        cur, path = frontier.pop()
+        n = tree[cur]
+        text = " ".join([n.title, n.inputs, n.outputs, n.effects, *n.steps, *n.notes])
+        for ref in STEP_REF.findall(text):
+            if ref in tree and ref != nid and ref not in paths:
+                paths[ref] = path + [ref]
+                frontier.append((ref, path + [ref]))
+    return paths
+
+
+def behind_hashes(tree: L.Tree, nid: str) -> dict[str, str]:
+    return {x: tree[x].hash for x in behind(tree, nid)}
+
+
 def contract_data(tree: L.Tree, nid: str) -> dict:
     """The data blocks a step's in:/out:/effects: lines name (its request and answer shapes)."""
     n = tree[nid]
@@ -147,9 +171,26 @@ def changed_data(was: str, now: str) -> list[str]:
     return sorted(names)
 
 
-def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | None = None):
+def linked_pending(c2: dict, r2: Path, t2: L.Tree, since: str | None, depth: int) -> dict[str, str]:
+    """Steps of a linked project that are themselves waiting on a change in a further tree
+    ({step id: why}), so a change reaches callers more than one link away (api -> library -> screen)."""
+    if depth <= 0:
+        return {}
+    lock2_path = r2 / "ladder.lock.json"
+    lock2 = json.loads(lock2_path.read_text()) if lock2_path.exists() else {}
+    if since is None and not any(not k.startswith("@") for k in lock2) and c2.get("baseline"):
+        since = c2["baseline"]
+    try:
+        _, appr, _, _ = check_links(t2, c2, r2, lock2, since, depth - 1)
+    except Exception:
+        return {}
+    return {a["node"]: a["msg"] for a in appr if a["kind"] == "linked-changed"}
+
+
+def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | None = None, depth: int = 3):
     """Problems, approval items, warnings and the facts `stamp` records ({step: {"alias:id": text}})."""
     problems, approvals, warnings, facts = [], [], [], {}
+    pending_cache: dict[str, dict[str, str]] = {}
     callers = {nid: parse_calls(n) for nid, n in tree.items() if getattr(n, "calls", None)}
     linked = load_linked(cfg, root) if (callers or cfg.get("links")) else {}
     for alias, v in linked.items():
@@ -179,15 +220,38 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
             key = f"{alias}:{tid}"
             now = contract_text(t2, tid)
             facts.setdefault(nid, {})[key] = now
+            now_behind = behind_hashes(t2, tid)
+            facts[nid][key + "#behind"] = json.dumps(now_behind, sort_keys=True)
             if since:
                 if alias not in old_trees:
                     old_trees[alias] = tree_at(c2, r2, since)
                 ot = old_trees[alias]
                 was = contract_text(ot, tid) if ot is not None and tid in ot else None
+                was_behind = behind_hashes(ot, tid) if ot is not None and tid in ot else None
                 when = f"since {since}"
             else:
                 was = was_all.get(nid, {}).get(key)
+                raw = was_all.get(nid, {}).get(key + "#behind")
+                was_behind = json.loads(raw) if raw else None
                 when = "since approval"
+            if alias not in pending_cache:
+                pending_cache[alias] = linked_pending(c2, r2, t2, since, depth)
+            if was == now and tid in pending_cache[alias]:
+                approvals.append(dict(kind="linked-changed", node=nid,
+                                      msg=f"calls {key}, which is itself waiting on a change in another tree "
+                                          f"({pending_cache[alias][tid].split(';')[0]}); its answers may differ: re-read it "
+                                          f"and this step, then approve"))
+            if was is not None and was == now and was_behind is not None:
+                paths = behind(t2, tid)
+                moved = sorted(x for x in set(now_behind) | set(was_behind) if now_behind.get(x) != was_behind.get(x))
+                if moved:
+                    via = "; ".join(f"[{x}]" + (f" (through {' -> '.join('[' + p + ']' for p in paths[x][1:-1])})"
+                                                if x in paths and len(paths[x]) > 2 else "")
+                                    + ("" if x in now_behind else " (no longer referred to)") for x in moved)
+                    approvals.append(dict(kind="linked-changed", node=nid,
+                                          msg=f"calls {key}, whose contract is unchanged, but steps its English relies on "
+                                              f"changed {when}: {via}; its answers may differ (a new refusal, a changed "
+                                              f"message): re-read those steps in the {alias} tree and this one, then approve"))
             if was is not None and was != now:
                 approvals.append(dict(kind="linked-changed", node=nid,
                                       msg=f"calls {key}, whose contract changed {when}: " + diff_text(was, now)
@@ -244,6 +308,19 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                     was = lock.get(tid, {}).get("hash") if isinstance(lock.get(tid), dict) else None
                     changed = bool(was) and was != tree[tid].hash
                     when = "since approval"
+                if not changed:
+                    # a step the called step relies on changed: callers see a different answer too
+                    for x, path in behind(tree, tid).items():
+                        if since:
+                            moved = own_old is not None and (x not in own_old or own_old[x].hash != tree[x].hash)
+                        else:
+                            wx = lock.get(x, {}).get("hash") if isinstance(lock.get(x), dict) else None
+                            moved = bool(wx) and wx != tree[x].hash
+                        if moved:
+                            warnings.append(dict(kind="has-callers", node=x,
+                                                 msg=f"edited {when}, and [{tid}] relies on it "
+                                                     f"({' -> '.join('[' + p + ']' for p in path)}), which {alias} [{cid}] calls: "
+                                                     f"that step shows as linked-changed until re-read and approved"))
                 if changed:
                     warnings.append(dict(kind="has-callers", node=tid,
                                          msg=f"{'its contract changed' if since else 'edited'} {when}, and it is called by "
