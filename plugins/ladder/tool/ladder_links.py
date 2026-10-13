@@ -188,6 +188,77 @@ def linked_pending(c2: dict, r2: Path, t2: L.Tree, since: str | None, depth: int
     return {a["node"]: a["msg"] for a in appr if a["kind"] == "linked-changed"}
 
 
+STEP_REF_RE = re.compile(r"\[([A-Za-z][A-Za-z0-9_-]*(?:\.[0-9]+)+)\]")
+
+
+def link_shape_warnings(tree: L.Tree, cfg: dict, root: Path) -> list[dict]:
+    """Round 15: links that carry nothing.
+    - rule-diverged: a named rule with the same name in a linked project says something else (a change made in one tree only);
+    - uncalled-reference: a step names another tree's step ([upl.2.1]) without a `calls:` line, so changes there never reach it;
+    - link-unused: a link that no `calls:` line uses, in either direction."""
+    out: list[dict] = []
+    linked = {a: v for a, v in load_linked(cfg, root).items() if not isinstance(v, str)}
+    if not linked:
+        return out
+    norm = lambda t: " ".join(t.split()).lower()
+    rules = getattr(tree, "rules", {})
+    # every project reachable through links (an API and its scanner are often linked only through the library)
+    me_pj = (root / "ladder.json").resolve()
+    seen, queue, reach = {me_pj}, [(cfg, root, "")], []
+    while queue:
+        c, r, path = queue.pop(0)
+        for a in (c.get("links") or {}):
+            pj = (r / link_spec(c, a)["project"]).resolve()
+            if pj in seen or not pj.exists():
+                continue
+            seen.add(pj)
+            try:
+                c2 = json.loads(pj.read_text())
+                t2 = L.parse_tree(pj.parent / c2["tree"])
+            except (SystemExit, ValueError, KeyError, OSError):
+                continue
+            name2 = f"{path}{a}" if not path else f"{path} -> {a}"
+            reach.append((name2, t2))
+            queue.append((c2, pj.parent, name2))
+    for where, t2 in reach:
+        for name, text in rules.items():
+            other = getattr(t2, "rules", {}).get(name)
+            if other is not None and norm(other) != norm(text):
+                out.append(dict(kind="rule-diverged", node=name,
+                                msg=f"rule {name} says \"{' '.join(text.split())}\" here and \"{' '.join(other.split())}\" in "
+                                    f"{where}: a change made in one tree has not reached the other; make them agree (or give "
+                                    f"them different names when they are different rules)"))
+    called_aliases = set()
+    for nid, n in tree.items():
+        targets = {tid for _, tid, _ in parse_calls(n)}
+        called_aliases |= {a for a, _, _ in parse_calls(n) if a}
+        foreign = []
+        # what the step does (not its notes, which may point at another tree to explain something)
+        said = "\n".join([n.title, n.inputs, n.outputs, n.effects, *n.steps])
+        for ref in dict.fromkeys(STEP_REF_RE.findall(said)):
+            if ref in tree or ref in targets:
+                continue
+            owner = next((a for a, (_, _, t2) in linked.items() if ref in t2), None)
+            if owner:
+                foreign.append(f"{owner} [{ref}]")
+        if foreign:
+            out.append(dict(kind="uncalled-reference", node=nid,
+                            msg=f"[{nid}] names {', '.join(foreign)} without a `calls:` line: changes there are never "
+                                f"reported here; add `calls: {', '.join(foreign)}`"))
+    me = (root / "ladder.json").resolve()
+    for alias, (c2, r2, t2) in linked.items():
+        if alias in called_aliases:
+            continue
+        back = {a for a in (c2.get("links") or {}) if (r2 / link_spec(c2, a)["project"]).resolve() == me}
+        if any(a in back for n in t2.values() for a, _, _ in parse_calls(n)):
+            continue
+        out.append(dict(kind="link-unused", node=alias,
+                        msg=f"the link to {alias} carries nothing: no step here calls it and none of its steps calls this "
+                            f"project, so changes on either side are never reported on the other; add `calls:` lines to the "
+                            f"steps that use it"))
+    return out
+
+
 def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | None = None, depth: int = 3):
     """Problems, approval items, warnings and the facts `stamp` records ({step: {"alias:id": text}})."""
     problems, approvals, warnings, facts = [], [], [], {}
