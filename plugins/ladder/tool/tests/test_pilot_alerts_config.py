@@ -196,5 +196,19 @@ class RepairSeesTheTypesItsErrorsName(Base):
         self.assertNotIn("export const x", note)
 
 
+class ErrorsAreMatchedByPathNotName(unittest.TestCase):
+    def test_same_file_name_in_another_folder_is_not_ours(self):
+        import regen as R
+        root = Path(tempfile.mkdtemp())
+        (root / "src/features/alerts").mkdir(parents=True)
+        (root / "src/features/developer").mkdir(parents=True)
+        mine = root / "src/features/alerts/hooks.ts"
+        mine.write_text("x\n")
+        self.assertFalse(R.error_names_file("src/features/developer/hooks.ts", mine, [root]))
+        self.assertTrue(R.error_names_file("src/features/alerts/hooks.ts", mine, [root]))
+        self.assertTrue(R.error_names_file(str(mine), mine, [root]))
+        self.assertTrue(R.error_names_file("hooks.ts", mine, [root]))       # no folder given: by name
+
+
 if __name__ == "__main__":
     unittest.main()

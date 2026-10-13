@@ -2651,11 +2651,17 @@ def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, roun
         if r == rounds:
             print(f"STILL DOES NOT BUILD after {rounds} repair round(s) ({n} error lines):\n" + errs[:3000])
             return 1
-        names = {Path(f).name for t in targets for b in cfg["builds"] if b["name"] == t for f in b.get("files", [])}
-        if not any(nm in errs for nm in names):
+        # Which builds' files the errors are in, by path (pilot: "hooks.ts" in another feature's error counted as this
+        # build's hooks.ts, and the repair rewrote a region nothing was wrong with)
+        bases = [root / cfg.get("check_cwd", "."), root, Path.cwd()]
+        locs = [m.group(1) for m in R.ERR_LOC.finditer(errs)]
+
+        def owns(bb: dict) -> bool:
+            return any(R.error_names_file(lp, root / f, bases) for f in bb.get("files", []) for lp in locs)
+        if not any(owns(b) for t in targets for b in cfg["builds"] if b["name"] == t):
             # Round 12: one broken build made every later build "STILL DOES NOT BUILD" after three useless rounds.
             others = sorted({b["name"] for b in cfg["builds"] if b.get("tagged") is not False and b["name"] not in targets
-                             for f in b.get("files", []) if Path(f).name in errs})
+                             and owns(b)})
             hint = (f"fix {', '.join(others)} first (`ladder regen --build=<it> --repair=N`)" if others else
                     "they are in files no build of this project generates (tests, fixtures, other features): update "
                     "them by hand as part of the change, or reconsider the English (an optional field breaks no caller)")

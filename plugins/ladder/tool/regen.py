@@ -1086,7 +1086,9 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
         # steps citing a rule that changed since approval are rewritten too (their own text did not change)
         REDO.update(c for r in L.changed_rules(tree, lock) for c in L.rule_citers(tree, r))
     ref_name = cfg.get("compare", {}).get("reference")
-    builds = sorted(cfg["builds"], key=lambda b: b["name"] != ref_name)
+    # A build compared by behaviour only ("tagged": false: a recording, an outside implementation) has no regions to
+    # write (pilot: regen tried to insert a new step's region into a recording and reported it rejected).
+    builds = sorted((b for b in cfg["builds"] if b.get("tagged") is not False), key=lambda b: b["name"] != ref_name)
     if only:
         builds = [b for b in builds if b["name"] == only]
     log_dir = new_log_dir(root, "-blind" if BLIND else "")
@@ -1280,6 +1282,21 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
 
 # A source file and line in an error message: "Foo.cs(12,5)", "src/a.tsx(43,29)", "a.py", line 7", "x.go:12:3".
 SOURCE_EXTS = "py|cpp|cc|cxx|c|hpp|hh|h|cs|ts|tsx|mts|cts|js|jsx|mjs|cjs|java|kt|kts|go|rs|swift|rb|php|dart|scala|vue|svelte"
+def error_names_file(err_path: str, fpath: Path, bases: list[Path]) -> bool:
+    """Whether a path in a build error means this file. Resolved against the folders the build runs from; a bare file
+    name (no folder) is matched by name. Never by name alone when the error gives a folder (pilot: an error in
+    features/developer/hooks.ts was repaired in features/alerts/hooks.ts, at the same line)."""
+    p = Path(err_path.replace("\\", "/"))
+    target = fpath.resolve()
+    if p.is_absolute():
+        return p.resolve() == target
+    if any((base / p).resolve() == target for base in bases):
+        return True
+    if len(p.parts) == 1:
+        return p.name == fpath.name
+    return str(target).endswith("/" + p.as_posix().lstrip("./"))
+
+
 ERR_LOC = re.compile(r"""([\w./\\-]+\.(?:""" + SOURCE_EXTS + r"""))(?:"?, line |[:(])(\d+)""")
 
 
@@ -1355,6 +1372,7 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
     log_dir = new_log_dir(root, "-repair")
     (log_dir / "cwd").mkdir(exist_ok=True)
     status = 0
+    bases = [root / cfg.get("check_cwd", "."), root, Path.cwd()]
     for f in b["files"]:
         fpath = root / f
         regions, owner, lines, _ = L.parse_regions(fpath, b["lang"])
@@ -1362,12 +1380,12 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
         err_lines = errors.splitlines()
         if "Traceback (most recent call last)" in errors:
             # A traceback lists every caller; only the innermost frame in this file is the fault.
-            ours = [l for l in err_lines if ERR_LOC.search(l) and Path(ERR_LOC.search(l).group(1)).name == fpath.name]
+            ours = [l for l in err_lines if ERR_LOC.search(l) and error_names_file(ERR_LOC.search(l).group(1), fpath, bases)]
             last = ours[-1:] if ours else []
             err_lines = last + [l for l in err_lines if not ERR_LOC.search(l)][-3:]
         for line in err_lines:
             for m in ERR_LOC.finditer(line):
-                if not str(fpath).endswith(m.group(1).lstrip("./")) and Path(m.group(1)).name != fpath.name:
+                if not error_names_file(m.group(1), fpath, bases):
                     continue
                 ln = int(m.group(2))
                 if not 1 <= ln <= len(lines):
