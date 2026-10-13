@@ -142,5 +142,24 @@ class BlindRunKeepsWhatCallersUse(unittest.TestCase):
         self.assertIn("public static bool IsDue(DateTime a, int b)", note)
 
 
+class RestoredApprovedCodeIsNotAHandEdit(Base):
+    def test_checkout_of_the_committed_code_after_a_regeneration(self):
+        pj = self.project()
+        _, _, tree, *_ = L.load_project(pj)
+        good = f"// @node t.1@{tree['t.1'].hash}\nexport const f = () => 'b'\n// @end\n"
+        (self.p / "c.ts").write_text(good)
+        self.assertEqual(quiet(L.stamp, pj)[0], 0)
+        git = ["git", "-C", str(self.root), "-c", "user.email=a@b", "-c", "user.name=a"]
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-qm", "approved"], check=True)
+        # a regeneration writes other code and records it as the build's code (working tree only)
+        (self.p / "c.ts").write_text(good.replace("'b'", "'bad'"))
+        L.record_code(self.p, L.read_config(pj))
+        # the person restores the approved file
+        subprocess.run(git + ["checkout", "--", "area/c.ts"], check=True)
+        b = L.read_config(pj)["builds"][0]
+        self.assertEqual(L.hand_edited(self.p, b), [])
+
+
 if __name__ == "__main__":
     unittest.main()

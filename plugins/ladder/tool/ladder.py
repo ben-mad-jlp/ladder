@@ -2274,13 +2274,31 @@ def hand_edited(root: Path, b: dict) -> list[tuple[str, str, int]]:
     what the generator last wrote in this checkout."""
     saved = load_code(root).get(b["name"], {})
     gen = load_generated(root).get(b["name"], {})
+    committed = committed_code(root).get(b["name"], {})
     out = []
     for f, regs in code_fingerprints(root, b).items():
         for key, (fp, line) in regs.items():
             was = saved.get(f, {}).get(key)
-            if was is not None and was != fp and gen.get(f, {}).get(key) != fp:
+            # The code as committed (approved) is never a hand edit: restoring it after a regeneration went wrong
+            # (`git checkout` of the file) must not make regen refuse the region (pilot).
+            if was is not None and was != fp and gen.get(f, {}).get(key) != fp \
+                    and committed.get(f, {}).get(key) != fp:
                 out.append((f, key, line))
     return out
+
+
+def committed_code(root: Path) -> dict:
+    """ladder.code.json as committed at HEAD ({} when it is not in git)."""
+    try:
+        res = subprocess.run(["git", "-C", str(root), "show", f"HEAD:./{CODE_FILE}"], capture_output=True, text=True)
+    except OSError:
+        return {}
+    if res.returncode != 0:
+        return {}
+    try:
+        return json.loads(res.stdout)
+    except ValueError:
+        return {}
 
 
 TYPE_ESCAPES = {
