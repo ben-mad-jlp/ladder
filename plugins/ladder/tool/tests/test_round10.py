@@ -223,5 +223,47 @@ class ReferenceRetire(unittest.TestCase):
             self.assertEqual(hist, ["old-scratch", "original"])
 
 
+class DataNotes(unittest.TestCase):
+    def test_notes_in_a_data_block_are_notes_not_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.ladder"
+            p.write_text("data Mail\n  note: the API's shape\n  id: whole number\n  note: QUESTION: typed yes/no\n\n"
+                         "[s.1] Read\n  out: Mail\n  > reads\n")
+            tree = L.parse_tree(p)
+            self.assertEqual(tree.data["Mail"].real_fields(), [("id", "whole number")])
+            self.assertIn("  note: QUESTION: typed yes/no", tree.data["Mail"].text())
+
+
+class SharedWith(unittest.TestCase):
+    def test_another_projects_regions_in_a_shared_file_are_foreign(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for name, tree, other in (("a", "[a.1] Do A\n  > does A\n", "b"), ("b", "[b.1] Do B\n  > does B\n", "a")):
+                (root / name).mkdir()
+                (root / name / "t.ladder").write_text(tree)
+            code_dir = root / "src"
+            code_dir.mkdir()
+            api = code_dir / "api.ts"
+            for name in ("a", "b"):
+                pj = root / name / "ladder.json"
+                pj.write_text(json.dumps({"title": name, "tree": "t.ladder", "builds": [
+                    {"name": "x", "lang": "typescript", "files": ["../src/api.ts"], "steps": [f"{name}.*"]}]}))
+            ha = L.parse_tree(root / "a" / "t.ladder")["a.1"].hash
+            hb = L.parse_tree(root / "b" / "t.ladder")["b.1"].hash
+            api.write_text(f"// @node a.1@{ha}\nexport const a = 1\n// @end\n// @node b.1@{hb}\nexport const b = 2\n// @end\n")
+            unknown = lambda name: [p for b in L.check(root / name / "ladder.json")["builds"] for p in b["problems"]
+                                    if p["kind"] == "unknown-step"]
+            self.assertEqual(len(unknown("a")), 1)
+            self.assertIn("shared_with", unknown("a")[0]["msg"])
+            for name, other in (("a", "b"), ("b", "a")):
+                pj = root / name / "ladder.json"
+                c = json.loads(pj.read_text())
+                c["builds"][0]["shared_with"] = [f"../{other}/ladder.json"]
+                pj.write_text(json.dumps(c))
+            self.assertEqual(unknown("a") + unknown("b"), [])
+            fp = L.code_fingerprints(root / "a", json.loads((root / "a" / "ladder.json").read_text())["builds"][0])
+            self.assertEqual(list(fp["../src/api.ts"]), ["node a.1"])
+
+
 if __name__ == "__main__":
     unittest.main()

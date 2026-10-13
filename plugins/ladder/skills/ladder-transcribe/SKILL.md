@@ -181,6 +181,12 @@ tests failed. The same goes for attributes another system finds on the page (`da
 `data-testid` a test runner uses): name the attribute in the English or in the vocabulary. In round 10
 the English said "the assistant's target"; regeneration wrote `data-assistant-target`.
 
+**Files several areas share.** A file another project already tags (an app's API module, where each area added
+its own functions) gets this area's regions too: tag them inside the other project's `@support` region with
+`ladder tag ... --base HEAD` (line numbers of the tagged file, so the other project's markers stay), and name each
+project in the other's build as `"shared_with": ["../../<area>/<project>/ladder.json"]`. Without it, each
+project reports the other's regions as `unknown-step`.
+
 **Large files.** When only part of a file belongs to the slice (8 members of a 1,700-line service),
 tag the rest as `@support` with a label and transcribe only the slice's members. To try regenerating
 such a file, don't use `generate` (it writes the whole file from the English and drops the support

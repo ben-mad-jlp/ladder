@@ -646,7 +646,8 @@ def export(argv: list[str]) -> int:
         "steps": [dict(id=n.id, title=n.title, parent=n.parent, children=n.children, depth=n.depth,
                        inputs=n.inputs, outputs=n.outputs, effects=n.effects, how=n.steps, notes=n.notes, compare=n.compare, reads=n.reads, writes=n.writes, calls=n.calls,
                        uses=n.uses, hash=n.hash, line=n.line) for n in tree.values()],
-        "data": [dict(name=d.name, fields=[dict(name=k, description=v) for k, v in d.fields], rules=d.rules)
+        "data": [dict(name=d.name, fields=[dict(name=k, description=v) for k, v in d.real_fields()], rules=d.rules,
+                      notes=[v for k, v in d.fields if k == "note"])
                  for d in tree.data.values()],
         "rules": tree.rules,
         "vocabulary": [dict(name=c.name, inputs=c.inputs, outputs=c.outputs, bindings=c.bindings,
