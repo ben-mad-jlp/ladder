@@ -1309,6 +1309,41 @@ REPAIR_RULE = ("Fix the cause of each error; never hide it. Do not add type asse
                "scale's state to a guessed shape and passed a wrongly named prop through a cast; it compiled and was wrong.)")
 
 
+TYPE_IN_ERROR = re.compile(r"'([A-Z][A-Za-z0-9_]*)(?:<[^']*>)?'")
+
+
+def named_type_declarations(errors: str, cwd: Path, own: Path, most: int = 4, lines: int = 40) -> str:
+    """The declarations of the types a build's errors name ("missing ... from type 'MeasureDecl'"), found with git grep
+    under the build folder: a region that must fit a type it never saw cannot be repaired from the message alone
+    (pilot: two repair rounds guessed DimensionDecl's fields and failed both times)."""
+    names = [n for n in dict.fromkeys(TYPE_IN_ERROR.findall(errors)) if len(n) > 2][:12]
+    out = []
+    for name in names:
+        res = subprocess.run(["git", "grep", "-n", "-E",
+                              rf"^\s*(export\s+)?((public|internal|sealed|abstract|partial|static)\s+)*"
+                              rf"(interface|type|class|record|struct|enum)\s+{name}\b"],
+                             cwd=cwd, capture_output=True, text=True)
+        hits = [h for h in res.stdout.splitlines() if h][:1]
+        for h in hits:
+            f, ln = h.split(":", 2)[:2]
+            path = cwd / f
+            if path.resolve() == own.resolve():
+                continue          # the region's own file: the prompt already shows it
+            body = path.read_text().splitlines()[int(ln) - 1:int(ln) - 1 + lines]
+            depth, keep = 0, []
+            for l in body:
+                keep.append(l)
+                depth += l.count("{") - l.count("}") + l.count("(") - l.count(")")
+                if depth <= 0 and len(keep) > 1 and re.search(r"[};]\s*$", l.strip()):
+                    break
+            out.append(f"--- {name} ({f}:{ln})\n" + "\n".join(keep))
+        if len(out) >= most:
+            break
+    if not out:
+        return ""
+    return "\n\n=== Declarations of the types these errors name (fit the code to them):\n" + "\n".join(out)
+
+
 def repair(pj: Path, build_name: str, errors: str) -> int:
     """Map build/run errors to the regions they point at and regenerate those regions,
     with the error text in the prompt. Errors inside @support regions are reported, not touched."""
@@ -1367,7 +1402,7 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
             regions, _, lines, _ = L.parse_regions(fpath, b["lang"])
             r = regions[idx]
             reason = "\n".join(dict.fromkeys(hits[idx] + [l.strip() for l in err_lines if l.strip() and not ERR_LOC.search(l)][-3:]))
-            reason = REPAIR_RULE + "\n" + reason
+            reason = REPAIR_RULE + "\n" + reason + named_type_declarations(reason, root / cfg.get("check_cwd", "."), fpath)
             tag = f"{build_name}__repair-{r.label.replace(' + ', '+').replace(' ', '-')}"
             if r.kind == "contract":
                 conv = conventions_text(b)

@@ -184,5 +184,17 @@ class RelativeTimesAndTheGapBetweenRecordings(unittest.TestCase):
         self.assertEqual(L.match_info(ref, val, 0, 73 * 60)[0], "different")
 
 
+class RepairSeesTheTypesItsErrorsName(Base):
+    def test_declaration_of_a_named_type_is_found(self):
+        import regen as R
+        (self.root / "types.ts").write_text("export type MeasureDecl = {\n  column: string\n  label: string\n}\nexport const x = 1\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        errs = "a.ts(1,1): error TS2739: Type '{ column: string; }' is missing the following properties from type 'MeasureDecl': label"
+        note = R.named_type_declarations(errs, self.root, self.root / "a.ts")
+        self.assertIn("export type MeasureDecl = {", note)
+        self.assertIn("label: string", note)
+        self.assertNotIn("export const x", note)
+
+
 if __name__ == "__main__":
     unittest.main()
