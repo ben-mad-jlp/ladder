@@ -1067,6 +1067,8 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                         f"names), or tag it as @support if no step owns it"))
         report["builds"].append(br)
     report["warnings"] += rule_in_support_warnings(root, cfg, tree, lock)
+    for b in cfg.get("builds", []):
+        report["warnings"] += exported_type_warnings(root, b)
     report["compare"] = compare_runs(root, cfg, tree)
     report["warnings"] += replay_settings_warnings(root, cfg)
     report["warnings"] += unused_trace_warnings(root, cfg)
@@ -1702,6 +1704,46 @@ EXPORT_CS = re.compile(r"^\s*public\s+(?:(?:static|sealed|abstract|partial|reado
 EXPORT_PY = re.compile(r"^(?:async\s+)?(?:def|class)\s+([A-Za-z]\w*)|^([A-Za-z]\w*)\s*(?::[^=]*)?=", re.M)
 
 
+EXPORTED_TYPE_RE = re.compile(r"^\s*export\s+(?:interface|type)\s+([A-Z][A-Za-z0-9_]*)")
+
+
+def exported_type_warnings(root: Path, b: dict) -> list[dict]:
+    """An exported TypeScript type declared in a step's region (not a @contract one) that other files of the repository
+    use: blind generation rewrites the step from the English, renames the type's fields, and those files break. Round
+    12: a view's props interface was rewritten and its container, its story fixtures and another screen's dialog no
+    longer compiled."""
+    if b.get("lang") not in ("typescript", "javascript") or b.get("tagged") is False:
+        return []
+    out = []
+    for f in b.get("files", []):
+        fpath = root / f
+        if not fpath.exists():
+            continue
+        regions, owner, lines, _ = parse_regions(fpath, b["lang"])
+        for i, l in enumerate(lines):
+            m = EXPORTED_TYPE_RE.match(l)
+            if not m or owner[i] is None or regions[owner[i]].kind != "node":
+                continue
+            name = m.group(1)
+            top = subprocess.run(["git", "-C", str(fpath.parent), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+            if top.returncode != 0:
+                continue
+            top_dir = Path(top.stdout.strip())
+            # within the file's own package (the nearest package.json): another app's type of the same name is not a user
+            pkg = next((d for d in fpath.resolve().parents if (d / "package.json").exists()), top_dir)
+            rel = pkg.relative_to(top_dir).as_posix() if pkg.is_relative_to(top_dir) else "."
+            res = subprocess.run(["git", "-C", str(top_dir), "grep", "-lw", name, "--", f"{rel}/*.ts", f"{rel}/*.tsx"],
+                                 capture_output=True, text=True)
+            here = fpath.resolve()
+            users = [u for u in res.stdout.splitlines() if (top_dir / u).resolve() != here][:3]
+            if users:
+                out.append(dict(kind="exported-type-in-step", node=name,
+                                msg=f"{name} (exported from a step region of {f}, line {i + 1}) is used by {', '.join(users)}: "
+                                    f"regeneration rewrites the step from the English and can rename its fields. Write "
+                                    f"it as a data block and tag it @contract, so its shape is part of the contract"))
+    return out
+
+
 def text_export_names(text: str, lang: str) -> list[str]:
     """The names a piece of code exports (see export_names), for one region's lines."""
     names: set[str] = set()
@@ -2098,6 +2140,16 @@ def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, roun
         n = len(errs.splitlines())
         if r == rounds:
             print(f"STILL DOES NOT BUILD after {rounds} repair round(s) ({n} error lines):\n" + errs[:3000])
+            return 1
+        names = {Path(f).name for t in targets for b in cfg["builds"] if b["name"] == t for f in b.get("files", [])}
+        if not any(nm in errs for nm in names):
+            # Round 12: one broken build made every later build "STILL DOES NOT BUILD" after three useless rounds.
+            others = sorted({b["name"] for b in cfg["builds"] if b.get("tagged") is not False and b["name"] not in targets
+                             for f in b.get("files", []) if Path(f).name in errs})
+            hint = (f"fix {', '.join(others)} first (`ladder regen --build=<it> --repair=N`)" if others else
+                    "they are in files no build of this project generates (tests, fixtures, other features): update "
+                    "them by hand as part of the change, or reconsider the English (an optional field breaks no caller)")
+            print(f"build errors ({n} lines), none in {', '.join(targets)}'s files: {hint}:\n" + errs[:2000])
             return 1
         print(f"build errors ({n} lines); repair round {r + 1} of {rounds}")
         before = snapshot(root, cfg)

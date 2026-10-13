@@ -179,7 +179,9 @@ which step builds it ("the snapshot is a MyAlertsSnapshot"). In round 8 the Engl
 selected (the alert being deleted, ...)"; blind regeneration chose its own keys and the assistant's
 tests failed. The same goes for attributes another system finds on the page (`data-sofia-target`,
 `data-testid` a test runner uses): name the attribute in the English or in the vocabulary. In round 10
-the English said "the assistant's target"; regeneration wrote `data-assistant-target`. Accessibility labels and roles
+the English said "the assistant's target"; regeneration wrote `data-assistant-target`. The props of a component other files render, and any exported type
+other files import, are contracts too: data blocks in `@contract` regions (round 12: a view's props were described in
+prose and blind regeneration renamed them; the container and the story fixtures stopped compiling). Accessibility labels and roles
 are the same kind of contract (screen readers and tests find controls by them): list them in the step that renders.
 
 **Name the exact signal.** When the code decides on one particular field and the English says something looser
