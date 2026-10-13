@@ -239,6 +239,11 @@ hand edits checked, give them a support-only build (`"steps": []`). (In the API 
 regenerated entity mapped every property to a camelCase column; every query failed on SQL Server
 while the tests, built from the same model, passed.)
 
+**What a test asserts is behaviour.** A CSS class, a test id or an exact text that a test checks belongs in the
+English, even where you otherwise leave styling out: the generator cannot keep a value it never sees. (Pilot: the
+blinking chip's class `animate-blink-colours` was left out as styling; the blind run named it otherwise and the
+screen's test failed.) Before tagging, grep the area's tests for the literals they assert.
+
 **What an insert leaves out is behaviour.** For every row the code adds, say which columns it sets. A required column
 it leaves unset makes the insert fail, and that failure is what the code does today: write it (with a QUESTION
 note), or the generator, seeing the schema, will fill the column in and "fix" it. (Pilot: a new alert definition
