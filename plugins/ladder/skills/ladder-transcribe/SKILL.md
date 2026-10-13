@@ -181,8 +181,13 @@ For more than a couple of files, list the regions in a `regions.json` next to la
 `ladder tag <ladder.json> regions.json --base <base>` rebuilds each file from `<base>` (the commit before
 any tags; record it when you start, since once the tags are committed HEAD is the tagged version) with the
 marker lines added and the tree's current hashes, so re-running it after the tree changes is safe and the
-diff stays comment lines only. `ladder adopt-check <ladder.json> --base <base>` proves it. Line numbers
-are the untagged file's; regions may nest. Commit `regions.json` with the tree.
+diff stays comment lines only (a file's line endings, CRLF or LF, are kept). `ladder adopt-check <ladder.json> --base
+<base>` proves it, line endings included. Line numbers are the untagged file's; regions may nest. Commit `regions.json`
+with the tree.
+
+**Write the cross-project calls as you go.** Put each call into another project's code in `CALLS.md` with the
+other tree's step id when you know it (a route table, `| METHOD /route | [step] |`, saves the linker most of the
+work). A step that uses another tree's type, not a step, names the type's data block: `calls: scanner [ShippingContext]`.
 
 **Shapes another system reads.** An object the code hands to another system (a snapshot for an
 assistant, an analytics event, a message on a queue, a log record a dashboard parses) is a contract

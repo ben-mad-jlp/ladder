@@ -238,7 +238,12 @@ each result against the command, the files it names and the code of the builds i
 to that code makes the result `test-stale`; a failed one is a problem. A project with tagged builds and
 no `"tests"` gets an `untested-project` warning: nothing records that its code passes the slice's
 tests. `ladder test` runs each distinct command once, however many capabilities, links or tests name
-it, and records the result for each.
+it, and records the result for each. The code of the builds is recorded without Ladder's marker lines, so a retag or
+a stamp does not make a passed test stale. A run whose output says no test ran ("No test files found", "No test
+matches the given testcase filter", "Total tests: 0") is recorded as failed, since a filter that matches nothing exits
+0; a pass with no output at all is recorded as `test-silent` (make the command print its runner's summary). The
+number of tests a runner reports is recorded and printed. A test that names a file that does not exist is not run;
+`check` reports it as `test-missing`.
 
 ### Links between trees
 
@@ -256,10 +261,15 @@ and ladder.json names the other project, optionally with a test that runs both s
                   "test": "npx vitest run ladder/auth/clients/harness/seam_login.test.tsx"}}
 ```
 
-(`"links": {"api": "../api/ladder.json"}` without a test.) `check` resolves every `calls:` item.
+(`"links": {"api": "../api/ladder.json"}` without a test.) `check` resolves every `calls:` item. One item may
+name several steps of a tree (`calls: scanner [shc.20.13] [shc.20.14]`), and items are separated by commas. A target
+may also be a data block of the other tree (`calls: scanner [ShippingContext]`): a step that uses another tree's type
+is then `linked-changed` when that block changes, with the fields that changed.
 A link carries changes only through `calls:` lines. `check` warns `uncalled-reference` when a step's English names
 another tree's step (`[upl.2.1]`, outside its notes) without a `calls:` line for it, and `link-unused` when no step on
-either side calls across a link: in both cases a change on the other side is never reported (round 15). A named rule
+either side calls across a link: in both cases a change on the other side is never reported (round 15). Under a
+ladder.repo.json with `"projects"`, a step that names a step of a project this one does not link to at all is warned
+too, so the first link is not needed before missing ones show. A named rule
 written in two linked projects (also through a project in between, an API and its scanner linked through the library)
 must say the same thing: `check` warns `rule-diverged` when the texts differ, as when a change was made in one tree only.
 `stamp` records the called step's contract: its `in:`, `out:` and `effects:` lines and the data
@@ -587,9 +597,10 @@ ladder check <ladder.json> [--since=REF] [--all-differences]
                                                       --since: review steps, schema and linked steps against a
                                                       git ref instead of the last approval
 ladder --version                                      the plugin's version
-ladder check --all [FOLDER] [--since=REF]             every project ladder.repo.json lists, one line each and a
-                                                      count by kind; exit 1 if any has problems, 3 if the rest
-                                                      only await approval
+ladder check --all [FOLDER] [--since=REF] [--warnings]
+                                                      every project ladder.repo.json lists, one line each and a
+                                                      count by kind (warnings totalled; --warnings: per project);
+                                                      exit 1 if any has problems, 3 if the rest only await approval
 ladder test <ladder.json> [NAME...]                   run capability and link tests; record the results
 ladder hashes <ladder.json>                           current hash of every step
 ladder export <ladder.json> [out.json]                the parsed tree as JSON
