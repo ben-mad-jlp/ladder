@@ -418,14 +418,36 @@ def _ladder_version() -> str:
         return "unknown"
 
 
-def _write_replay_meta(out: Path, mask: dict, mask_text: list, jwt_on: bool, record: list, observe) -> None:
+def _replay_project(out: Path, explicit: str | None) -> Path | None:
+    """The ladder.json whose traces these are: --project, or <project>/traces/<build> by position."""
+    if explicit:
+        return Path(explicit)
+    o = out.resolve()
+    pj = o.parent.parent / "ladder.json"
+    return pj if o.parent.name == "traces" and pj.exists() else None
+
+
+def _repo_relative(text: str, where: Path) -> str:
+    """A command with the repository's absolute path replaced by <repo>, so two checkouts of the same repository
+    record the same settings (round 14: a scratch copy's --observe differed only by its folder)."""
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                         cwd=str(where if where.exists() else where.parent))
+    root = top.stdout.strip()
+    return text.replace(root, "<repo>") if root and text else text
+
+
+def _write_replay_meta(out: Path, mask: dict, mask_text: list, jwt_on: bool, record: list, observe,
+                       project: Path | None = None) -> None:
     """How these traces were recorded, so `check` can tell when two builds' traces were recorded
-    differently (another Ladder version, other masks) and the difference is the recording's."""
+    differently (another Ladder version, other masks) and the difference is the recording's; and, for a project's
+    traces, a fingerprint of its code, so `check` can tell when the reference no longer matches the code."""
     import datetime
     meta = {"ladder": _ladder_version(), "mask": dict(sorted(mask.items())),
             "mask_text": [f"{rx.pattern}={rep}" for rx, rep in mask_text], "jwt": jwt_on,
-            "record_headers": sorted(record), "observe": observe or "",
+            "record_headers": sorted(record), "observe": _repo_relative(observe or "", out),
             "recorded": datetime.date.today().isoformat()}
+    if project and project.exists():
+        meta["code"] = L.code_fingerprint(project.parent, json.loads(project.read_text()))
     (out / ".replay.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
@@ -447,7 +469,7 @@ def replay(argv: list[str]) -> int:
     if not argv or argv[0].startswith("--"):
         raise SystemExit("usage: ladder replay <scenario.json|folder> --base URL --out traces/<build> "
                          "[--mask a,b:presence,c:time] [--mask-text 'PATTERN=REPLACEMENT'] [--header 'K: V'] "
-                         "[--before-each 'command'] [--record-headers a,b] [--jwt] [--observe 'command'] [--force]")
+                         "[--before-each 'command'] [--record-headers a,b] [--jwt] [--observe 'command'] [--project ladder.json] [--force]")
     src = Path(argv[0])
     base = opt(argv, "--base", required=True).rstrip("/")
     out = Path(opt(argv, "--out", required=True))
@@ -554,7 +576,7 @@ def replay(argv: list[str]) -> int:
             events.append({"step": step, "ev": "exit", "ms": 0, "info": f"{status}",
                            "data": json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)})
         (out / f"{f.stem}.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
-        _write_replay_meta(out, mask, mask_text, jwt_on, record_default, observe)
+        _write_replay_meta(out, mask, mask_text, jwt_on, record_default, observe, _replay_project(out, opt(argv, "--project")))
         print(f"  {f.stem}: {len(events) // 2} requests -> {out / (f.stem + '.jsonl')}")
     return 0
 

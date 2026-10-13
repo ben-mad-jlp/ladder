@@ -1114,6 +1114,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
         report["warnings"] += exported_type_warnings(root, b)
     report["compare"] = compare_runs(root, cfg, tree)
     report["warnings"] += replay_settings_warnings(root, cfg)
+    report["warnings"] += reference_stale_warnings(root, cfg)
     report["warnings"] += unused_trace_warnings(root, cfg)
     # Mutants (builds with "mutant": true) are broken on purpose: they must differ somewhere.
     mutants = {b["name"] for b in cfg["builds"] if b.get("mutant")}
@@ -1324,6 +1325,73 @@ def unused_trace_warnings(root: Path, cfg: dict) -> list[dict]:
     return out
 
 
+def code_fingerprint(root: Path, cfg: dict) -> dict[str, str]:
+    """{file: fingerprint} of every tagged build's files, without comment lines (markers, notes) or spacing, so
+    retagging and stamping do not change it. `ladder replay` records it with a project's traces."""
+    out: dict[str, str] = {}
+    for b in cfg.get("builds", []):
+        if b.get("tagged") is False:
+            continue
+        cm = COMMENT.get(b.get("lang", ""), "//")
+        for f in b.get("files", []):
+            p = root / f
+            if f in out or not p.exists():
+                continue
+            lines = [" ".join(l.split()) for l in p.read_text(errors="replace").splitlines()]
+            code = [l for l in lines if l and not l.startswith(cm)]
+            out[f] = hashlib.sha1("\n".join(code).encode()).hexdigest()[:10]
+    return out
+
+
+def reference_stale_warnings(root: Path, cfg: dict) -> list[dict]:
+    """The reference's traces were recorded (by `ladder replay`) from code other than what is here now: a change was
+    accepted and the reference not recorded again, or the recording ran binaries built before the change. Round 14:
+    the reference was re-recorded with the service's old build; nothing said so."""
+    c = cfg.get("compare") or {}
+    ref = c.get("reference")
+    if not ref:
+        return []
+    folder = next((b.get("traces", b["name"]) for b in cfg.get("builds", []) if b["name"] == ref), ref)
+    try:
+        meta = json.loads((root / "traces" / folder / ".replay.json").read_text())
+    except (OSError, ValueError):
+        return []
+    was = meta.get("code")
+    if not was:
+        return []
+    now = code_fingerprint(root, cfg)
+    changed = sorted(f for f in set(was) | set(now) if was.get(f) != now.get(f))
+    if not changed:
+        return []
+    return [dict(kind="reference-stale", node=ref,
+                 msg=f"traces/{folder} were recorded from other code than is here now ({', '.join(changed[:3])}"
+                     + (f" and {len(changed) - 3} more" if len(changed) > 3 else "") + "): if the change was approved, "
+                     f"build this code and record the reference again (or `ladder reference <ladder.json> --from=<a build "
+                     f"recorded from this code>`); until then every comparison is measured against the old behaviour")]
+
+
+def repo_relative_command(cmd: str) -> str:
+    """A recorded command with each absolute path that exists written relative to its git repository ("<repo>/..."),
+    so recordings made in two checkouts of the same repository compare equal (older recordings kept absolute paths)."""
+    import shlex
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return cmd
+    for tok in parts:
+        if not tok.startswith("/") or "<repo>" in tok:
+            continue
+        p = Path(tok)
+        where = p if p.is_dir() else p.parent
+        if not where.exists():
+            continue
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, cwd=str(where))
+        root = top.stdout.strip()
+        if top.returncode == 0 and root and tok.startswith(root):
+            cmd = cmd.replace(tok, "<repo>" + tok[len(root):])
+    return cmd
+
+
 def replay_settings_warnings(root: Path, cfg: dict) -> list[dict]:
     """Traces that `ladder replay` recorded with different settings (masks, --jwt, --observe) or a
     different Ladder version than the reference's: their differences may come from the recording."""
@@ -1354,8 +1422,9 @@ def replay_settings_warnings(root: Path, cfg: dict) -> list[dict]:
                                 f"0.6.1, or not by replay) while the other side has one; if they differ, re-record with "
                                 f"the same settings before trusting the comparison"))
             continue
+        want, got = dict(want, observe=repo_relative_command(want.get("observe", ""))), dict(got, observe=repo_relative_command(got.get("observe", "")))
         diffs = [f"{k}: {want.get(k)} vs {got.get(k)}" for k in sorted(set(want) | set(got))
-                 if k not in ("recorded", "mask_text") and want.get(k) != got.get(k)]   # mask_text: applied to both at compare
+                 if k not in ("recorded", "mask_text", "code") and want.get(k) != got.get(k)]   # mask_text: applied to both at compare; code: differs by design
         if diffs:
             out.append(dict(kind="replay-settings", node=b["name"],
                             msg=f"recorded with different replay settings than {ref} (" + "; ".join(diffs)
@@ -1875,13 +1944,16 @@ def export_changes(root: Path, b: dict) -> list[tuple[str, list[str], list[str]]
             except SystemExit:
                 orig = None
             if orig is not None:
-                tmp = root / ".ladder" / "exports-base.tmp"
-                local_dir(root)
-                tmp.write_text(orig)
+                # a file of its own per run: two checks of one project at once must not share it (round 14)
+                import tempfile
+                fd, name = tempfile.mkstemp(prefix="exports-base-", suffix=".tmp", dir=str(local_dir(root)))
+                tmp = Path(name)
+                with open(fd, "w") as fh:
+                    fh.write(orig)
                 try:
                     was = {**was, f: export_names(tmp, b["lang"]) or []}
                 finally:
-                    tmp.unlink()
+                    tmp.unlink(missing_ok=True)
         if f not in was:
             continue
         now = export_names(root / f, b["lang"]) or []

@@ -272,6 +272,8 @@ ladder replay ladder/<area>/api/scenarios --base http://localhost:5000 --out lad
   --before-each "<command that resets and reseeds the test database>"
 ```
 
+**Build first, from the checkout you record.** `replay` talks to whatever is running: a service started from an earlier build answers with the earlier code. Make the recording script build the service from the checkout it records before starting it (round 14: a reference was re-recorded from the binaries of the code before a change). `replay` writes a fingerprint of the project's code into the traces' `.replay.json` (traces under `<project>/traces/<build>`, or `--project <ladder.json>`), and `check` warns `reference-stale` when the reference was recorded from other code than is there now.
+
 If it cannot run here, still write the scenarios and say exactly how to record them.
 
 ## 8. Hand back
