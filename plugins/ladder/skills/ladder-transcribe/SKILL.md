@@ -53,7 +53,13 @@ ladder init ladder/<area>/api --name "<Area> API" --build api:csharp --adopted
 ladder init ladder/<area>/clients --name "<Area> clients" --build web:typescript --build mobile:typescript --adopted
 ```
 
-Then, in each ladder.json, point `"vocabulary"` and the `"conventions"` entries at the shared
+**Many areas in one repository:** before the first area, write a `ladder.repo.json` at the repository root with
+the settings every project shares (the vocabulary, conventions per language, the generator, the schemas) and
+`"projects"`, the globs of every ladder.json (reference section 7). `ladder init` then leaves those out of each new
+project, `ladder check --all` checks every area in one run, and an edited step names the projects that call it.
+Settings that differ per area stay in that area's ladder.json, which always wins.
+
+Without one, in each ladder.json, point `"vocabulary"` and the `"conventions"` entries at the shared
 files (`"../vocabulary.ladder"`, `"../conventions/csharp.md"`), delete the per-project copies that
 `init` created, and list each build's `files` (paths relative to that ladder.json). The API
 project's `compare.reference` is the API build: the existing system is the reference every

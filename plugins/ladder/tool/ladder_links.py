@@ -13,8 +13,8 @@ with ladder.json naming the other project:
 `check` resolves every link, and `stamp` records the contract of each called step (its in:, out:
 and effects: lines, plus the data blocks those lines name). When the called step's contract changes,
 the calling step shows as `linked-changed` until it is re-read and approved. The project being
-called learns its callers from its own "links" (if it lists the calling project) and warns when an
-edited step has callers.
+called learns its callers from its own "links" (if it lists the calling project), or from every project a
+ladder.repo.json lists, and warns when an edited step has callers.
 
 Tests: a claim about a library (a vocabulary capability's binding and `known:` lines) or about the
 seam between two trees is only as good as the code that checks it. Capabilities say how to check
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -62,8 +63,8 @@ def load_linked(cfg: dict, root: Path) -> dict[str, tuple[dict, Path, L.Tree] | 
             out[alias] = f"links.{alias}: {spec['project']} not found"
             continue
         try:
-            c2 = json.loads(pj.read_text())
-            out[alias] = (c2, pj.parent, L.parse_tree(pj.parent / c2["tree"]))
+            c2 = L.linked_config(pj)
+            out[alias] = (c2, pj.parent, L.linked_tree(pj.parent / c2["tree"]))
         except (SystemExit, ValueError, KeyError) as e:
             out[alias] = f"links.{alias}: cannot read {spec['project']}: {e}"
     return out
@@ -177,15 +178,26 @@ def linked_pending(c2: dict, r2: Path, t2: L.Tree, since: str | None, depth: int
     ({step id: why}), so a change reaches callers more than one link away (api -> library -> screen)."""
     if depth <= 0:
         return {}
-    lock2_path = r2 / "ladder.lock.json"
-    lock2 = json.loads(lock2_path.read_text()) if lock2_path.exists() else {}
+    lp = r2 / "ladder.lock.json"
+    key = (str(r2.resolve()), since, depth, L._stamp(r2 / c2["tree"]), L._stamp(lp) if lp.exists() else None)
+    if key in _PENDING:
+        return _PENDING[key]
+    lock2 = L.linked_lock(r2)
     if since is None and not any(not k.startswith("@") for k in lock2) and c2.get("baseline"):
         since = c2["baseline"]
     try:
         _, appr, _, _ = check_links(t2, c2, r2, lock2, since, depth - 1)
     except Exception:
+        _PENDING[key] = {}
         return {}
-    return {a["node"]: a["msg"] for a in appr if a["kind"] == "linked-changed"}
+    _PENDING[key] = {a["node"]: a["msg"] for a in appr if a["kind"] == "linked-changed"}
+    return _PENDING[key]
+
+
+# linked_pending's answers for this run, keyed by the linked project's tree and lock as they are on disk: `check --all`
+# asks about the same projects from many callers. (A project further along may change in the same run only when a
+# command writes it, which no command that follows links does.)
+_PENDING: dict = {}
 
 
 STEP_REF_RE = re.compile(r"\[([A-Za-z][A-Za-z0-9_-]*(?:\.[0-9]+)+)\]")
@@ -213,8 +225,8 @@ def link_shape_warnings(tree: L.Tree, cfg: dict, root: Path) -> list[dict]:
                 continue
             seen.add(pj)
             try:
-                c2 = json.loads(pj.read_text())
-                t2 = L.parse_tree(pj.parent / c2["tree"])
+                c2 = L.linked_config(pj)
+                t2 = L.linked_tree(pj.parent / c2["tree"])
             except (SystemExit, ValueError, KeyError, OSError):
                 continue
             name2 = f"{path}{a}" if not path else f"{path} -> {a}"
@@ -370,17 +382,15 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                                         f"re-read this step too, then approve")
                 approvals.append(flagged[nid])
                 frontier.append(nid)
-    # The other direction: steps here that projects we link to call.
-    for alias, got in linked.items():
-        if isinstance(got, str):
-            continue
-        c2, r2, t2 = got
-        back = [a for a in (c2.get("links") or {}) if
-                (r2 / link_spec(c2, a)["project"]).resolve() == (root / "ladder.json").resolve()
-                or (r2 / link_spec(c2, a)["project"]).resolve().parent == root.resolve()]
-        if not back:
-            continue
-        own_old = tree_at(cfg, root, since) if since else None
+    # The other direction: steps here that other projects call.
+    # One warning per changed step, naming every caller (round 20: an API step called from many screens).
+    direct: dict[str, list[str]] = {}
+    indirect: dict[tuple[str, str, str], list[str]] = {}
+    when = f"since {since}" if since else "since approval"
+    own_old = None
+    for alias, c2, r2, t2, back in caller_projects(cfg, root, linked):
+        if since and own_old is None:
+            own_old = tree_at(cfg, root, since)
         for cid, cn in t2.items():
             for a, tid, _ in parse_calls(cn):
                 if a not in back or tid not in tree:
@@ -389,11 +399,9 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                     # compare the contract callers rely on with this tree as it was at the ref
                     changed = own_old is not None and tid in own_old and \
                         contract_text(own_old, tid) != contract_text(tree, tid)
-                    when = f"since {since}"
                 else:
                     was = lock.get(tid, {}).get("hash") if isinstance(lock.get(tid), dict) else None
                     changed = bool(was) and not tree[tid].tag_matches(was)
-                    when = "since approval"
                 if not changed:
                     # a step the called step relies on changed: callers see a different answer too
                     for x, path in behind(tree, tid).items():
@@ -403,16 +411,96 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                             wx = lock.get(x, {}).get("hash") if isinstance(lock.get(x), dict) else None
                             moved = bool(wx) and not tree[x].tag_matches(wx)
                         if moved:
-                            warnings.append(dict(kind="has-callers", node=x,
-                                                 msg=f"edited {when}, and [{tid}] relies on it "
-                                                     f"({' -> '.join('[' + p + ']' for p in path)}), which {alias} [{cid}] calls: "
-                                                     f"that step shows as linked-changed until re-read and approved"))
+                            key = (x, tid, " -> ".join("[" + p + "]" for p in path))
+                            indirect.setdefault(key, []).append(f"{alias} [{cid}]")
                 if changed:
-                    warnings.append(dict(kind="has-callers", node=tid,
-                                         msg=f"{'its contract changed' if since else 'edited'} {when}, and it is called by "
-                                             f"{alias} [{cid}]: that step shows as linked-changed until re-read and approved; "
-                                             f"update its English in the same change, or tell whoever owns it"))
+                    direct.setdefault(tid, []).append(f"{alias} [{cid}]")
+
+    def who(names: list[str]) -> str:
+        return ", ".join(names[:8]) + (f" and {len(names) - 8} more" if len(names) > 8 else "")
+    for (x, tid, path), names in indirect.items():
+        warnings.append(dict(kind="has-callers", node=x,
+                             msg=f"edited {when}, and [{tid}] relies on it ({path}), which {who(names)} "
+                                 f"call{'s' if len(names) == 1 else ''}: "
+                                 f"{'that step shows' if len(names) == 1 else 'those steps show'} as linked-changed "
+                                 f"until re-read and approved"))
+    for tid, names in direct.items():
+        warnings.append(dict(kind="has-callers", node=tid,
+                             msg=f"{'its contract changed' if since else 'edited'} {when}, and it is called by "
+                                 f"{who(names)}: {'that step shows' if len(names) == 1 else 'those steps show'} as "
+                                 f"linked-changed until re-read and approved; update their English in the same change, "
+                                 f"or tell whoever owns them"))
     return problems, approvals, warnings, facts
+
+
+def links_here(c2: dict, r2: Path, root: Path) -> list[str]:
+    """The aliases of project c2 (in folder r2) that point at the project in `root`."""
+    me = (root / "ladder.json").resolve()
+    out = []
+    for a in (c2.get("links") or {}):
+        spec = link_spec(c2, a)
+        if not spec or "project" not in spec:
+            continue
+        p = (r2 / spec["project"]).resolve()
+        if p == me or p.parent == root.resolve():
+            out.append(a)
+    return out
+
+
+def caller_projects(cfg: dict, root: Path, linked: dict) -> list[tuple[str, dict, Path, L.Tree, list[str]]]:
+    """Projects whose steps may call this one: (name, cfg, folder, tree, their aliases for this project). The projects
+    this one links to, when they link back; and, under a ladder.repo.json with "projects", every project there that
+    links here (round 20: an API called by many screens lists none of them, so an edited step warned no one)."""
+    out, seen = [], set()
+    for alias, got in linked.items():
+        if isinstance(got, str):
+            continue
+        c2, r2, t2 = got
+        back = links_here(c2, r2, root)
+        if back:
+            out.append((alias, c2, r2, t2, back))
+            seen.add(r2.resolve())
+    found = L.find_repo(root)
+    if not found or not found[0].get("projects"):
+        return out
+    me = root.resolve()
+    for r2, c2, back in reverse_links(*found).get(me, []):
+        if r2 in seen:
+            continue
+        try:
+            t2 = L.linked_tree(r2 / c2["tree"])
+        except (SystemExit, OSError, KeyError):
+            continue
+        seen.add(r2)
+        out.append((os.path.relpath(r2, me), c2, r2, t2, back))
+    return out
+
+
+_REVERSE: dict = {}
+
+
+def reverse_links(repo: dict, rdir: Path) -> dict[Path, list[tuple[Path, dict, list[str]]]]:
+    """For a repository: each project folder -> the projects that link to it (folder, config, their aliases for it).
+    Built once per run; a check that follows links several levels deep asks for it many times."""
+    if rdir in _REVERSE:
+        return _REVERSE[rdir]
+    index: dict[Path, list] = {}
+    for other in L.repo_projects(repo, rdir):
+        r2 = other.parent.resolve()
+        try:
+            c2 = L.linked_config(other)
+        except SystemExit:
+            continue
+        targets: dict[Path, list[str]] = {}
+        for a in (c2.get("links") or {}):
+            spec = link_spec(c2, a)
+            if spec and "project" in spec:
+                targets.setdefault((r2 / spec["project"]).resolve().parent, []).append(a)
+        for t, aliases in targets.items():
+            if t != r2:
+                index.setdefault(t, []).append((r2, c2, aliases))
+    _REVERSE[rdir] = index
+    return index
 
 
 def diff_text(was: str, now: str) -> str:

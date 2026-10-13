@@ -449,7 +449,7 @@ def _write_replay_meta(out: Path, mask: dict, mask_text: list, jwt_on: bool, rec
             "record_headers": sorted(record), "observe": _repo_relative(observe or "", out),
             "recorded": datetime.date.today().isoformat()}
     if project and project.exists():
-        meta["code"] = L.code_fingerprint(project.parent, json.loads(project.read_text()))
+        meta["code"] = L.code_fingerprint(project.parent, L.read_config(project))
     (out / ".replay.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
@@ -645,37 +645,56 @@ def init(argv: list[str]) -> int:
     adopted = "--adopted" in argv
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "project"
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "conventions").mkdir(exist_ok=True)
+    # Under a ladder.repo.json, what it supplies is not repeated here (round 20).
+    found = L.find_repo(folder)
+    shared = (found[0].get("defaults") or {}) if found else {}
+    layers = (found[0].get("build_defaults") or {}) if found else {}
+    from_repo = lambda lang, key: key in (layers.get("*") or {}) or key in (layers.get(lang) or {})
+    own_conventions = not all(from_repo(lang, "conventions") for _, lang in pairs)
+    if own_conventions:
+        (folder / "conventions").mkdir(exist_ok=True)
     tree_file = opt(argv, "--tree", default=None) or f"{slug}.ladder"
     if not (folder / tree_file).exists():
         prefix = opt(argv, "--prefix", default=None) or (scopes and next(iter(scopes.values()))[0].split(".")[0].rstrip("*")) or slug.split("-")[0] or "s"
         (folder / tree_file).write_text(TREE_TEMPLATE.format(name=name, prefix=prefix))
-    if not (folder / "vocabulary.ladder").exists():
+    if "vocabulary" not in shared and not (folder / "vocabulary.ladder").exists():
         (folder / "vocabulary.ladder").write_text(VOCAB_TEMPLATE)
-    if not (folder / "conventions" / "shared.md").exists():
+    if own_conventions and not (folder / "conventions" / "shared.md").exists():
         (folder / "conventions" / "shared.md").write_text("# Conventions shared by every build\n\n(fill in with the ladder-profile skill)\n")
     builds = []
     for bname, lang in pairs:
-        conv = folder / "conventions" / f"{lang}.md"
-        if not conv.exists():
-            conv.write_text(f"# {lang} build profile\n\n(fill in with the ladder-profile skill)\n")
-        b = {"name": bname, "lang": lang, "mode": "literal", "files": [files[bname]] if bname in files else [],
-             "conventions": ["conventions/shared.md", f"conventions/{lang}.md"]}
+        b = {"name": bname, "lang": lang, "mode": "literal", "files": [files[bname]] if bname in files else []}
+        if not from_repo(lang, "conventions"):
+            conv = folder / "conventions" / f"{lang}.md"
+            if not conv.exists():
+                conv.write_text(f"# {lang} build profile\n\n(fill in with the ladder-profile skill)\n")
+            b["conventions"] = ["conventions/shared.md", f"conventions/{lang}.md"]
+        if from_repo(lang, "mode"):
+            del b["mode"]
         if bname in scopes:
             b["steps"] = scopes[bname]
-        if adopted:
+        repo_adopted = ((layers.get(lang) or {}).get("adopted", (layers.get("*") or {}).get("adopted")))
+        if adopted and repo_adopted is not True:
             b["adopted"] = True
+        elif not adopted and repo_adopted:
+            b["adopted"] = False          # the repository's default says adopted; this one is new code
         builds.append(b)
     cfg = {"title": name, "tree": tree_file, "vocabulary": "vocabulary.ladder",
            "generator": {"command": ["claude", "-p", "--output-format", "text", "--tools", ""]},
            "builds": builds,
            "compare": {"reference": builds[0]["name"], "runs": [], "number_tolerance": 0}}
+    for k in ("vocabulary", "generator", "compare"):
+        if k in shared:
+            del cfg[k]
     pj = folder / "ladder.json"
     if pj.exists():
         print(f"{pj} already exists; left it alone")
     else:
         pj.write_text(json.dumps(cfg, indent=2) + "\n")
-    print(f"ladder project in {folder}: {tree_file}, vocabulary.ladder, conventions/, ladder.json")
+    made = [tree_file] + (["vocabulary.ladder"] if "vocabulary" not in shared else []) + \
+        (["conventions/"] if own_conventions else []) + ["ladder.json"]
+    print(f"ladder project in {folder}: {', '.join(made)}"
+          + (f" (the rest from {found[1] / L.REPO_FILE})" if found and (shared or layers) else ""))
     print(f"compare.reference is '{builds[0]['name']}' (the first build); change it in ladder.json if another build is the reference")
     return 0
 
