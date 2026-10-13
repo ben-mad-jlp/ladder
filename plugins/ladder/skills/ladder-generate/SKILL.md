@@ -77,9 +77,12 @@ source file in its prompt, so it calls what exists; `check` warns `binding-not-c
 calls none of a binding's calls (round 9: `storageService.getItem` for `storageService.get`, then a
 repair that imported the storage library directly).
 
-**New steps in an approved tree.** `ladder regen --build=<name> --blind --redo=<new step ids>` rewrites
-only those steps' regions, so their neighbours' approved code stays. Without `--redo`, a blind run
-rewrites every region of the build.
+**New steps in an approved tree.** `ladder regen --build=<name> --blind --redo=<changed and new step ids>`
+first writes each new step (one with no code yet, top-level ones included) after the step before it,
+then rewrites only the named steps' regions, so their neighbours' approved code stays. Name the steps
+that call the new one too (`--redo=unps.3,unps.5`): they are rewritten after it exists, so they call
+what it is named. Without `--redo`, a blind run rewrites every region of the build. Add `--repair=3` to
+build and repair in the same run.
 
 `regen` exits 1 if any region's reply was rejected (that region keeps its old code; the reason is
 printed and the prompt and reply are logged), 0 otherwise. `generate` writes only the steps in the
@@ -111,7 +114,9 @@ checks below.
 ## 2. Build, then repair
 
 Right after generating, build and run the fast tests for each changed build (`dotnet build`,
-`npx tsc --noEmit`, the project's test command). Save the compiler or test output to a file and run
+`npx tsc --noEmit`, the project's test command). `ladder regen ... --repair=3` does the build part for
+you: it runs the project's `check_command`, repairs what it reports and builds again, at most three
+rounds, and says whether the code builds. Otherwise save the compiler or test output to a file and run
 `ladder repair` with it. It maps each error to the region it points at and regenerates only that
 region, with the error in the prompt. It may add imports or declarations to `@support` regions
 through `@add-to-support` requests; these are listed in its output, so review them.

@@ -15,6 +15,9 @@ Commands
   ladder export <project.json> [out.json]   the parsed tree, data, rules and vocabulary as JSON
   ladder init   <folder> --name NAME --build NAME:LANG [--build ...] [--adopted]   start a project
                                    (or --lang LANG to name a build after its language)
+  ladder tag    <project.json> <regions.json> [--base GIT_REF]
+                                   transcription: add the marker lines a regions file lists (line
+                                   ranges of the file at GIT_REF, default HEAD), with the tree's hashes
   ladder adopt-check <project.json> [--base GIT_REF]
                                    transcription check: tagged files differ from GIT_REF (default HEAD)
                                    only by added comment lines
@@ -24,8 +27,10 @@ Commands
                    [--record-headers set-cookie] [--observe "command run after each request"]
                                    send recorded requests to a running service; save each response as
                                    a trace, so an existing API and a generated one can be compared
-  ladder regen  <project.json> [--build=NAME] [--dry-run] [--blind]
-                                   regenerate stale regions with the project's generator (an LLM)
+  ladder regen  <project.json> [--build=NAME] [--dry-run] [--blind] [--redo=IDS] [--repair=N]
+                                   regenerate stale regions with the project's generator (an LLM);
+                                   --repair=N: then run check_command and repair what it reports,
+                                   at most N rounds, until the code builds
   ladder generate <project.json> --build=NAME [--out=PATH]
                                    write a build's whole file from the tree (new build or language);
                                    --out writes elsewhere, to try regeneration without touching the file
@@ -37,10 +42,11 @@ Commands
   ladder retag  <project.json> <STEP IDS> [--build=NAME]
                                    the English was reworded without changing behavior: update the
                                    markers' hashes instead of regenerating (a person's call)
-  ladder reference <project.json> --from=BUILD
+  ladder reference <project.json> --from=BUILD [--retire=A,B]
                                    an approved change of behaviour: BUILD's recording (made from the
                                    approved code) becomes the comparison's reference; the old reference
-                                   traces move to traces/history/
+                                   traces move to traces/history/; --retire=A,B moves builds recorded
+                                   from the old code that cannot be recorded again to history too
   ladder accept <project.json> [--build=NAME] [STEP IDS] [--exports] [--from=SCRATCH/ladder.json]
                                    accept hand edits to regions: the English still describes them
                                    (regen and repair refuse to overwrite hand-edited regions unless
@@ -59,6 +65,7 @@ import fnmatch
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -274,6 +281,13 @@ PATHLIKE_RE = re.compile(r"[\w.@-]+(?:/[\w.@-]+)+\.\w+|[\w.-]+\.(?:py|cs|ts|tsx|
 CALL_KEYWORDS = {"await", "new", "return", "typeof", "sizeof", "if", "for", "foreach", "while", "switch", "catch",
                  "using", "lock", "var", "let", "const", "function", "async", "def", "fn", "func", "throw", "yield"}
 CALL_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^<>()]*>)?\s*\(")
+JSX_NAME_RE = re.compile(r"(?<![A-Za-z0-9_])<([A-Z][A-Za-z0-9_]*)[\s/>]")   # a component a binding renders: <DataGrid ... /> (not a generic: f<Row>())
+
+
+def uses_name(text: str, name: str) -> bool:
+    """Whether code calls `name(...)` or renders `<name ...>`."""
+    return bool(re.search(r"\b" + re.escape(name) + r"\s*(?:<[^<>()]*>)?\s*\(", text)
+                or re.search(r"(?<![A-Za-z0-9_])<" + re.escape(name) + r"[\s/>]", text))
 
 
 def binding_parts(binding: str) -> tuple[str, str]:
@@ -303,7 +317,7 @@ def binding_call_names(binding: str) -> set[str]:
     """The names a binding's call part calls ("await storageService.get<T>(key)" -> {"get"}): code that uses the
     capability calls at least one of them."""
     _, call = binding_parts(binding)
-    return {m.group(1) for m in CALL_NAME_RE.finditer(call)} - CALL_KEYWORDS
+    return ({m.group(1) for m in CALL_NAME_RE.finditer(call)} | {m.group(1) for m in JSX_NAME_RE.finditer(call)}) - CALL_KEYWORDS
 
 
 def project_bases(cfg: dict, root: Path) -> list[Path]:
@@ -544,6 +558,35 @@ def region_contract_hash(tree, build: dict | None, code: list[str], label: str =
     return "d" + hashlib.sha1(t.encode()).hexdigest()[:5]
 
 
+def label_blocks(tree, build: dict | None, label: str) -> list[str]:
+    """The data blocks a @contract region's label names (`@contract ClockInRequest@...`, or several joined
+    with + or commas), among the blocks the build spells out."""
+    data = build_data(tree, build)
+    return [w for w in re.split(r"[\s,+]+", label.replace("contract ", "", 1)) if w in data]
+
+
+def declared_blocks(tree, build: dict | None, code: list[str]) -> set[str]:
+    """The build's data blocks a piece of code declares a type for (class ClockInRequestDto -> ClockInRequest)."""
+    data = build_data(tree, build)
+    def base(t: str) -> str:
+        t = re.sub(r"(Dto|DTO)$", "", t)
+        return t[1:] if len(t) > 2 and t[0] == "I" and t[1].isupper() and t[1:] in data else t
+    return {base(m.group(1)) for l in code for m in CONTRACT_DECL_RE.finditer(l)} & set(data)
+
+
+def contract_layout(root: Path, build: dict, tree) -> list[tuple[str, str, list[str]]]:
+    """Where a build's @contract regions are: (file, label, the data blocks the label names)."""
+    out = []
+    for f in build.get("files", []):
+        fpath = root / f
+        if not fpath.exists():
+            continue
+        for r in parse_regions(fpath, build["lang"])[0]:
+            if r.kind == "contract":
+                out.append((f, r.label, label_blocks(tree, build, r.label)))
+    return out
+
+
 def contract_region_ok(tree, build, tag_hash: str, code: list[str], label: str = "") -> bool:
     """A @contract region is current when its tag matches what its code depends on now (per region),
     or the whole build contract (regions written before per-region hashes)."""
@@ -641,10 +684,16 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
         base = cfg["baseline"]
     if base:
         old = baseline_lock(cfg, root, base)
-        if old is None:
+        known = subprocess.run(["git", "-C", str((root / cfg["tree"]).resolve().parent), "rev-parse", "--verify",
+                                "--quiet", f"{base}^{{commit}}"], capture_output=True).returncode == 0
+        if old is None and known:
+            # A first transcription: the tree is new since the baseline, which is what the skill sets up.
+            report["tree"].append(dict(kind="baseline-new", node=base,
+                                       msg=f"the tree did not exist at {base}: every step is new since the baseline"))
+        elif old is None:
             report["tree"].append(dict(kind="baseline", node=base,
-                                       msg=f"{base} is not a commit git knows here, or the tree did not exist "
-                                           f"there; every step shows as new (git fetch, or fix the ref)"))
+                                       msg=f"{base} is not a commit git knows here; every step shows as new "
+                                           f"(git fetch, or fix the ref)"))
         else:
             lock = {**{k: v for k, v in lock.items() if k.startswith("@") and k not in ("@data",)}, **old}
             schema_since = schema_since or base
@@ -809,6 +858,23 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                     if not contract_region_ok(tree, b, h, own, r.label):
                         br["problems"].append(dict(kind="stale-contract", file=f, line=r.start,
                                                    msg=f"contract types were generated from older in:/out: lines or data blocks (tag {h}, now {region_contract_hash(tree, b, own, r.label)}); regenerate this region"))
+                    # A region whose label names data blocks must declare those, and no block another region's label
+                    # names: blind generation once wrote three DTOs into one file and repair then emptied the right one.
+                    named = label_blocks(tree, b, r.label)
+                    if named:
+                        declared = declared_blocks(tree, b, own)
+                        elsewhere = {blk: (ff, lab) for ff, lab, blks in contract_layout(root, b, tree)
+                                     if (ff, lab) != (f, r.label) for blk in blks}
+                        # (the type's own name may differ from the block's: the label is what ties them)
+                        lacking = named if not any(CONTRACT_DECL_RE.search(l) for l in own) else []
+                        foreign = sorted(d for d in declared if d in elsewhere and d not in named)
+                        if lacking or foreign:
+                            parts = ([f"declares no type (for {', '.join(lacking)})"] if lacking else []) + \
+                                    [f"declares {d}, which belongs to the region '{elsewhere[d][1]}' in {elsewhere[d][0]}" for d in foreign]
+                            br["problems"].append(dict(
+                                kind="contract-misplaced", file=f, line=r.start,
+                                msg=f"contract region '{r.label}' {'; '.join(parts)}; each labelled region holds the "
+                                    f"types its label names: regenerate this build's contract regions"))
                     continue
                 if r.kind != "node":
                     continue
@@ -879,19 +945,29 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                 # Only for code in this repository whose files resolve: a published library's binding is checked by
                 # its version and tests, and a binding naming a folder says too little to look for.
                 names = binding_call_names(bind[1]) if binding_files(bind[1], project_bases(cfg, root)) else set()
-                if names and b.get("tagged") is not False:
-                    text = "\n".join((root / f).read_text() for f in b["files"] if (root / f).exists())
-                    if not any(re.search(r"\b" + re.escape(n) + r"\s*(?:<[^<>()]*>)?\s*\(", text) for n in names):
+                def calls(build: dict) -> bool:
+                    text = "\n".join((root / f).read_text() for f in build["files"] if (root / f).exists())
+                    return any(uses_name(text, n) for n in names)
+                # A step can rely on a capability another build of the project calls (a controller relies on the error
+                # answer its service throws into): that build's call counts.
+                others = [ob for ob in cfg["builds"] if ob is not b and ob.get("tagged") is not False
+                          and c.binding_for(ob) == bind]
+                if names and b.get("tagged") is not False and not calls(b) and not any(calls(ob) for ob in others):
+                    if True:
                         report["warnings"].append(dict(
                             kind="binding-not-called", node=ids[0],
                             msg=f"capability '{name}' (used by {', '.join(ids)}): no file of build '{b['name']}' calls "
-                                f"{', '.join(sorted(names))}, the calls its binding names. If these steps rely on it "
-                                f"without calling it (another build does), drop it from their uses:; otherwise the code "
-                                f"may call an API that does not exist or another library: regenerate those steps"))
+                                f"{', '.join(sorted(names))}, the calls its binding names, and no other build of this "
+                                f"project does. If these steps rely on it without calling it, drop it from their uses:; "
+                                f"otherwise the code may call an API that does not exist or another library: regenerate "
+                                f"those steps"))
                 was = vlock.get(name, {}).get("bindings", {}).get(bind[0])
                 if was and was != c.binding_hash(bind[0]):
                     br["problems"].append(dict(kind="binding-changed", node=ids[0],
-                                               msg=f"binding '{bind[0]}' of '{name}' changed since approval; regenerate with --redo={','.join(ids)}"))
+                                               msg=f"binding '{bind[0]}' of '{name}' changed since approval: if the code must "
+                                                   f"change, regenerate with --redo={','.join(ids)}; if the approved code "
+                                                   f"still fits the new binding (another area added a call or a claim to "
+                                                   f"a shared capability), read it against the binding and `ladder stamp`"))
 
         scope = b.get("steps")   # optional: glob patterns of step ids this build implements
 
@@ -903,6 +979,15 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
             if n.is_leaf and in_scope(nid) and not is_covered(nid):
                 br["problems"].append(dict(kind="missing", node=nid,
                                            msg=f"no code is tagged with [{nid}]"))
+            if n.is_leaf and len(covered[nid]) > 1 and b.get("tagged") is not False:
+                # Regeneration writes each region from the whole step, so a step split over two regions is written
+                # twice (round 10: a helper tagged as a second region of its caller's step became a duplicate method).
+                report["warnings"].append(dict(
+                    kind="split-step", node=nid,
+                    msg=f"[{nid}]'s code is in {len(covered[nid])} regions of build '{b['name']}' "
+                        f"({', '.join(covered[nid])}): regeneration writes each region from the whole step, so the "
+                        f"code would be written twice. Give the separate part its own step (a helper the English "
+                        f"names), or tag it as @support if no step owns it"))
         report["builds"].append(br)
     report["compare"] = compare_runs(root, cfg, tree)
     report["warnings"] += replay_settings_warnings(root, cfg)
@@ -930,7 +1015,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
         report["tree"].append(dict(kind="trace-steps", node=", ".join(unknown[:8]),
                                    msg="traces name steps that are not in the tree (a typo?); list harness-only "
                                        "names in compare.extra_steps"))
-    approval_kinds = {"new", "edited", "parent-changed", "removed", "capability-changed",
+    approval_kinds = {"new", "baseline-new", "edited", "parent-changed", "removed", "capability-changed",
                       "data-new", "data-edited", "data-removed", "compare-edited", "schema-changed",
                       "linked-changed"}
     real_tree = [p for p in report["tree"] if p["kind"] not in approval_kinds]
@@ -1797,9 +1882,11 @@ def build_view(pj: Path, out: Path) -> None:
     print(f"viewer -> {out}")
 
 
-def make_reference(pj: Path, src: str) -> int:
+def make_reference(pj: Path, src: str | None, retire: list[str] | None = None) -> int:
     """After a reviewed, intended change of behaviour: the recording of build `src` (made from the approved code)
-    becomes the comparison's reference. The old reference traces move to traces/history/, so nothing is lost."""
+    becomes the comparison's reference. The old reference traces move to traces/history/, so nothing is lost.
+    `retire`: builds recorded from the old code that cannot be recorded again (an earlier scratch copy): their traces
+    move to traces/history/ too and they leave ladder.json's builds."""
     import shutil
     from datetime import datetime
     cfg, root = json.loads(pj.read_text()), pj.parent
@@ -1807,6 +1894,23 @@ def make_reference(pj: Path, src: str) -> int:
     if not c.get("reference"):
         raise SystemExit("ladder reference: this project has no compare.reference")
     folder = {b["name"]: b.get("traces", b["name"]) for b in cfg.get("builds", [])}
+    if retire:
+        stamp_ = f"{datetime.now():%Y%m%d-%H%M%S}"
+        for name in retire:
+            if name not in folder or name in (c["reference"], src):
+                raise SystemExit(f"ladder reference: cannot retire '{name}' (not a build, or the reference)")
+            d = root / "traces" / folder[name]
+            if d.exists() and not any(b.get("traces", b["name"]) == folder[name]
+                                      for b in cfg["builds"] if b["name"] not in retire):
+                dest = root / "traces" / "history" / f"{d.name}-{stamp_}"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(d), str(dest))
+                print(f"moved   traces/{d.name} -> {dest.relative_to(root)}")
+        cfg["builds"] = [b for b in cfg["builds"] if b["name"] not in retire]
+        pj.write_text(json.dumps(cfg, indent=2) + "\n")
+        print(f"retired {', '.join(retire)} (removed from ladder.json builds)")
+        if not src:
+            return 0
     if src not in folder:
         raise SystemExit(f"ladder reference: no build '{src}' (builds: {', '.join(folder)})")
     ref_dir, src_dir = root / "traces" / folder.get(c["reference"], c["reference"]), root / "traces" / folder[src]
@@ -1821,17 +1925,46 @@ def make_reference(pj: Path, src: str) -> int:
         print(f"moved   traces/{ref_dir.name} -> {dest.relative_to(root)}")
     shutil.copytree(src_dir, ref_dir)
     print(f"copied  traces/{src_dir.name} -> traces/{ref_dir.name} (the reference now)")
-    print("Other builds are now compared with this run: re-record any whose recording came from the old code.")
+    print("Other builds are now compared with this run: re-record any whose recording came from the old code, or, when\n"
+          "that code is gone (an earlier scratch copy), retire them: `ladder reference <ladder.json> --retire=A,B`.")
     return 0
 
 
 # ---------------------------------------------------------------- main
 
 
+def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, rounds: int) -> int:
+    """`regen --repair=N`: run the project's check_command; while it fails, repair the regions its errors point at
+    (in the given build, or every tagged build), at most N rounds. 0 when it builds, 1 when it still does not."""
+    import regen as R
+    targets = [build] if build else [b["name"] for b in cfg["builds"] if b.get("tagged") is not False]
+    for r in range(rounds + 1):
+        errs = R.project_check_errors(cfg, root)
+        if errs is None:
+            print("--repair: no check_command in ladder.json, so nothing tells whether the code builds")
+            return 1
+        if not errs:
+            print("builds: clean" + (f" after {r} repair round(s)" if r else " without repair"))
+            return 0
+        n = len(errs.splitlines())
+        if r == rounds:
+            print(f"STILL DOES NOT BUILD after {rounds} repair round(s) ({n} error lines):\n" + errs[:3000])
+            return 1
+        print(f"build errors ({n} lines); repair round {r + 1} of {rounds}")
+        before = snapshot(root, cfg)
+        for t in targets:
+            R.repair(pj, t, errs)
+        run_formatter(root, cfg, before)
+        restamp_contracts(root, cfg)
+        record_code(root, cfg, before=before)
+    return 1
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) >= 3 and argv[1] in {"adopt-check", "replay", "init", "export"}:
+    if len(argv) >= 3 and argv[1] in {"adopt-check", "replay", "init", "export", "tag"}:
         import ladder_extra as X
-        return {"adopt-check": X.adopt_check, "replay": X.replay, "init": X.init, "export": X.export}[argv[1]](argv[2:])
+        return {"adopt-check": X.adopt_check, "replay": X.replay, "init": X.init, "export": X.export,
+                "tag": X.tag}[argv[1]](argv[2:])
     if len(argv) >= 3 and argv[1] == "accept":
         return accept(Path(argv[2]), argv[3:])
     if len(argv) >= 3 and argv[1] == "schema":
@@ -1850,9 +1983,10 @@ def main(argv: list[str]) -> int:
         return K.run_tests(Path(argv[2]), [a for a in argv[3:] if not a.startswith("--")] or None)
     if len(argv) >= 3 and argv[1] == "reference":
         src = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--from=")), None)
-        if not src:
-            raise SystemExit("usage: ladder reference <ladder.json> --from=BUILD")
-        return make_reference(Path(argv[2]), src)
+        retire = next((a.split("=", 1)[1].split(",") for a in argv[3:] if a.startswith("--retire=")), None)
+        if not src and not retire:
+            raise SystemExit("usage: ladder reference <ladder.json> --from=BUILD [--retire=A,B]")
+        return make_reference(Path(argv[2]), src, retire)
     if len(argv) >= 3 and argv[1] == "retag":
         return retag(Path(argv[2]), argv[3:])
     if len(argv) >= 3 and argv[1] in {"generate", "repair", "regen"}:
@@ -1881,6 +2015,9 @@ def main(argv: list[str]) -> int:
             restamp_contracts(root, cfg)
             # Regions the generator just wrote are its code now, not hand edits.
             record_code(root, cfg, before=before)
+        rounds = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--repair=")), None)
+        if argv[1] == "regen" and rounds and "--dry-run" not in argv:
+            status = max(status, repair_until_builds(pj, cfg, root, build, int(rounds)))
         return status
     if len(argv) < 3 or argv[1] not in {"check", "hashes", "stamp", "view"}:
         print(__doc__)

@@ -565,7 +565,7 @@ def run_tests(pj: Path, only: list[str] | None = None) -> int:
     cfg, root, tree, _, _ = L.load_project(pj)
     tests = all_tests(cfg, root, tree)
     if only:
-        tests = [t for t in tests if any(o in t["key"] for o in only)]
+        tests = [t for t in tests if any(o in t["key"] or o in t["what"] for o in only)]   # the name it prints too
     if not tests:
         print("no tests declared (capability `test:` lines, \"test\" on a links entry, or the project's \"tests\")")
         return 0
@@ -574,16 +574,18 @@ def run_tests(pj: Path, only: list[str] | None = None) -> int:
     cwd = root / cfg.get("check_cwd", ".")
     failed = 0
     ran: dict[str, tuple[bool, int, list[str]]] = {}   # one run per distinct command (round 9: one link test named
-    for t in tests:                                     # by five subjects started the API five times)
+    first: dict[str, str] = {}                          # by five subjects started the API five times)
+    for t in tests:
         if t["cmd"] in ran:
             ok, rc, tail = ran[t["cmd"]]
-            print(f"{t['what']}: same command as above, not run again")
+            print(f"{t['what']}: same command as {first[t['cmd']]}, not run again")
         else:
             print(f"{t['what']}: {t['cmd']}")
             res = subprocess.run(t["cmd"], shell=True, cwd=cwd, capture_output=True, text=True)
             tail = failure_lines(res.stdout + res.stderr)
             ok, rc = res.returncode == 0, res.returncode
             ran[t["cmd"]] = (ok, rc, tail)
+            first[t["cmd"]] = t["what"]
         failed += not ok
         print(f"  {'ok' if ok else 'FAILED (exit ' + str(rc) + ')'}")
         if not ok:

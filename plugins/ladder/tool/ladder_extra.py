@@ -110,6 +110,89 @@ def adopt_check(argv: list[str]) -> int:
     return 1 if bad else 0
 
 
+# ---------------------------------------------------------------- tag
+
+
+def tag(argv: list[str]) -> int:
+    """`ladder tag <ladder.json> <regions.json> [--base GIT_REF]`: write the marker lines of a transcription.
+
+    regions.json maps each file (as ladder.json lists it) to its regions, each [first line, last line, what], with line
+    numbers of the file at GIT_REF (default HEAD, the untagged code) and `what` one of "node <id>[ <id>...]",
+    "contract <label>" or "support <label>". Every file is rebuilt from GIT_REF with the marker lines added (the hashes
+    from the tree as it is now), so re-running after the English changes is safe and the diff stays comment lines only.
+    Rounds 8, 9 and 10 each copied a script that did this."""
+    if len(argv) < 2 or argv[0].startswith("--"):
+        raise SystemExit("usage: ladder tag <ladder.json> <regions.json> [--base GIT_REF]")
+    pj, spec_path = Path(argv[0]), Path(argv[1])
+    ref = opt(argv, "--base", default="HEAD")
+    cfg, root, tree, *_ = L.load_project(pj)
+    spec = json.loads(spec_path.read_text())
+    by_file = {f: b for b in cfg["builds"] if b.get("tagged") is not False for f in b["files"]}
+    bad = 0
+    for f, regions in spec.items():
+        b = by_file.get(f)
+        if b is None:
+            print(f"  {f}: not a file of any tagged build in {pj}")
+            bad += 1
+            continue
+        src = _git_original(root, f, ref)
+        if src is None:
+            print(f"  {f}: not in {ref}; tag a file that git knows (or pass --base)")
+            bad += 1
+            continue
+        nl = "\r\n" if "\r\n" in src else "\n"
+        lines = src.split(nl)
+        trailing = lines[-1] == ""
+        if trailing:
+            lines = lines[:-1]
+        c = L.COMMENT[b["lang"]]
+        markers, problems = [], []
+        for first, last, what in regions:
+            kind, _, rest = what.partition(" ")
+            if not (1 <= first <= last <= len(lines)):
+                problems.append(f"[{first}, {last}, {what}] is outside the file's {len(lines)} lines")
+                continue
+            if kind == "node":
+                ids = rest.split()
+                missing = [i for i in ids if i not in tree]
+                if missing:
+                    problems.append(f"{', '.join(missing)} not in the tree")
+                    continue
+                text = "@node " + " ".join(f"{i}@{tree[i].hash}" for i in ids)
+            elif kind == "contract":
+                text = f"@contract {rest}@{L.contract_hash(tree, b)}"   # per-region hash: restamp_contracts below
+            elif kind == "support":
+                text = f"@support {rest}" if rest else "@support"
+            else:
+                problems.append(f"unknown kind {kind!r} (node, contract or support)")
+                continue
+            markers.append((first, last, text))
+        if problems:
+            print(f"  {f}: " + "; ".join(problems))
+            bad += 1
+            continue
+        opens, closes = {}, {}
+        for first, last, text in sorted(markers, key=lambda m: (m[0], -m[1])):
+            opens.setdefault(first, []).append(text)
+        for first, last, text in sorted(markers, key=lambda m: (-m[1], m[0])):
+            closes.setdefault(last, []).append(first)
+        indent = lambda s: s[: len(s) - len(s.lstrip())]
+        out = []
+        for i in range(1, len(lines) + 1):
+            for text in opens.get(i, []):
+                out.append(f"{indent(lines[i - 1])}{c} {text}")
+            out.append(lines[i - 1])
+            for first in sorted(closes.get(i, []), key=lambda x: -x):
+                out.append(f"{indent(lines[first - 1])}{c} @end")
+        with open(root / f, "w", newline="") as fh:
+            fh.write(nl.join(out) + (nl if trailing else ""))
+        print(f"  {f}: {2 * len(markers)} marker lines")
+    L.restamp_contracts(root, cfg)
+    print("RESULT:", "tagged; check it with `ladder adopt-check` and `ladder check`" if not bad
+          else f"{bad} file(s) not tagged")
+    return 1 if bad else 0
+
+
 # ---------------------------------------------------------------- replay
 
 
@@ -408,7 +491,8 @@ def replay(argv: list[str]) -> int:
             sent_at = datetime.now(timezone.utc)
             r = _subst({k: v for k, v in raw_r.items() if k != "save"}, env, saved)
             step = r.get("step", "http")
-            data = None if "body" not in r else json.dumps(r["body"]).encode()
+            # "raw": text sent as it is (a body that is not JSON at all); "body": any JSON value.
+            data = (r["raw"].encode() if "raw" in r else None if "body" not in r else json.dumps(r["body"]).encode())
             # A request's own headers override the defaults; an empty value removes that header.
             hdrs = {k: v for k, v in {**_subst(headers, env, saved), **r.get("headers", {})}.items() if v != ""}
             req = urllib.request.Request(base + r["path"], data=data, method=r["method"], headers=hdrs)

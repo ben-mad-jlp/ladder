@@ -157,18 +157,29 @@ behavior wins; transcription only reports.
 4. If one step's code is scattered (a helper used by two steps), tag the helper with the step it
    mainly serves, or as support, and mention it in the step's `note:`.
 
-Tip: for more than a couple of files, write a small script that rebuilds each file from
-`git show <base>:<path>` and inserts marker lines at chosen line numbers, where `<base>` is the commit
-before any tags (record it when you start; once the tags are committed, HEAD is the tagged version).
-Re-running it after the tree changes is safe, the diff stays pure additions by construction, and
-`ladder adopt-check <ladder.json> --base <base>` proves it.
+For more than a couple of files, list the regions in a `regions.json` next to ladder.json and let
+`ladder tag` write the markers:
+
+```json
+{"../../src/notes/NotesController.cs": [[1, 8, "support usings and namespace"], [9, 80, "node api.1"],
+                                         [20, 41, "node api.1.1"], [43, 79, "node api.1.2"]],
+ "../../src/notes/NoteDto.cs": [[1, 2, "support namespace"], [3, 20, "contract NoteDto"]]}
+```
+
+`ladder tag <ladder.json> regions.json --base <base>` rebuilds each file from `<base>` (the commit before
+any tags; record it when you start, since once the tags are committed HEAD is the tagged version) with the
+marker lines added and the tree's current hashes, so re-running it after the tree changes is safe and the
+diff stays comment lines only. `ladder adopt-check <ladder.json> --base <base>` proves it. Line numbers
+are the untagged file's; regions may nest. Commit `regions.json` with the tree.
 
 **Shapes another system reads.** An object the code hands to another system (a snapshot for an
 assistant, an analytics event, a message on a queue, a log record a dashboard parses) is a contract
 even when nothing in the code declares its type: write it as a data block with its exact keys and say
 which step builds it ("the snapshot is a MyAlertsSnapshot"). In round 8 the English said "what is
 selected (the alert being deleted, ...)"; blind regeneration chose its own keys and the assistant's
-tests failed.
+tests failed. The same goes for attributes another system finds on the page (`data-sofia-target`,
+`data-testid` a test runner uses): name the attribute in the English or in the vocabulary. In round 10
+the English said "the assistant's target"; regeneration wrote `data-assistant-target`.
 
 **Large files.** When only part of a file belongs to the slice (8 members of a 1,700-line service),
 tag the rest as `@support` with a label and transcribe only the slice's members. To try regenerating
@@ -209,10 +220,11 @@ ladder check ladder/<area>/ladder.json            # no untagged code, no missing
 If you can build the project here (`dotnet build`, `npx tsc --noEmit`), do it: comments must not
 break a build, but a marker in the wrong place (inside a string or a multi-line expression) can.
 
-**Trial regeneration** (the real test of the English and the profile): for each build,
-`ladder generate <ladder.json> --build=<name> --out=<scratch file>` writes a version generated from the
-English alone without touching the real file. Swap it in temporarily in a scratch copy of the repo,
-build and run the tests. Every compile error or failing test is a gap: a missing sentence in the
+**Trial regeneration** (the real test of the English and the profile): in a scratch copy,
+`ladder regen <ladder.json> --build=<name> --blind --repair=3` rewrites the build's regions from the
+English alone, then builds and repairs until it compiles (or says it still does not); then run the
+tests. (`ladder generate <ladder.json> --build=<name> --out=<scratch file>` writes a whole file from the
+English instead, without touching the real one; swap it in, build and run the tests.) Every compile error or failing test is a gap: a missing sentence in the
 English, or a missing shape rule in the profile. Fix those, not the generated code. Set
 `"check_command"` (e.g. `["npx", "tsc", "--noEmit"]`, with `"check_cwd"` relative to ladder.json) and
 `"format_command"` (e.g. `["npx", "prettier", "--write"]`) in ladder.json so generation retries on

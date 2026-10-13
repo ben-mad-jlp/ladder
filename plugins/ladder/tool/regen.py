@@ -522,7 +522,7 @@ def find_missing(build: dict, root: Path, tree: dict[str, L.Node]) -> list[str]:
         for r in L.parse_regions(root / f, build["lang"])[0]:
             tagged |= {nid for nid, _ in r.tags}
     return [n.id for n in tree.values()
-            if n.is_leaf and n.id not in tagged and n.parent and in_scope(build, n.id)]
+            if n.is_leaf and n.id not in tagged and in_scope(build, n.id)]
 
 
 def region_for(build: dict, root: Path, nid: str):
@@ -574,13 +574,22 @@ def body_from_reply(reply: str, marker: str, lang: str) -> tuple[list[str] | Non
 
 
 def insert_prompt(build, file_rel, lines, after_line, new: L.Node, prev: L.Node, tree, ref_text):
-    parent = tree[new.parent]
-    order = "\n".join(f"  [{c}] {tree[c].title}" + ("   <- NEW" if c == new.id else "")
-                       for c in parent.children)
+    if new.parent:
+        parent = tree[new.parent]
+        kids = parent.children
+        where = f"=== Its parent [{parent.id}] now runs these sub-steps, in order:"
+    else:
+        # a new top-level step: its neighbours are the build's other top-level steps
+        kids = [n.id for n in tree.values() if n.parent is None and L.build_in_scope(build, n.id)]
+        where = "=== This build's top-level steps, in order:"
+    order = "\n".join(f"  [{c}] {tree[c].title}" + ("   <- NEW" if c == new.id else "") for c in kids)
+    users = [n.id for n in tree.values() if n.id != new.id and f"[{new.id}]" in n.own_text()]
     parts = [f"LANGUAGE: {build['lang']}    BUILD: {build['name']}    FILE: {file_rel}",
              MODE_RULES.get(build.get("mode", "literal"), MODE_RULES["literal"]), "",
              f"=== A NEW step was added to the English:", step_block(new), "",
-             f"=== Its parent [{parent.id}] now runs these sub-steps, in order:", order, "",
+             where, order, "",
+             *([f"=== Steps whose English uses it: {', '.join(f'[{u}]' for u in users)}; they will call what you "
+                f"write, so give it the name the conventions give it.", ""] if users else []),
              f"=== The step just before it, [{prev.id}]:", step_block(prev), "",
              "Write the code for the new step as ONE new region. It will be inserted into the file at "
              f"exactly one spot: right after line {after_line}, which ends the region for [{prev.id}]. "
@@ -594,7 +603,7 @@ def insert_prompt(build, file_rel, lines, after_line, new: L.Node, prev: L.Node,
                   f"exactly (same checks, same constants), written idiomatically for {build['lang']}:",
                   ref_text, ""]
     numbered = "\n".join(f"{i + 1:4d}  {l}" for i, l in enumerate(lines))
-    parts += [context_text(build, [new.id, new.parent])]
+    parts += [context_text(build, [new.id] + ([new.parent] if new.parent else []))]
     parts += ["=== Whole current file (line numbers are not part of the code):", numbered, "",
               support_labels(lines, build["lang"]), "",
               "=== Your reply must start with exactly this line:",
@@ -636,12 +645,24 @@ def contract_prompt(build, file_rel, lines, r: L.Region, tree, conv: str) -> str
                           if L.build_in_scope(build, n.id))
     numbered = "\n".join(f"{i + 1:4d}  {l}" for i, l in enumerate(lines))
     marker_name = lines[r.start - 1].split("@contract", 1)[1].strip().rpartition("@")[0]
+    # Which data blocks this region holds, and where the build's others live: without this, a region labelled with
+    # one block got every block of the build, and the build declared each type twice.
+    holds = []
+    mine = L.label_blocks(tree, build, r.label)
+    if mine and CTX.get("root") is not None:
+        others = [(f, lab, blks) for f, lab, blks in L.contract_layout(CTX["root"], build, tree)
+                  if blks and not (f == file_rel and lab == r.label)]
+        holds = [f"=== This region holds only the type(s) for: {', '.join(mine)}."]
+        if others:
+            holds.append("The build's other data blocks have their own regions; do not declare them here, refer to "
+                         "them by name: " + "; ".join(f"{', '.join(blks)} in {f}" for f, lab, blks in others) + ".")
+        holds.append("")
     return "\n".join([
         f"LANGUAGE: {build['lang']}    BUILD: {build['name']}    FILE: {file_rel}",
         "This region holds the data types that spell out the steps' in:/out: contracts (the names in "
         "backticks are field names). One or more contracts changed. Update the types so they match the "
         "contracts exactly: add, remove or rename fields as the English now says. Keep imports, constants "
-        "and anything else in the region unless the contract change requires otherwise.", "",
+        "and anything else in the region unless the contract change requires otherwise.", "", *holds,
         "=== Conventions:", conv, "",
         "=== Every step's contract, as it is now:", contracts, "",
         context_text(build, conventions=False),
@@ -757,7 +778,7 @@ def leaked_lines(conv: str, lines: list[str], regions: list, idxs) -> list[tuple
     return out
 
 
-def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_run: bool) -> list:
+def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_run: bool, skip: set | None = None) -> list:
     """Regenerate every @contract region and every @node region of one build from the English
     alone, keeping @support code. The generator never sees the code it replaces: regions not yet
     regenerated are hidden in every prompt. Innermost regions go first, one at a time, top of file
@@ -782,6 +803,9 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
                     if k and (r.kind == "contract" or (r.kind == "node" and i not in has_child
                               and all(in_scope(b, t) for t, _ in r.tags)))]
         pending = todo_keys(regions, keys)
+        # steps inserted in this run were just written from the English: not again
+        pending = [k for k, r in zip(keys, regions) if k in pending and not (skip and r.tags
+                   and all(t in skip for t, _ in r.tags))]
         parents = [k for r, k, i in zip(regions, keys, range(len(regions)))
                    if k and r.kind == "node" and i in has_child and all(in_scope(b, t) for t, _ in r.tags)]
         if asked:
@@ -906,7 +930,10 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
 
     def do_build(b: dict):
         if BLIND:
-            return b["name"], regen_blind(cfg, root, tree, lock, b, gen, log_dir, dry_run)
+            # New steps first (a changed step may call them), then the regions, from the English alone.
+            added = insert_new_steps(b)
+            fresh = {label for _, label, status in added if status.startswith("new step inserted")}
+            return b["name"], added + regen_blind(cfg, root, tree, lock, b, gen, log_dir, dry_run, skip=fresh)
         results = regen_contracts(b, root, tree, gen, log_dir) if not dry_run else []
         # Parents that get a new sub-step are rewritten once, by the parent update below
         # (which also sees their changed wording), not twice.
@@ -976,10 +1003,19 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
                 fpath.write_text("\n".join(cur) + "\n")
                 results += [(f, "support", n) for n in notes]
 
-        # New steps: insert a region after the previous sibling's region, then update the parent.
+        results += insert_new_steps(b)
+        return b["name"], results
+
+    def insert_new_steps(b: dict) -> list:
+        # New steps: insert a region after the previous sibling's region, then update the parent. A top-level step
+        # (no parent) goes after the previous top-level step this build implements.
+        results = []
+        keep = protected(root, b)
         for nid in find_missing(b, root, tree):
+            if BLIND and REDO and nid not in REDO:
+                continue
             new = tree[nid]
-            sibs = tree[new.parent].children
+            sibs = tree[new.parent].children if new.parent else [n.id for n in tree.values() if n.parent is None]
             prev_id = next((c for c in reversed(sibs[:sibs.index(nid)]) if region_for(b, root, c)), None)
             loc = region_for(b, root, prev_id) if prev_id else None
             if not loc:
@@ -989,7 +1025,8 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
             fpath = root / f
             prev_r = regions[idx]
             # Insert after the outermost region that covers the previous sibling but not the parent.
-            while prev_r.parent is not None and not any(t == new.parent for t, _ in regions[prev_r.parent].tags):
+            while prev_r.parent is not None and regions[prev_r.parent].kind == "node" \
+                    and not any(t == new.parent for t, _ in regions[prev_r.parent].tags):
                 prev_r = regions[prev_r.parent]
             ref = reference_text.get("insert:" + nid) if b["name"] != ref_name else None
             prompt = insert_prompt(b, f, lines, prev_r.end, new, tree[prev_id], tree, ref and ref["text"])
@@ -1021,7 +1058,7 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
             results += [(f, "support", n) for n in add_notes]
 
             # Parent orchestration: only when the parent is its own function (no nested regions).
-            ploc = region_for(b, root, new.parent)
+            ploc = region_for(b, root, new.parent) if new.parent else None
             if not ploc:
                 continue
             pf, pregions, plines, pidx = ploc
@@ -1049,7 +1086,7 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
             if b["name"] == ref_name:
                 reference_text["parent:" + new.parent] = dict(lang=b["lang"], text="\n".join(clean_reply(reply)))
             results.append((pf, new.parent, "parent updated to call the new step"))
-        return b["name"], results
+        return results
 
     # Reference first (others need its text), then the rest in parallel.
     first = [b for b in builds if b["name"] == ref_name]
@@ -1243,6 +1280,24 @@ def read_files_text(root: Path, b: dict) -> str:
     for f in b.get("reads", []):
         parts += ["", f"=== {f} (exists already; read only, do not repeat or change it):", (root / f).read_text()]
     return "\n".join(parts)
+
+
+def project_check_errors(cfg: dict, root: Path) -> str | None:
+    """Run the project's "check_command" and return its error lines ("" when it builds; None when no command is
+    configured). Used by `regen --repair=N` between repair rounds."""
+    cmd = cfg.get("check_command")
+    if not cmd:
+        return None
+    cwd = (root / cfg.get("check_cwd", ".")).resolve()
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=900)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"(check command failed to run: {e})"
+    if res.returncode == 0:
+        return ""
+    lines = list(dict.fromkeys(l.strip() for l in (res.stdout + res.stderr).splitlines()
+                               if re.search(r"\berror\b|Error|FAIL", l)))
+    return "\n".join(lines) if lines else (res.stdout + res.stderr)[-2000:]
 
 
 def run_build_check(cfg: dict, root: Path, target: Path) -> str:

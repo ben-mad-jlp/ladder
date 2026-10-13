@@ -29,7 +29,7 @@ class ProjectTests(unittest.TestCase):
             self.assertEqual(kinds(L.check(pj), "test-not-run"), ["tests unit", "tests again"])
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(K.run_tests(pj), 0)
-            self.assertIn("same command as above, not run again", out.getvalue())
+            self.assertIn("same command as the project's tests 'unit', not run again", out.getvalue())
             self.assertEqual((root / "ran.txt").read_text(), "one\n")          # ran once
             rep = L.check(pj)
             self.assertEqual(kinds(rep, "test-not-run") + kinds(rep, "test-stale"), [])
