@@ -155,6 +155,34 @@ def _mask(v, keys, sent_at=None):
     return v
 
 
+MASK_ECHO_MIN = 4   # shorter masked values (an id like 3) are too likely to occur by chance; use --mask-text
+
+
+def _masked_values(v, kinds: dict, found: dict) -> None:
+    """The values a key mask hides, {text: what it is written as}, so the same value inside another field's text
+    (an incident id inside its message) can be hidden too."""
+    if isinstance(v, dict):
+        for k, x in v.items():
+            if k in kinds and isinstance(x, (str, int)) and not isinstance(x, bool) and len(str(x)) >= MASK_ECHO_MIN:
+                found[str(x)] = f"<{k}>"
+            else:
+                _masked_values(x, kinds, found)
+    elif isinstance(v, list):
+        for x in v:
+            _masked_values(x, kinds, found)
+
+
+def _mask_echoes(v, kinds: dict):
+    """Mask key values, and replace each masked value (of at least MASK_ECHO_MIN characters) wherever it appears
+    inside the result's other strings."""
+    found: dict = {}
+    _masked_values(v, kinds if isinstance(kinds, dict) else {k: "value" for k in kinds}, found)
+    if not found:
+        return v
+    pats = [(re.compile(r"(?<![\w-])" + re.escape(t) + r"(?![\w-])"), rep_) for t, rep_ in found.items()]
+    return _mask_text(v, pats)
+
+
 def _mask_text(v, patterns: list[tuple]):
     """Replace regex matches inside every string of a result: a time inside a message
     ("Already clocked in since 10:55" with \\d\\d:\\d\\d=<hh:mm>) that no key mask can reach."""
@@ -425,7 +453,7 @@ def replay(argv: list[str]) -> int:
                 if ob.returncode != 0:
                     raise SystemExit(f"replay: --observe command failed ({ob.returncode}): {ob.stderr.strip()[:200]}")
                 result["observed"] = ob.stdout.strip()
-            result = _mask_text(_mask(result, mask_f, sent_at), text_f)
+            result = _mask_text(_mask(_mask_echoes(result, mask_f), mask_f, sent_at), text_f)
             info = f"{raw_r['method']} {raw_r['path']}"
             events.append({"step": step, "ev": "enter", "ms": 0, "info": info})
             events.append({"step": step, "ev": "exit", "ms": 0, "info": f"{status}",

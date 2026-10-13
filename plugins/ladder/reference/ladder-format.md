@@ -170,6 +170,13 @@ capability current user
   is a language (`csharp`) or a build name (`web-ts`), the value is `package version | call`.
 - `ladder check` reports a step that uses an undefined capability, and a build with no binding
   for a capability its steps use.
+- A binding of code in the same repository starts with `(in repository)` and names its files
+  (`typescript: (in repository) src/services/storage.ts | await storage.get<T>(key)`); paths are
+  resolved from the project folder, its `check_cwd`, or any folder above. Generator prompts include
+  each such file the region's steps use (a long one cut to the declarations its calls name), so the
+  generator calls what exists; repair prompts forbid replacing a binding with another library.
+  `check` warns `binding-not-called` when no file of a build calls any name the binding's call part
+  calls (`get`, `set` above): the code may use another library or an API that does not exist.
 - Changing a capability's in/out flags its users for re-review; changing one binding flags
   only that language's builds (regenerate with `--redo=<step ids>`).
 - Framework plumbing (routing, DI, rendering) and small utilities are not capabilities; build
@@ -202,6 +209,15 @@ whose subject changed since it ran (`test-stale`). The files a command names (a 
 file) are part of that subject too, so editing a test makes its result stale; files it reaches
 only indirectly are not. A capability whose test touches database tables names them with `reads:` /
 `writes:` lines, like a step; a schema change to those tables then makes the test stale too.
+
+The project's own behaviour tests (the slice's unit or integration tests) go in ladder.json:
+`"tests": [{"name": "unit", "command": "npx vitest run src/x.test.ts", "builds": ["hooks"]}]`
+(`builds` optional: all tagged builds by default). `ladder test` runs them with the others and records
+each result against the command, the files it names and the code of the builds it tests, so any change
+to that code makes the result `test-stale`; a failed one is a problem. A project with tagged builds and
+no `"tests"` gets an `untested-project` warning: nothing records that its code passes the slice's
+tests. `ladder test` runs each distinct command once, however many capabilities, links or tests name
+it, and records the result for each.
 
 ### Links between trees
 
@@ -239,7 +255,9 @@ the called project lists the caller in its own `"links"`, its `check` warns that
 callers (`has-callers`); with `--since=<ref>` it compares the called step's contract with that commit
 instead of the lock. Generator prompts for a calling step include the called step's contract. A link
 with callers but no `"test"` is reported as `untested-link`: only running both sides catches a
-wrong assumption about the code between them.
+wrong assumption about the code between them. A call into a step its own project has never approved,
+or has changed since approving, is warned `linked-unapproved`: its English may still change, so stamp
+the called project first (or re-read the caller once it is approved).
 
 ## 5. Regions in code
 
@@ -441,6 +459,24 @@ Two ways to get traces:
   build's) unless given `--force`. `{"wait": 32}` alone
   pauses between requests. `--observe "<command>"` runs after each request and its output is compared
   too (a SQL command count, a queue length). `save` paths without a prefix read the body.
+  A masked value of 4 or more characters is also replaced wherever it appears inside the response's
+  other strings (`<incidentId>` inside a message); shorter ones need `--mask-text`. Text masks are
+  applied again when comparing, to both sides, from either side's `.replay.json`: adding a pattern to
+  a newer recording masks the older ones too, without re-recording them.
+
+**What is compared.** Each run of the reference is set against the same run of every other build that
+has its own traces. Builds that share the reference's traces (`"traces": "<reference>"`, one harness
+for several tagged builds) are not compared; to compare another recording (a second run of the same
+code, a regenerated build) add it as a build with `"tagged": false`, named after its folder under
+`traces/`. When no build has its own traces, `check` says "nothing was compared" and does not call the
+comparison fine; a folder under `traces/` that no build names is warned `traces-unused`.
+
+**An approved change of behaviour.** After a change through the English, the reference still shows
+the old behaviour, so the regenerated build differs where the change was meant to. Once the
+difference is reviewed and the English stamped, record the approved code as a build and make it the
+reference: `ladder reference <ladder.json> --from=<build>` copies its traces into the reference's
+folder and moves the old reference to `traces/history/<name>-<time>/`. Re-record other builds that
+came from the old code.
 
 ## 10. Commands
 
@@ -460,8 +496,11 @@ ladder regen <ladder.json> [--build=NAME] [--redo=IDS] [--dry-run]
                                                       regenerate stale/new regions (contract first);
                                                       exit 1 if any reply was rejected
 ladder repair <ladder.json> <errors.txt> --build=NAME regenerate the regions errors point at
-ladder accept <ladder.json> [--build=NAME] [IDS]      accept hand edits (the English still describes them)
+ladder accept <ladder.json> [--build=NAME] [IDS]      accept hand edits (the English still describes them);
+                                                      --from=SCRATCH: regions copied from a scratch copy that
+                                                      are exactly what it generated (copy the files first)
 ladder retag <ladder.json> IDS [--build=NAME]         English reworded, behavior unchanged: update markers only
+ladder reference <ladder.json> --from=BUILD          an approved change: BUILD's recording becomes the reference
 ladder schema <ladder.json> [ENTITY]                  the database schema the English can refer to
               (generate, regen and repair take --discard-hand-edits to overwrite them anyway)
 ladder replay <scenarios> --base URL --out traces/<build> [--mask a,b:presence,c:time] [--header "K: V"]
@@ -469,7 +508,9 @@ ladder replay <scenarios> --base URL --out traces/<build> [--mask a,b:presence,c
                                                       (scenarios: {{env:X}}, save / {{var:x}}, wait, cookies)
 ladder regen <ladder.json> --build=NAME --blind       rewrite a build's regions from the English alone,
                                                       old code hidden, @support kept (use a scratch copy);
-                                                      innermost regions first, then each parent's own lines
+                                                      innermost regions first, then each parent's own lines;
+                                                      with --redo=IDS only the regions of those steps (new
+                                                      steps added to an approved tree)
 ladder stamp <ladder.json>                            approve the English as it is now
 ladder view <ladder.json> [out.html]                  side-by-side viewer
 ```

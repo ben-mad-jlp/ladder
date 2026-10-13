@@ -51,6 +51,11 @@ Every profile also answers:
   observe: which methods are `async` and which return a promise directly, sync vs microtask vs timer,
   overload order, error classes. A spec read by a generator loses these; a rule with an example keeps
   them.
+- **"Nothing":** how the English's "nothing" becomes a value in each language. C# and Python have one
+  null; TypeScript and JavaScript have two, so say which (for example: an answer or state that is
+  "nothing" is `null`, an optional field or argument is left off, `undefined`), and keep existing
+  `| null` results. Without the rule a regenerated `find(...)` answered `undefined` where callers and
+  tests expected `null`.
 - **Off limits:** files and folders the generator must never write: migrations (created with
   `dotnet ef migrations add` and reviewed by a person), `Program.cs` / startup, CI, lock files.
 - **Pins:** framework and package versions the code must target (the vocabulary pins individual

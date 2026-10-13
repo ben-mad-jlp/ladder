@@ -90,6 +90,12 @@ option, event, thrown error and message, and the *order* in which things happen 
 to each other, synchronous vs microtask vs timer). Callers and tests depend on that order even when
 no document mentions it.
 
+Read the app-wide failure handling too, even when it is outside the slice: a global exception
+middleware or filter often turns an exception type into a status and body (an
+`InvalidOperationException` answering 409, not 500). Write that mapping once as a vocabulary
+capability ("API error answer") the steps use, rather than guessing a status per step; replay
+then checks it.
+
 While reading, collect facts, not impressions: exact routes and status codes, exact error
 messages, limits and whether they are inclusive, defaults, ordering and tie-breaks, paging
 math, what happens on empty, missing, duplicate and too-long input, time zones and units,
