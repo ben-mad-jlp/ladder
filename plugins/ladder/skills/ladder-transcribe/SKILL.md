@@ -231,7 +231,9 @@ If the project has no `ModelSnapshot.cs` (its schema changes are SQL scripts), e
 `dotnet run --project ${CLAUDE_PLUGIN_ROOT}/tool/exporters/efcore-schema -p:ModelsProject=<the
 project with the DbContexts> -- --context <Name> --out ladder/<area>/api/schemas/<name>.json` (one
 `--context`/`--out` pair per DbContext) and point `"schemas"` at the JSON with `"kind": "json"`.
-Re-export after each schema change and commit the JSON. Before anything is stamped,
+Re-export after each schema change and commit the JSON (the exporter takes the models project's target framework;
+round 19 walked the whole flow: a person writes the migration and the entity property, re-exports, then changes the
+English to use the column; `check` flags the other steps that touch the table as `schema-changed` for a re-read). Before anything is stamped,
 `ladder check --since=<base commit>` shows which steps a schema change affects.
 
 ## 6. Verify

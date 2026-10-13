@@ -16,8 +16,9 @@ dotnet run --project <plugin>/tool/exporters/efcore-schema \
        --context ReportsDbContext --out ladder/auth/api/schemas/reports.json
 ```
 
-- Add `-p:LadderTargetFramework=net9.0` (or the models project's framework) if it is not net8.0. (Not
-  `-p:TargetFramework`: NuGet's restore drops that one and the build fails with NU1201.)
+- The exporter targets the framework the models project names in `<TargetFramework>`; set
+  `-p:LadderTargetFramework=...` only to override it (not `-p:TargetFramework`: NuGet's restore drops that one and the
+  build fails with NU1201). When only an older runtime is installed, `DOTNET_ROLL_FORWARD=Major` runs it.
 - A context whose constructor takes more than the options (a per-year archive context) gets the rest
   from `--ctor-arg name=value` after its `--context`, for example `--ctor-arg year=2025`.
 - The models project must reference its provider (SQL Server, PostgreSQL or SQLite); the exporter

@@ -4,6 +4,9 @@
     <OutputType>Exe</OutputType>
     <!-- NuGet's restore drops a global TargetFramework, so the framework is its own property:
          -p:LadderTargetFramework=net9.0 to match a models project that targets net9.0. -->
+    <!-- By default, the framework the models project targets (round 19: net8.0 against a net9.0 models project failed with
+         NU1201, and the hint was only in this folder's README). -->
+    <LadderTargetFramework Condition="'$(LadderTargetFramework)' == '' and '$(ModelsProject)' != '' and Exists('$(ModelsProject)')">$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(ModelsProject)')), '&lt;TargetFramework&gt;\s*([^&lt;;\s]+)').Groups[1].Value)</LadderTargetFramework>
     <LadderTargetFramework Condition="'$(LadderTargetFramework)' == ''">net8.0</LadderTargetFramework>
     <TargetFramework>$(LadderTargetFramework)</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
