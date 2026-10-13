@@ -55,6 +55,8 @@ Kotlin, Go, Rust, Swift and Dart; when no error line points into the build's fil
 If ladder.json sets `"check_command"` (`["npx", "tsc", "--noEmit"]`), `generate` builds after writing
 and retries once with the compile errors; `"format_command"` runs the formatter over every file the
 generator changed. `generate --out=<file>` writes somewhere else, to try a regeneration safely. When code regenerated in a scratch copy is copied back, run `ladder accept <ladder.json> --from=<scratch>/ladder.json` so the copied regions are not reported as hand-edited. `accept` does not copy: copy the build files over first. A project with no stamp yet has no approved code, so copied code needs no accepting (`accept --from` says so). Bring later English changes into the scratch copy with git as usual: what the scratch copy generated is kept in its local `.ladder/generated.json`, which a sync does not touch.
+
+**Linked packages in a scratch copy.** When one project consumes another through a local link (an npm `file:` or workspace dependency, a symlinked `node_modules`, a project reference), make the scratch copy's consumer resolve the scratch copy's package, and rebuild that package after regenerating it. A `node_modules` linked back to the original checkout resolves the original package: the consumer then builds and tests against the code you did not regenerate, and a change in the package never reaches it (round 14: the dashboard's `qbs-library-react` pointed at the original library). Check with `readlink -f <consumer>/node_modules/<package>`.
 `repair` can open an `@support imports` region at the top of a file that has none when the fix is a
 missing import, and it repairs `@contract` regions (entities, DTOs) as well as step regions.
 
