@@ -449,7 +449,7 @@ def _repo_relative(text: str, where: Path) -> str:
 
 
 def _write_replay_meta(out: Path, mask: dict, mask_text: list, jwt_on: bool, record: list, observe,
-                       project: Path | None = None) -> None:
+                       project: Path | None = None, started: dict | None = None) -> None:
     """How these traces were recorded, so `check` can tell when two builds' traces were recorded
     differently (another Ladder version, other masks) and the difference is the recording's; and, for a project's
     traces, a fingerprint of its code, so `check` can tell when the reference no longer matches the code."""
@@ -460,6 +460,13 @@ def _write_replay_meta(out: Path, mask: dict, mask_text: list, jwt_on: bool, rec
             "recorded": datetime.date.today().isoformat()}
     if project and project.exists():
         meta["code"] = L.code_fingerprint(project.parent, L.read_config(project))
+    # When each run (scenario file) started: a fixed date masked as a relative time ("now-17707m") moves by the time
+    # between two recordings, and check allows exactly that (pilot: the reference was recorded 73 minutes earlier).
+    try:
+        old = json.loads((out / ".replay.json").read_text()).get("started", {})
+    except (OSError, ValueError):
+        old = {}
+    meta["started"] = dict(sorted({**old, **(started or {})}.items()))
     (out / ".replay.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
@@ -518,6 +525,8 @@ def replay(argv: list[str]) -> int:
             if res.returncode != 0:
                 raise SystemExit(f"replay: --before-each command failed ({res.returncode}) before {f.name}")
         sc = json.loads(f.read_text())
+        from datetime import datetime as _dt, timezone as _tz
+        run_started = _dt.now(_tz.utc).isoformat(timespec="seconds")
         env = sc.get("env", {})
         saved: dict = {}
         jar = http.cookiejar.CookieJar()
@@ -602,7 +611,8 @@ def replay(argv: list[str]) -> int:
             print(f"  {f.stem}: {tokens_hidden} values that look like signed tokens (JWT) were written as <token>; "
                   f"--jwt records their claims instead (comparable across runs), --keep-tokens keeps them (never in committed traces)")
             tokens_hidden = 0
-        _write_replay_meta(out, mask, mask_text, jwt_on, record_default, observe, _replay_project(out, opt(argv, "--project")))
+        _write_replay_meta(out, mask, mask_text, jwt_on, record_default, observe, _replay_project(out, opt(argv, "--project")),
+                           {f.stem: run_started})
         print(f"  {f.stem}: {len(events) // 2} requests -> {out / (f.stem + '.jsonl')}")
         not_times = sum(e.get("data", "").count("<not a time>") for e in events if isinstance(e.get("data"), str))
         if not_times:

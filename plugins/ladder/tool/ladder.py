@@ -1495,10 +1495,51 @@ def apply_compare(value: str, rules: dict) -> str:
     return json.dumps(walk(v), sort_keys=True, separators=(",", ":"))
 
 
-def match_info(ref: str, val: str, tol: float) -> tuple[str, float]:
-    """'same' if identical; 'close' if only numbers differ and each by at most tol;
-    otherwise 'different'. Returns (status, largest numeric difference)."""
-    if ref == val:
+REL_TIME_RE = re.compile(r"\bnow([+-])(\d+)(m|s)\b")
+
+
+def shift_times(val: str, gap_s: float) -> str:
+    """A result recorded gap_s seconds after the reference, with each relative time ("now-17780m") moved back by that
+    gap: a fixed date in the data then reads as it did in the reference's recording."""
+    def move(m):
+        n = (1 if m.group(1) == "+" else -1) * int(m.group(2))
+        unit = 60 if m.group(3) == "m" else 1
+        k = round((n * unit + gap_s) / unit)
+        return f"now{'+' if k >= 0 else '-'}{abs(k)}{m.group(3)}"
+    return REL_TIME_RE.sub(move, val)
+
+
+def same_but_for_drift(ref: str, val: str, gap_s: float | None) -> bool:
+    """Equal once every relative time that differs is read either as "now"-based (equal as written) or as a fixed date
+    (moved by the gap between the two recordings), within a minute: what a masked time cannot tell apart."""
+    if gap_s is None or not REL_TIME_RE.search(ref) or REL_TIME_RE.sub("#", ref) != REL_TIME_RE.sub("#", val):
+        return False
+    shifted = shift_times(val, gap_s)
+    for a, b, c in zip(REL_TIME_RE.finditer(ref), REL_TIME_RE.finditer(val), REL_TIME_RE.finditer(shifted)):
+        def mins(m):
+            n = (1 if m.group(1) == "+" else -1) * int(m.group(2))
+            return n if m.group(3) == "m" else n / 60
+        if abs(mins(a) - mins(b)) > 1 and abs(mins(a) - mins(c)) > 1:
+            return False
+    return True
+
+
+def run_gap(ref_dir: Path, dir_: Path, run: str) -> float | None:
+    """Seconds between the reference's recording of a run and a build's (from each folder's .replay.json), or None."""
+    from datetime import datetime
+    def started(d):
+        try:
+            return datetime.fromisoformat(json.loads((d / ".replay.json").read_text())["started"][run])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+    a, b = started(ref_dir), started(dir_)
+    return (b - a).total_seconds() if a and b else None
+
+
+def match_info(ref: str, val: str, tol: float, gap_s: float | None = None) -> tuple[str, float]:
+    """'same' if identical (or identical but for relative times moved by the gap between the recordings); 'close' if
+    only numbers differ and each by at most tol; otherwise 'different'. Returns (status, largest numeric difference)."""
+    if ref == val or same_but_for_drift(ref, val, gap_s):
         return "same", 0.0
     if NUM_RE.sub("#", ref) != NUM_RE.sub("#", val):
         return "different", float("inf")
@@ -1695,7 +1736,7 @@ def replay_settings_warnings(root: Path, cfg: dict) -> list[dict]:
             continue
         want, got = dict(want, observe=repo_relative_command(want.get("observe", ""))), dict(got, observe=repo_relative_command(got.get("observe", "")))
         diffs = [f"{k}: {want.get(k)} vs {got.get(k)}" for k in sorted(set(want) | set(got))
-                 if k not in ("recorded", "mask_text", "code") and want.get(k) != got.get(k)]   # mask_text: applied to both at compare; code: differs by design
+                 if k not in ("recorded", "mask_text", "code", "started") and want.get(k) != got.get(k)]   # mask_text: applied to both at compare; code, started: differ by design
         if diffs:
             out.append(dict(kind="replay-settings", node=b["name"],
                             msg=f"recorded with different replay settings than {ref} (" + "; ".join(diffs)
@@ -1780,7 +1821,7 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
                     pairs = list(zip(ref_ex_b[step], ex[step]))
                 if rl:
                     pairs = [(apply_compare(r, rl), apply_compare(v, rl)) for r, v in pairs]
-                results = [match_info(r, v, step_tol) for r, v in pairs]
+                results = [match_info(r, v, step_tol, run_gap(ref_path.parent, path.parent, run)) for r, v in pairs]
                 status = ("different" if any(r[0] == "different" for r in results)
                           else "close" if any(r[0] == "close" for r in results) else "same")
                 worst = max(r[1] for r in results)

@@ -171,5 +171,18 @@ class SupportImportsGoAfterAWholeImport(unittest.TestCase):
                                    "} from 'y'", "import { d } from 'w'", "// @end"])
 
 
+class RelativeTimesAndTheGapBetweenRecordings(unittest.TestCase):
+    def test_a_fixed_date_moves_by_the_gap_and_still_matches(self):
+        ref = '{"timestamp":"now-17707m","at":"now+0m"}'
+        val = '{"timestamp":"now-17780m","at":"now+0m"}'
+        self.assertEqual(L.match_info(ref, val, 0, 73 * 60)[0], "same")
+        self.assertEqual(L.match_info(ref, val, 0, None)[0], "different")
+
+    def test_a_wrong_time_still_differs(self):
+        ref = '{"at":"now+0m"}'
+        val = '{"at":"now+300m"}'
+        self.assertEqual(L.match_info(ref, val, 0, 73 * 60)[0], "different")
+
+
 if __name__ == "__main__":
     unittest.main()
