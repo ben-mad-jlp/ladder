@@ -471,11 +471,35 @@ def apply_support_adds(lines: list[str], lang: str, adds) -> tuple[list[str], li
     return lines, notes
 
 
+# Generator use in this run (pilot: sizing a whole-repository run needs calls, time and prompt size per region; they
+# were measured from outside). Printed after "prompts and replies" and appended to <log>/usage.json.
+USAGE = {"calls": 0, "seconds": 0.0, "prompt_chars": 0, "reply_chars": 0}
+
+
 def call_generator(cmd: list[str], prompt: str, cwd: Path) -> str:
-    res = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=cwd, timeout=600)
+    import time
+    t0 = time.monotonic()
+    try:
+        res = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=cwd, timeout=600)
+    finally:
+        USAGE["calls"] += 1
+        USAGE["seconds"] += time.monotonic() - t0
+        USAGE["prompt_chars"] += len(prompt)
     if res.returncode != 0:
         raise RuntimeError(f"generator failed ({res.returncode}): {res.stderr.strip()[:300]}")
+    USAGE["reply_chars"] += len(res.stdout)
     return res.stdout
+
+
+def usage_line(log_dir: Path) -> str:
+    """One line on this run's generator use, also written to <log>/usage.json."""
+    u = dict(USAGE, seconds=round(USAGE["seconds"], 1))
+    try:
+        (log_dir / "usage.json").write_text(json.dumps(u, indent=2) + "\n")
+    except OSError:
+        pass
+    return (f"generator: {u['calls']} call(s), {u['seconds']:.0f} s, prompts {u['prompt_chars'] // 1000}k characters, "
+            f"replies {u['reply_chars'] // 1000}k")
 
 
 def validate_and_splice(file: Path, lang: str, lines: list[str], r: L.Region, reply: list[str],
@@ -1277,6 +1301,7 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
             print(f"{name:<20} {f}  [{label}]  {status}")
             bad += status.startswith(("REJECTED", "REFUSED"))
     print(f"\nprompts and replies: {log_dir.relative_to(root)}")
+    print(usage_line(log_dir))
     return 1 if bad else 0
 
 
@@ -1456,6 +1481,7 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
             for n in notes:
                 print(f"{build_name:<20} {f}  [support]  {n}")
     print(f"prompts and replies: {log_dir.relative_to(root)}")
+    print(usage_line(log_dir))
     return status
 
 
@@ -1688,10 +1714,12 @@ def generate(pj: Path, build_name: str, attempts: int = 2) -> int:
             print(f"{build_name}: generated {target} ({len(lines)} lines, attempt {attempt})"
                   + (" -- STILL DOES NOT BUILD, run `ladder repair` with:\n" + build_errors if build_errors else ""))
             print(f"prompts and replies: {log_dir.relative_to(root)}")
+            print(usage_line(log_dir))
             return 1 if build_errors else 0
         feedback = "; ".join(issues[:8])
         print(f"{build_name}: attempt {attempt} rejected: {feedback}")
     print(f"prompts and replies: {log_dir.relative_to(root)}")
+    print(usage_line(log_dir))
     return 1
 
 
