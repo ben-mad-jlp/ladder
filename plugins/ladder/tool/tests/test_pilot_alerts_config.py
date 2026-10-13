@@ -121,5 +121,26 @@ class TestMissingAndVersion(Base):
         self.assertRegex(out.strip(), r"^\d+\.\d+\.\d+$")
 
 
+class BlindRunKeepsWhatCallersUse(unittest.TestCase):
+    def test_multi_line_declaration_is_kept_whole(self):
+        import regen as R
+        own = ["export function dataset(", "  name: string,", "  input: { a: number },", "): Rows {", "  return []", "}"]
+        self.assertEqual(R.declarations(own), ["export function dataset( name: string, input: { a: number }, ): Rows {"])
+
+    def test_csharp_public_and_internal_members_are_named(self):
+        import regen as R
+        lines = ["// @node x.1@abc", "public static bool IsDue(DateTime a, int b)", "{", "  return true;", "}",
+                 "internal string Name { get; set; }", "// @end"]
+        regions, *_ = L.parse_regions_text(lines, "csharp") if hasattr(L, "parse_regions_text") else (None,)
+        if regions is None:
+            p = Path(tempfile.mkdtemp()) / "a.cs"
+            p.write_text("\n".join(lines) + "\n")
+            regions, _, flines, _ = L.parse_regions(p, "csharp")
+        note = R.public_names_note(regions, flines, 0, "csharp")
+        self.assertIn("IsDue", note)
+        self.assertIn("Name", note)
+        self.assertIn("public static bool IsDue(DateTime a, int b)", note)
+
+
 if __name__ == "__main__":
     unittest.main()

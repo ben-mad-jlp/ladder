@@ -828,21 +828,68 @@ def leaked_lines(conv: str, lines: list[str], regions: list, idxs) -> list[tuple
     return out
 
 
+CS_MEMBER = re.compile(r"^\s*(?:public|internal)\s+(?:(?:static|async|virtual|override|sealed|new|readonly|required|const)\s+)*"
+                       r"(?!class\b|interface\b|record\b|struct\b|enum\b|delegate\b|event\b)"
+                       r"(?:\([^()]*\)\??|[\w<>?,.\[\]]+(?:\s*<[^>]*>)?)\s+([A-Za-z_]\w*)\s*(?:\(|<|\{|=>|=|;)", re.M)
+
+
 def public_names_note(regions: list, lines: list[str], idx: int, lang: str) -> str:
     """The names a hidden region exports (its own lines), which other files import: a blind run must keep them.
     Round 11: two exported props interfaces came back unexported and the folder's index.ts no longer compiled."""
     own = L.region_own_code(regions, lines, idx)
     names = L.text_export_names("\n".join(own), lang)
+    if lang == "csharp":
+        # Members too, not only types: a public (or internal, seen by test projects) method or property that other
+        # code calls (pilot: a test called AlertService.IsScheduledDue, the English never named it, the blind run
+        # renamed it and the tests stopped compiling).
+        names = sorted(set(names) | set(CS_MEMBER.findall("\n".join(own))))
     if not names:
         return ""
     # the declaration line of each exported function or constant: its signature is what callers in other files use
     # (round 12: a dataset function came back taking three arguments where its caller passes one object)
-    sigs = [" ".join(l.split()) for l in own if re.match(r"^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|const)\b", l)
-            or re.match(r"^\s*public\s+(?:static\s+)?(?:async\s+)?[\w<>?,\s\[\]]+\s+\w+\s*\(", l)]
+    sigs = declarations(own)
     out = ("\n\n=== This region's public names (other files import them): " + ", ".join(names)
            + ". Keep each one exported, with this name.")
     if sigs:
-        out += " Keep these declarations as they are (callers depend on them): " + " | ".join(x[:200] for x in sigs)
+        out += " Keep these declarations as they are (callers depend on them): " + " | ".join(sigs)
+    return out
+
+
+DECL_START = re.compile(r"^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|const)\b"
+                        r"|^\s*(?:public|internal)\s+(?:static\s+)?(?:async\s+)?(?:\([^()]*\)\??|[\w<>?,\s\[\]]+)\s+\w+\s*\(")
+
+
+def declarations(own: list[str], limit: int = 600) -> list[str]:
+    """Each exported function's or public method's whole declaration, up to where its body starts: a parameter list
+    over several lines is part of what callers depend on (pilot: only `export function alertsDataset(` was kept, and
+    the blind run turned its (name, input object) into six positional parameters)."""
+    out = []
+    for i, line in enumerate(own):
+        if not DECL_START.match(line):
+            continue
+        if re.match(r"^\s*export\s+(?:default\s+)?const\b", line) and "=" in line:
+            # a constant: its name and type, not its value
+            head = line.split("=", 1)[0] if not re.search(r"=\s*(?:async\s*)?\(", line) else None
+            if head is not None:
+                out.append(" ".join(head.split()))
+                continue
+        parts = []
+        for l in own[i:i + 20]:
+            parts.append(l.strip())
+            text = " ".join(parts)
+            # the parameter list starts at the first `name(` (after any tuple return type) and the declaration ends on
+            # the line where it closes
+            m = re.search(r"[A-Za-z_]\w*\s*(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\s*\(", text)
+            if m:
+                depth = 0
+                for ch in text[m.end() - 1:]:
+                    depth += (ch == "(") - (ch == ")")
+                    if depth == 0:
+                        break
+                if depth == 0:
+                    break
+        decl = " ".join(" ".join(parts).split())
+        out.append(decl[:limit])
     return out
 
 
