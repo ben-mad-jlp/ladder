@@ -455,6 +455,14 @@ def apply_support_adds(lines: list[str], lang: str, adds) -> tuple[list[str], li
             continue
         if all(IMPORT_LIKE.match(a) for a in new):
             last = max((i for i in range(start + 1, end) if IMPORT_LIKE.match(lines[i])), default=start)
+            # after the end of that import, not its first line: `import type {` over several lines (pilot: two
+            # imports landed inside one and the file no longer parsed)
+            depth = 0
+            for j in range(last, end):
+                depth += lines[j].count("{") + lines[j].count("(") - lines[j].count("}") - lines[j].count(")")
+                last = j
+                if depth <= 0:
+                    break
             at = last + 1
         else:
             at = end

@@ -161,5 +161,15 @@ class RestoredApprovedCodeIsNotAHandEdit(Base):
         self.assertEqual(L.hand_edited(self.p, b), [])
 
 
+class SupportImportsGoAfterAWholeImport(unittest.TestCase):
+    def test_new_import_after_a_multi_line_import(self):
+        import regen as R
+        lines = ["// @support imports", "import { a } from 'x'", "import type {", "  B,", "  C,", "} from 'y'", "// @end",
+                 "export const z = 1"]
+        new, _ = R.apply_support_adds(lines, "typescript", [("imports", ["import { d } from 'w'"])])
+        self.assertEqual(new[:8], ["// @support imports", "import { a } from 'x'", "import type {", "  B,", "  C,",
+                                   "} from 'y'", "import { d } from 'w'", "// @end"])
+
+
 if __name__ == "__main__":
     unittest.main()
