@@ -288,12 +288,12 @@ def stale_regions(file: Path, lang: str, tree: dict[str, L.Node]):
     regions, _, lines, _ = L.parse_regions(file, lang)
     out = []
     for i, r in enumerate(regions):
-        if r.kind == "node" and any(nid in tree and (h != tree[nid].hash or nid in REDO) for nid, h in r.tags):
+        if r.kind == "node" and any(nid in tree and (not tree[nid].tag_matches(h) or nid in REDO) for nid, h in r.tags):
             # If a stale region sits inside another stale region, the outer one covers it.
             p, covered = r.parent, False
             while p is not None:
                 pr = regions[p]
-                if any(nid in tree and h != tree[nid].hash for nid, h in pr.tags):
+                if any(nid in tree and not tree[nid].tag_matches(h) for nid, h in pr.tags):
                     covered = True
                 p = pr.parent
             if not covered:
@@ -346,7 +346,7 @@ def build_prompt(build: dict, file_rel: str, lines: list[str], r: L.Region,
     ids = [nid for nid, _ in r.tags]
     nested = nested or []
     nested_ids = [nid for rr in nested if rr.kind == "node" for nid, _ in rr.tags if nid in tree]
-    changed = [nid for nid, h in r.tags if h != tree[nid].hash]
+    changed = [nid for nid, h in r.tags if not tree[nid].tag_matches(h)]
     parts = [f"LANGUAGE: {build['lang']}    BUILD: {build['name']}    FILE: {file_rel}",
              MODE_RULES.get(build.get("mode", "literal"), MODE_RULES["literal"]), ""]
     redo = [nid for nid, _ in r.tags if nid in REDO and nid not in changed]
@@ -370,7 +370,7 @@ def build_prompt(build: dict, file_rel: str, lines: list[str], r: L.Region,
     for nid in nested_ids:
         n = tree[nid]
         h = next(h for rr in nested for t, h in rr.tags if t == nid)
-        if h != n.hash:
+        if not n.tag_matches(h):
             parts += [f"=== Nested step [{nid}] CHANGED (its region sits inside this one). Before:",
                       old_block(lock.get(nid)), "", f"=== Nested step [{nid}] now:", step_block(n), ""]
         else:
@@ -627,7 +627,7 @@ def parent_prompt(build, file_rel, lines, r: L.Region, new: L.Node, new_region: 
     parent = tree[new.parent]
     order = "\n".join(f"  [{c}] {tree[c].title}" + ("   <- NEW" if c == new.id else "")
                        for c in parent.children)
-    changed = any(nid == parent.id and h != parent.hash for nid, h in r.tags)
+    changed = any(nid == parent.id and not parent.tag_matches(h) for nid, h in r.tags)
     wording = ([f"=== Step [{parent.id}] CHANGED. Before:", old_block((lock or {}).get(parent.id)), "",
                 f"=== Step [{parent.id}] now:", step_block(parent), ""] if changed
                else [f"=== Step [{parent.id}] (its own wording did not change):", step_block(parent), ""])
@@ -1072,7 +1072,7 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
                 ref = None
                 if b["name"] != ref_name:
                     # Use the reference's text for the changed steps, whatever region they sit in.
-                    changed = {nid for nid, h in r.tags if h != tree[nid].hash}
+                    changed = {nid for nid, h in r.tags if not tree[nid].tag_matches(h)}
                     texts = [v for k, v in reference_text.items() if changed & set(k.split("+"))]
                     if texts:
                         ref = dict(build=ref_name, lang=texts[0]["lang"],
@@ -1540,7 +1540,7 @@ def generate(pj: Path, build_name: str, attempts: int = 2) -> int:
                    if nid in tree and not in_scope(b, nid)]
         issues += [f"step [{nid}] has {len(v)} regions; it needs exactly one" for nid, v in tagged.items() if len(v) > 1]
         issues += [f"step [{nid}] marker has hash {v[0]}, expected {tree[nid].hash}"
-                   for nid, v in tagged.items() if nid in tree and v[0] != tree[nid].hash]
+                   for nid, v in tagged.items() if nid in tree and not tree[nid].tag_matches(v[0])]
         issues += [f"region tagged with unknown step [{nid}]" for nid in tagged if nid not in tree]
         if not issues:
             target.write_text("\n".join(lines) + "\n")

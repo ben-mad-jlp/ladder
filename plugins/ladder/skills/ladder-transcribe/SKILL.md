@@ -184,6 +184,16 @@ other files import, are contracts too: data blocks in `@contract` regions (round
 prose and blind regeneration renamed them; the container and the story fixtures stopped compiling). Accessibility labels and roles
 are the same kind of contract (screen readers and tests find controls by them): list them in the step that renders.
 
+**Cite a rule wherever its value is used.** A named rule reaches only the steps that say "(rule <name>)". In round 13
+three parsers checked the same weight limit and only one cited the rule; a change to the rule regenerated that one and
+left the other two with the old limit, while every check and test passed. `check` now warns `rule-uncited`, but write
+the citation in the first place.
+
+**Branches that never run.** Code often guards a case that cannot happen (a split that always yields a piece, a check
+after an earlier one already returned). Say so in the English, with the reason ("there is always a piece, so ... never
+fires"); written as a live branch, regeneration makes it reachable. In round 13 "no pieces: error ..." became
+reachable for blank text, and the differential run caught it in 118 of 200 seeds.
+
 **Name the exact signal.** When the code decides on one particular field and the English says something looser
 ("while signed in", "once loaded", "when valid"), name the field: "while the auth store holds an employee (its
 `isAuthenticated` flag is not read)". In round 11 "signed in" was regenerated as `isAuthenticated` twice, where the

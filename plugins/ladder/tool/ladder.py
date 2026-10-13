@@ -91,6 +91,8 @@ class Node:
     reads: list[str] = field(default_factory=list)     # schema entities the step reads
     writes: list[str] = field(default_factory=list)    # schema entities the step writes
     calls: list[str] = field(default_factory=list)     # steps in other trees it calls: "api [api.1.1]"
+    rule_texts: list[str] = field(default_factory=list)  # "<name>: <text>" of each named rule the step cites
+    legacy_ok: bool = True   # a tag in the hash before v0.6.8 still holds: none of the rules it cites changed since approval
 
     @property
     def is_leaf(self) -> bool:
@@ -110,9 +112,24 @@ class Node:
 
     @property
     def hash(self) -> str:
-        """What the code is generated from (tags carry it). `calls:` lines are left out: declaring that a
-        step calls another tree changes what a person reviews, not what the code must do."""
+        """What the code is generated from (tags carry it): the step's text and the text of every named rule it
+        cites, so code generated under another version of a rule is stale (round 13: a rule changed, was regenerated
+        and changed back; the code kept the changed value and nothing said so). `calls:` lines are left out:
+        declaring that a step calls another tree changes what a person reviews, not what the code must do."""
+        text = self.own_text(with_calls=False)
+        if self.rule_texts:
+            text += "\n" + "\n".join("rule " + r for r in self.rule_texts)
+        return hashlib.sha1(text.encode()).hexdigest()[:6]
+
+    @property
+    def legacy_hash(self) -> str:
+        """The hash before v0.6.8 (the step's text only)."""
         return hashlib.sha1(self.own_text(with_calls=False).encode()).hexdigest()[:6]
+
+    def tag_matches(self, h: str) -> bool:
+        """Whether a tag (or an approved hash) still describes this step. A hash written before v0.6.8 holds while
+        the rules the step cites are as approved."""
+        return h == self.hash or (bool(self.rule_texts) and self.legacy_ok and h == self.legacy_hash)
 
     @property
     def review_hash(self) -> str:
@@ -233,6 +250,9 @@ def parse_tree(path: Path) -> Tree:
             current.steps.append(m.group(1))
         else:
             raise SystemExit(f"{path}:{i}: not a step, contract line, 'uses:' or '>' line: {raw.strip()}")
+    for n in nodes.values():
+        n.rule_texts = [f"{k}: {' '.join(v.split())}" for k, v in sorted(nodes.rules.items())
+                        if re.search(r"\brule\s+" + re.escape(k) + r"\b", n.own_text(), re.I)]
     return nodes
 
 
@@ -477,6 +497,9 @@ def load_project(pj: Path):
     tree = parse_tree(root / cfg["tree"])
     lock_path = root / "ladder.lock.json"
     lock = json.loads(lock_path.read_text()) if lock_path.exists() else {}
+    changed = set(changed_rules(tree, lock))
+    for n in tree.values():
+        n.legacy_ok = not any(r.split(":", 1)[0] in changed for r in n.rule_texts)
     return cfg, root, tree, lock, lock_path
 
 
@@ -675,7 +698,8 @@ def changed_rules(tree, lock: dict) -> list[str]:
 def rule_in_support_warnings(root: Path, cfg: dict, tree, lock: dict | None = None) -> list[dict]:
     """A value a named rule states (a number, a quoted text) written in a @support region of a build that implements
     steps citing the rule: regeneration never rewrites support code, so a change to the rule cannot reach it (round 11:
-    the 5000-character limit lived in support constants in both apps)."""
+    the 5000-character limit lived in support constants in both apps). Also (`rule-uncited`) such a value in the code
+    of a step that does not cite the rule (round 13: two of three parsers held the weight limit without citing it)."""
     out = []
     was = (lock or {}).get("@data", {})
     for name, text in getattr(tree, "rules", {}).items():
@@ -693,6 +717,25 @@ def rule_in_support_warnings(root: Path, cfg: dict, tree, lock: dict | None = No
                     continue
                 regions, _, lines, _ = parse_regions(root / f, b["lang"])
                 for i, r in enumerate(regions):
+                    if r.kind == "node":
+                        # Round 13: a rule's value written in a step that does not cite the rule; a change to the
+                        # rule regenerates the steps that cite it and leaves this one with the old value, silently.
+                        ids = [t for t, _ in r.tags if t in tree]
+                        if not ids or any(t in users for t in ids):
+                            continue
+                        cm = COMMENT[b["lang"]]
+                        own = "\n".join(l for l in region_own_code(regions, lines, i)
+                                        if not l.lstrip().startswith((cm, "/*", "*", '"""')))
+                        hit = sorted(v for v in values if re.search(r"(?<![\w.])" + re.escape(v) + r"(?![\w.])", own))
+                        if hit:
+                            out.append(dict(kind="rule-uncited", node=name,
+                                            msg=f"rule {name}'s value {', '.join(hit)} is written in the code of "
+                                                f"[{', '.join(ids)}] ({f}, line {r.start}), which does not cite the rule: "
+                                                f"a change to the rule regenerates {', '.join(users[:3])} and leaves "
+                                                f"this code with the old value. If the step follows the rule, say so "
+                                                f"in its English (\"(rule {name})\"); if the value is a coincidence, "
+                                                f"ignore this"))
+                        continue
                     if r.kind != "support":
                         continue
                     cm = COMMENT[b["lang"]]
@@ -770,7 +813,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
             continue
         if was.get("review_hash", was["hash"]) != (n.review_hash if "review_hash" in was else n.hash):
             report["tree"].append(dict(kind="edited", node=n.id, msg="edited since last approval"))
-        if n.parent and was.get("parent_hash") != tree[n.parent].hash:
+        if n.parent and not tree[n.parent].tag_matches(was.get("parent_hash") or ""):
             report["tree"].append(dict(kind="parent-changed", node=n.id,
                                        msg=f"parent [{n.parent}] changed; re-check that this step still fits it"))
     vocab = load_vocabulary(cfg, root)
@@ -960,7 +1003,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                                                           "this file, name it in the build's \"shared_with\"")))
                         continue
                     covered[nid].append(f"{f}:{r.start}")
-                    if h != tree[nid].hash:
+                    if not tree[nid].tag_matches(h):
                         br["problems"].append(dict(kind="stale", file=f, line=r.start, node=nid,
                                                    msg=f"generated from an older [{nid}] (tag {h}, tree now {tree[nid].hash}); regenerate this region, "
                                                        f"or, if the English was only reworded, `ladder retag <ladder.json> {nid}`"))
@@ -1354,12 +1397,18 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
             if b.get("traces") and b.get("traces") == ref_b.get("traces", ref):
                 continue   # shares the reference's traces (one harness for several per-file builds)
             path = root / "traces" / b.get("traces", b["name"]) / f"{run}.jsonl"
-            if not path.exists() or not ref_ex:
-                entry["builds"].append(dict(build=b["name"], ok=False, missing=True, rows=[],
-                                            not_comparable=[]))
-                continue
+            # Only step results ("ev": "exit") are compared; a harness logging other events gets told so (round 13).
+            why = ("no trace for this run" if not path.exists() else
+                   f"nothing compared: the reference's trace has no step results (lines with \"ev\": \"exit\"; "
+                   f"other events are not read)" if not ref_ex else None)
             order: list[str] = []
-            ex = trace_exits(path, order)
+            ex = trace_exits(path, order) if not why else {}
+            if not why and not ex:
+                why = "nothing compared: this trace has no step results (lines with \"ev\": \"exit\"; other events are not read)"
+            if why:
+                entry["builds"].append(dict(build=b["name"], ok=False, missing=True, rows=[],
+                                            not_comparable=[], why=why))
+                continue
             pats = ref_patterns + [p for p in recorded_mask_text(path.parent) if p not in ref_patterns]
             if pats:
                 ref_ex_b = {st: [apply_mask_text(v, pats) for v in vs] for st, vs in ref_ex.items()}
@@ -1513,7 +1562,7 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
             continue
         for b in run["builds"]:
             if b["missing"]:
-                print(f"  {b['build']:<20} no trace for this run")
+                print(f"  {b['build']:<20} {b.get('why', 'no trace for this run')}")
                 continue
             if compact and all(r["status"] == "same" for r in b["rows"]):
                 continue
@@ -1581,7 +1630,19 @@ def print_report(rep: dict, tree: dict[str, Node]) -> None:
         print("note: no comparison runs are configured (compare.runs), so behavior was not checked")
 
 
-def stamp(pj: Path) -> None:
+def stamp(pj: Path, force: bool = False) -> int:
+    """Approve the English and record the code. Refused while a region is stale: approving would record the English
+    as describing code generated from another version of it (round 13: a reworded step was stamped and its region
+    stayed stale). Regenerate those regions, or `ladder retag` them when the English was only reworded."""
+    if not force:
+        stale = [p for b in check(pj)["builds"] for p in b.get("problems", []) if p.get("kind") in ("stale", "stale-contract")]
+        if stale:
+            print("not stamped: the code of these regions was generated from another version of the English:")
+            for p in stale:
+                print(f"  {p['kind']:<15} {p.get('file', '')}:{p.get('line', '')}  {p['msg']}")
+            print("regenerate them, or `ladder retag <ladder.json> <ids>` if the English was only reworded "
+                  "(`ladder stamp --force` stamps anyway)")
+            return 1
     cfg, root, tree, _, lock_path = load_project(pj)
     lock = {n.id: {"hash": n.hash, "review_hash": n.review_hash, "parent_hash": tree[n.parent].hash if n.parent else None,
                    "text": n.own_text(), "compare": n.compare}
@@ -1607,6 +1668,7 @@ def stamp(pj: Path) -> None:
     n = record_code(root, cfg)
     record_exports(root, cfg)
     print(f"recorded the approved code of every region -> {root / CODE_FILE}" + (f" ({n} regions new or changed)" if n else ""))
+    return 0
 
 
 # ---------------------------------------------------------------- hand edits
@@ -1930,7 +1992,7 @@ def retag(pj: Path, args: list[str]) -> int:
                 toks = []
                 for tok in m.group(2).split():
                     nid, _, h = tok.partition("@")
-                    if nid in ids and nid in tree and h != tree[nid].hash:
+                    if nid in ids and nid in tree and not tree[nid].tag_matches(h):
                         tok = f"{nid}@{tree[nid].hash}"
                         changed = True
                         n += 1
@@ -2162,6 +2224,9 @@ def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, roun
 
 
 def main(argv: list[str]) -> int:
+    if "--help" in argv[1:] or "-h" in argv[1:]:
+        print(__doc__)
+        return 0
     if len(argv) >= 3 and argv[1] in {"adopt-check", "replay", "init", "export", "tag"}:
         import ladder_extra as X
         return {"adopt-check": X.adopt_check, "replay": X.replay, "init": X.init, "export": X.export,
@@ -2250,8 +2315,7 @@ def main(argv: list[str]) -> int:
             print(f"contract hash (for @contract regions): {contract_hash(tree)}")
         return 0
     if cmd == "stamp":
-        stamp(pj)
-        return 0
+        return stamp(pj, force="--force" in argv[3:])
     build_view(pj, Path(argv[3]) if len(argv) > 3 else pj.parent / "viewer.html")
     return 0
 
