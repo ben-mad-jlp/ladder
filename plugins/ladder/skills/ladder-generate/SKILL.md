@@ -77,9 +77,12 @@ source file in its prompt, so it calls what exists; `check` warns `binding-not-c
 calls none of a binding's calls (round 9: `storageService.getItem` for `storageService.get`, then a
 repair that imported the storage library directly).
 
-**New steps in an approved tree.** `ladder regen --build=<name> --blind --redo=<new step ids>` rewrites
-only those steps' regions, so their neighbours' approved code stays. Without `--redo`, a blind run
-rewrites every region of the build.
+**New steps in an approved tree.** `ladder regen --build=<name> --blind --redo=<changed and new step ids>`
+first writes each new step (one with no code yet, top-level ones included) after the step before it,
+then rewrites only the named steps' regions, so their neighbours' approved code stays. Name the steps
+that call the new one too (`--redo=unps.3,unps.5`): they are rewritten after it exists, so they call
+what it is named. Without `--redo`, a blind run rewrites every region of the build. Add `--repair=3` to
+build and repair in the same run.
 
 `regen` exits 1 if any region's reply was rejected (that region keeps its old code; the reason is
 printed and the prompt and reply are logged), 0 otherwise. `generate` writes only the steps in the

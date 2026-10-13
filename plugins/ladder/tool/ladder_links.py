@@ -565,7 +565,7 @@ def run_tests(pj: Path, only: list[str] | None = None) -> int:
     cfg, root, tree, _, _ = L.load_project(pj)
     tests = all_tests(cfg, root, tree)
     if only:
-        tests = [t for t in tests if any(o in t["key"] for o in only)]
+        tests = [t for t in tests if any(o in t["key"] or o in t["what"] for o in only)]   # the name it prints too
     if not tests:
         print("no tests declared (capability `test:` lines, \"test\" on a links entry, or the project's \"tests\")")
         return 0

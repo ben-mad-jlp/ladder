@@ -178,5 +178,50 @@ class Tag(unittest.TestCase):
             self.assertEqual((root / "Svc.cs").read_text(), svc)
 
 
+class NewTopLevelStep(unittest.TestCase):
+    def test_a_new_top_level_step_is_found_missing_and_gets_an_insert_prompt(self):
+        tree_text = TREE.replace("  > saves it", "  > checks it ([o.3]), then saves it") + \
+            "\n[o.3] Check an order\n  in: Order\n  out: nothing\n  > checks it\n"
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            svc = "// @node o.2@000000\nvoid Save() {}\n// @end\n"
+            pj = project(root, GOOD_ORDER, GOOD_LINE, svc, "// @node o.1@000000\nx();\n// @end\n")
+            (root / "o.ladder").write_text(tree_text)
+            cfg = json.loads(pj.read_text())
+            cfg["builds"][1]["steps"] = ["o.2", "o.3"]
+            pj.write_text(json.dumps(cfg))
+            cfg, root, tree, *_ = L.load_project(pj)
+            R.set_context(cfg, root, tree)
+            b = cfg["builds"][1]
+            self.assertEqual(R.find_missing(b, root, tree), ["o.3"])
+            lines = (root / "Svc.cs").read_text().splitlines()
+            prompt = R.insert_prompt(b, "Svc.cs", lines, 3, tree["o.3"], tree["o.2"], tree, None)
+            self.assertIn("This build's top-level steps, in order:", prompt)
+            self.assertIn("[o.3] Check an order   <- NEW", prompt)
+            self.assertIn("Steps whose English uses it: [o.2]", prompt)
+
+
+class ReferenceRetire(unittest.TestCase):
+    def test_retire_moves_old_recordings_to_history_and_drops_their_builds(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import sample
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            builds = [{"name": "code", "lang": "typescript", "files": ["code.ts"], "traces": "original"},
+                      {"name": "original", "lang": "typescript", "tagged": False, "files": ["code.ts"]},
+                      {"name": "new", "lang": "typescript", "tagged": False, "files": ["code.ts"]},
+                      {"name": "old-scratch", "lang": "typescript", "tagged": False, "files": ["code.ts"]}]
+            pj = sample.make(root, builds=builds, compare={"reference": "original", "runs": ["*"]})
+            for f, v in (("original", 1), ("new", 2), ("old-scratch", 1)):
+                sample.trace(root, f, "r1", {"s.1": v})
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(L.make_reference(pj, "new", ["old-scratch"]), 0)
+            names = [b["name"] for b in json.loads(pj.read_text())["builds"]]
+            self.assertNotIn("old-scratch", names)
+            self.assertFalse((root / "traces" / "old-scratch").exists())
+            hist = sorted(p.name.rsplit("-", 2)[0] for p in (root / "traces" / "history").iterdir())
+            self.assertEqual(hist, ["old-scratch", "original"])
+
+
 if __name__ == "__main__":
     unittest.main()

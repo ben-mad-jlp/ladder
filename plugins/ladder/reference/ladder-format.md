@@ -501,15 +501,19 @@ ladder hashes <ladder.json>                           current hash of every step
 ladder export <ladder.json> [out.json]                the parsed tree as JSON
 ladder adopt-check <ladder.json> [--base REF]         transcription changed nothing but comments
 ladder generate <ladder.json> --build=NAME [--out=F]  write a build's file from the English (--out: elsewhere)
-ladder regen <ladder.json> [--build=NAME] [--redo=IDS] [--dry-run]
+ladder regen <ladder.json> [--build=NAME] [--redo=IDS] [--dry-run] [--repair=N]
                                                       regenerate stale/new regions (contract first);
-                                                      exit 1 if any reply was rejected
+                                                      exit 1 if any reply was rejected; --repair=N: then
+                                                      run check_command and repair, at most N rounds
+ladder tag <ladder.json> <regions.json> [--base REF]  write a transcription's markers from line ranges
 ladder repair <ladder.json> <errors.txt> --build=NAME regenerate the regions errors point at
 ladder accept <ladder.json> [--build=NAME] [IDS]      accept hand edits (the English still describes them);
                                                       --from=SCRATCH: regions copied from a scratch copy that
                                                       are exactly what it generated (copy the files first)
 ladder retag <ladder.json> IDS [--build=NAME]         English reworded, behavior unchanged: update markers only
 ladder reference <ladder.json> --from=BUILD          an approved change: BUILD's recording becomes the reference
+              [--retire=A,B]                          (recordings of the old code that cannot be made again
+                                                      move to traces/history/ and leave the builds)
 ladder schema <ladder.json> [ENTITY]                  the database schema the English can refer to
               (generate, regen and repair take --discard-hand-edits to overwrite them anyway)
 ladder replay <scenarios> --base URL --out traces/<build> [--mask a,b:presence,c:time] [--header "K: V"]
@@ -518,8 +522,9 @@ ladder replay <scenarios> --base URL --out traces/<build> [--mask a,b:presence,c
 ladder regen <ladder.json> --build=NAME --blind       rewrite a build's regions from the English alone,
                                                       old code hidden, @support kept (use a scratch copy);
                                                       innermost regions first, then each parent's own lines;
-                                                      with --redo=IDS only the regions of those steps (new
-                                                      steps added to an approved tree)
+                                                      with --redo=IDS only the regions of those steps, after
+                                                      writing the new steps among them (a change to an
+                                                      approved tree)
 ladder stamp <ladder.json>                            approve the English as it is now
 ladder view <ladder.json> [out.html]                  side-by-side viewer
 ```

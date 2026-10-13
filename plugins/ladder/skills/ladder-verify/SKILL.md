@@ -52,7 +52,10 @@ English. Put files in `scenarios/` and list their names in ladder.json `compare.
 - The slice's own tests (the existing unit tests for those files, and behaviour tests you write for the
   states the English describes) go in ladder.json `"tests"`, so `ladder test` runs and records them and
   `check` sees when the code changed after they ran. A generated build that compiles can still use the
-  wrong library or answer `undefined` for `null`; in the trials only these tests caught it.
+  wrong library or answer `undefined` for `null`; in the trials only these tests caught it. Include the
+  repository's own guards on what the slice touches: a committed API contract (OpenAPI) snapshot, generated
+  client types. In round 10 a change made through the English four rounds earlier had altered an API type
+  without updating the committed contract, and nothing in Ladder noticed.
 
 ## 3. Record traces
 
@@ -134,7 +137,7 @@ waiting for a person's approval. For each difference, decide which kind it is, b
 | Difference | Fix |
 |---|---|
 | Generated code doesn't do what the English says | `ladder repair` or regenerate (ladder-generate) |
-| The intended change (the English was changed and stamped) | record the approved code as a build, then `ladder reference <ladder.json> --from=<build>`; the old reference moves to `traces/history/` |
+| The intended change (the English was changed and stamped) | record the approved code as a build, then `ladder reference <ladder.json> --from=<build>`; the old reference moves to `traces/history/`. Re-record the other builds from the approved code (`original-2`); retire recordings whose code is gone (an earlier scratch copy) with `--retire=A,B` |
 | The English allows both behaviors | tighten the English (ladder-write), then regenerate |
 | The reference itself is surprising | a `note: QUESTION:` for the person; don't copy or fix silently |
 | Library or environment difference (versions, decoder, collation) | pin it or record it in the vocabulary (`known:`); set `number_tolerance` only for real numeric noise |

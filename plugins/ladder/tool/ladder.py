@@ -42,10 +42,11 @@ Commands
   ladder retag  <project.json> <STEP IDS> [--build=NAME]
                                    the English was reworded without changing behavior: update the
                                    markers' hashes instead of regenerating (a person's call)
-  ladder reference <project.json> --from=BUILD
+  ladder reference <project.json> --from=BUILD [--retire=A,B]
                                    an approved change of behaviour: BUILD's recording (made from the
                                    approved code) becomes the comparison's reference; the old reference
-                                   traces move to traces/history/
+                                   traces move to traces/history/; --retire=A,B moves builds recorded
+                                   from the old code that cannot be recorded again to history too
   ladder accept <project.json> [--build=NAME] [STEP IDS] [--exports] [--from=SCRATCH/ladder.json]
                                    accept hand edits to regions: the English still describes them
                                    (regen and repair refuse to overwrite hand-edited regions unless
@@ -1881,9 +1882,11 @@ def build_view(pj: Path, out: Path) -> None:
     print(f"viewer -> {out}")
 
 
-def make_reference(pj: Path, src: str) -> int:
+def make_reference(pj: Path, src: str | None, retire: list[str] | None = None) -> int:
     """After a reviewed, intended change of behaviour: the recording of build `src` (made from the approved code)
-    becomes the comparison's reference. The old reference traces move to traces/history/, so nothing is lost."""
+    becomes the comparison's reference. The old reference traces move to traces/history/, so nothing is lost.
+    `retire`: builds recorded from the old code that cannot be recorded again (an earlier scratch copy): their traces
+    move to traces/history/ too and they leave ladder.json's builds."""
     import shutil
     from datetime import datetime
     cfg, root = json.loads(pj.read_text()), pj.parent
@@ -1891,6 +1894,23 @@ def make_reference(pj: Path, src: str) -> int:
     if not c.get("reference"):
         raise SystemExit("ladder reference: this project has no compare.reference")
     folder = {b["name"]: b.get("traces", b["name"]) for b in cfg.get("builds", [])}
+    if retire:
+        stamp_ = f"{datetime.now():%Y%m%d-%H%M%S}"
+        for name in retire:
+            if name not in folder or name in (c["reference"], src):
+                raise SystemExit(f"ladder reference: cannot retire '{name}' (not a build, or the reference)")
+            d = root / "traces" / folder[name]
+            if d.exists() and not any(b.get("traces", b["name"]) == folder[name]
+                                      for b in cfg["builds"] if b["name"] not in retire):
+                dest = root / "traces" / "history" / f"{d.name}-{stamp_}"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(d), str(dest))
+                print(f"moved   traces/{d.name} -> {dest.relative_to(root)}")
+        cfg["builds"] = [b for b in cfg["builds"] if b["name"] not in retire]
+        pj.write_text(json.dumps(cfg, indent=2) + "\n")
+        print(f"retired {', '.join(retire)} (removed from ladder.json builds)")
+        if not src:
+            return 0
     if src not in folder:
         raise SystemExit(f"ladder reference: no build '{src}' (builds: {', '.join(folder)})")
     ref_dir, src_dir = root / "traces" / folder.get(c["reference"], c["reference"]), root / "traces" / folder[src]
@@ -1905,7 +1925,8 @@ def make_reference(pj: Path, src: str) -> int:
         print(f"moved   traces/{ref_dir.name} -> {dest.relative_to(root)}")
     shutil.copytree(src_dir, ref_dir)
     print(f"copied  traces/{src_dir.name} -> traces/{ref_dir.name} (the reference now)")
-    print("Other builds are now compared with this run: re-record any whose recording came from the old code.")
+    print("Other builds are now compared with this run: re-record any whose recording came from the old code, or, when\n"
+          "that code is gone (an earlier scratch copy), retire them: `ladder reference <ladder.json> --retire=A,B`.")
     return 0
 
 
@@ -1962,9 +1983,10 @@ def main(argv: list[str]) -> int:
         return K.run_tests(Path(argv[2]), [a for a in argv[3:] if not a.startswith("--")] or None)
     if len(argv) >= 3 and argv[1] == "reference":
         src = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--from=")), None)
-        if not src:
-            raise SystemExit("usage: ladder reference <ladder.json> --from=BUILD")
-        return make_reference(Path(argv[2]), src)
+        retire = next((a.split("=", 1)[1].split(",") for a in argv[3:] if a.startswith("--retire=")), None)
+        if not src and not retire:
+            raise SystemExit("usage: ladder reference <ladder.json> --from=BUILD [--retire=A,B]")
+        return make_reference(Path(argv[2]), src, retire)
     if len(argv) >= 3 and argv[1] == "retag":
         return retag(Path(argv[2]), argv[3:])
     if len(argv) >= 3 and argv[1] in {"generate", "repair", "regen"}:
