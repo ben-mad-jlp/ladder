@@ -686,8 +686,16 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
         warnings.append(dict(kind="untested-project", node="tests",
                              msg="no \"tests\" in ladder.json: nothing records that this code passes the slice's own "
                                  "tests; add {\"name\": ..., \"command\": ...} for each (run from check_cwd)"))
+    cwd = root / cfg.get("check_cwd", ".")
     for t in tests:
         r = results.get(t["key"])
+        gone = missing_files(t["cmd"], cwd)
+        if gone:
+            # A test line copied from another area may name a harness that is not here (pilot): say so, not "never run".
+            warnings.append(dict(kind="test-missing", node=t["key"],
+                                 msg=f"`{t['cmd']}` names {', '.join(gone)}, which does not exist (from {cwd}); "
+                                     f"fix the path, or write that test for this project"))
+            continue
         if r is None:
             warnings.append(dict(kind="test-not-run", node=t["key"], msg=f"never run; `ladder test` runs `{t['cmd']}`"))
         elif r.get("hash") != t["hash"]:
@@ -718,6 +726,20 @@ def failure_lines(output: str, limit: int = 10) -> list[str]:
             seen.add(l)
             out.append(l)
     return out[:limit]
+
+
+TEST_FILE_RE = re.compile(r"^[\w./-]*/[\w.-]+\.(?:sh|ts|tsx|js|mjs|cjs|py|cs|json)$")
+
+
+def missing_files(cmd: str, cwd: Path) -> list[str]:
+    """Words of a test command that look like a file path (a folder and a file name with an extension) and do not
+    exist, read from the folder the command runs in."""
+    out = []
+    for word in cmd.split():
+        w = word.strip("'\"")
+        if TEST_FILE_RE.match(w) and not (cwd / w).exists():
+            out.append(w)
+    return out
 
 
 def run_tests(pj: Path, only: list[str] | None = None) -> int:

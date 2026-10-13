@@ -136,6 +136,12 @@ def tag(argv: list[str]) -> int:
             print(f"  {f}: not a file of any tagged build in {pj}")
             bad += 1
             continue
+        gen = L.generated_by(cfg, root, f)
+        if gen:
+            print(f"  {f}: another tool writes this file (\"generated\": {gen}); not tagged. Take it out of the build "
+                  f"(if Ladder's code feeds it, add the tool to after_generate)")
+            bad += 1
+            continue
         src = _git_original(root, f, ref)
         if src is None:
             print(f"  {f}: not in {ref}; tag a file that git knows (or pass --base)")

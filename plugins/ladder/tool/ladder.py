@@ -396,9 +396,49 @@ def parse_vocabulary(path: Path) -> dict[str, Capability]:
     return caps
 
 
+def _same_capability(a: Capability, b: Capability) -> bool:
+    return (a.inputs, a.outputs, a.bindings, a.known, a.checks, a.notes, a.tests, a.tables) == \
+        (b.inputs, b.outputs, b.bindings, b.known, b.checks, b.notes, b.tests, b.tables)
+
+
+def vocabulary_layers(cfg: dict, root: Path) -> list[tuple[str, dict[str, Capability]]]:
+    """The vocabulary files a project reads, in order: "vocabulary" (often the repository's shared one), then each of
+    "extra_vocabulary" (the area's own capabilities)."""
+    files = ([cfg["vocabulary"]] if cfg.get("vocabulary") else []) + list(cfg.get("extra_vocabulary") or [])
+    return [(f, parse_vocabulary(root / f)) for f in files]
+
+
 def load_vocabulary(cfg: dict, root: Path) -> dict[str, Capability] | None:
-    v = cfg.get("vocabulary")
-    return parse_vocabulary(root / v) if v else None
+    """Every capability the project may use. "extra_vocabulary" adds to "vocabulary" rather than replacing it (pilot:
+    four areas each copied the shared capabilities into their own file, and one changed a copy). A capability defined
+    again with different text is an error: change the shared one, or give the area's its own name."""
+    layers = vocabulary_layers(cfg, root)
+    if not layers:
+        return None
+    caps: dict[str, Capability] = {}
+    where: dict[str, str] = {}
+    for f, more in layers:
+        for name, c in more.items():
+            if name in caps and not _same_capability(caps[name], c):
+                raise SystemExit(f"{root / f}:{c.line}: capability '{name}' is also defined in {where[name]} and says "
+                                 f"something else: change it there (it is shared), or give this one its own name")
+            if name not in caps:
+                caps[name], where[name] = c, f
+    return caps
+
+
+def vocabulary_copy_warnings(cfg: dict, root: Path) -> list[dict]:
+    """Capabilities an extra vocabulary repeats word for word from an earlier file: copies to delete."""
+    out, seen = [], {}
+    for f, more in vocabulary_layers(cfg, root):
+        for name in more:
+            if name in seen:
+                out.append(dict(kind="vocabulary-copy", node=name,
+                                msg=f"'{name}' in {f} repeats {seen[name]} word for word; delete the copy (the project "
+                                    f"reads both files)"))
+            else:
+                seen[name] = f
+    return out
 
 
 # ---------------------------------------------------------------- code regions
@@ -542,6 +582,8 @@ def with_repo_defaults(raw: dict, root: Path) -> dict:
             raise SystemExit(f"{rdir / REPO_FILE}: defaults.{k} belongs in each project's ladder.json")
         if k in ("vocabulary", "check_cwd"):
             v = rebase(v)
+        elif k == "extra_vocabulary":
+            v = [rebase(x) for x in v]
         elif k == "schemas":
             v = {name: ({**s, "source": rebase(s["source"])} if isinstance(s, dict) and "source" in s else s)
                  for name, s in v.items()}
@@ -572,6 +614,26 @@ def read_config(pj: Path) -> dict:
     except ValueError as e:
         raise SystemExit(f"{pj}: {e}")
     return with_repo_defaults(raw, pj.parent)
+
+
+def generated_by(cfg: dict, root: Path, f: str) -> str | None:
+    """The "generated" glob that names file f (a build's path, relative to the project), if another tool writes it:
+    ladder.repo.json's globs are relative to it, a project's own relative to the project."""
+    target = (root / f).resolve()
+    found = find_repo(root)
+    pats = []
+    if found:
+        pats += [(found[1].resolve(), g) for g in found[0].get("generated") or []]
+    raw = cfg.get("generated") or []
+    pats += [(root.resolve(), g) for g in raw]
+    for base, g in pats:
+        try:
+            rel = target.relative_to(base).as_posix()
+        except ValueError:
+            continue
+        if fnmatch.fnmatchcase(rel, g):
+            return g
+    return None
 
 
 def repo_projects(repo: dict, rdir: Path) -> list[Path]:
@@ -705,6 +767,12 @@ def contract_hash(tree: dict[str, Node], build: dict | None = None) -> str:
 
 
 CONTRACT_DECL_RE = re.compile(r"\b(?:class|interface|record|struct|type|enum)\s+([A-Z][A-Za-z0-9_]*)\b")
+
+
+def rule_region_name(label: str) -> str | None:
+    """The rule a @contract region holds the code of (`@contract rule <name>`), or None."""
+    bare = label.replace("contract ", "", 1)
+    return bare[5:].strip() if bare.startswith("rule ") else None
 
 
 def region_contract_hash(tree, build: dict | None, code: list[str], label: str = "") -> str:
@@ -1143,16 +1211,29 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                 br["problems"].append(dict(kind="missing-file", file=f, line=0,
                                            msg="file not found (generate it with `ladder generate`, or fix the path in ladder.json)"))
                 continue
+            gen = generated_by(cfg, root, f)
+            if gen:
+                br["problems"].append(dict(kind="generated-file", file=f, line=0,
+                                           msg=f"another tool writes this file (\"generated\": {gen}): its markers are lost "
+                                               f"the next time it runs, and that tool's own check sees a changed file. Take it "
+                                               f"out of the build; if Ladder's code feeds it, add the tool to after_generate"))
+                continue
             regions, _, flines, probs = parse_regions(fpath, b["lang"])
             br["problems"] += group_untagged(probs)
             for r in regions:
                 if r.kind == "contract":
                     h = r.tags[0][1] if r.tags else ""
-                    has_contract = True
+                    # A named rule's region (@contract rule ...) spells out no data block (pilot: it hid a build's
+                    # missing data contract).
+                    has_contract = has_contract or rule_region_name(r.label) is None
                     own = region_own_code(regions, flines, regions.index(r))
                     if not contract_region_ok(tree, b, h, own, r.label):
+                        now_h = region_contract_hash(tree, b, own, r.label)
+                        what = (f"the code of rule {rule_region_name(r.label)} was generated from an older wording of "
+                                f"the rule" if rule_region_name(r.label) else
+                                "contract types were generated from older in:/out: lines or data blocks")
                         br["problems"].append(dict(kind="stale-contract", file=f, line=r.start,
-                                                   msg=f"contract types were generated from older in:/out: lines or data blocks (tag {h}, now {region_contract_hash(tree, b, own, r.label)}); regenerate this region"))
+                                                   msg=f"{what} (tag {h}, now {now_h}); regenerate this region"))
                     # A region whose label names data blocks must declare those, and no block another region's label
                     # names: blind generation once wrote three DTOs into one file and repair then emptied the right one.
                     named = label_blocks(tree, b, r.label)
@@ -1291,6 +1372,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                         f"names), or tag it as @support if no step owns it"))
         report["builds"].append(br)
     report["warnings"] += rule_in_support_warnings(root, cfg, tree, lock)
+    report["warnings"] += vocabulary_copy_warnings(cfg, root)
     for b in cfg.get("builds", []):
         report["warnings"] += exported_type_warnings(root, b)
     report["compare"] = compare_runs(root, cfg, tree)
@@ -2531,6 +2613,9 @@ def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, roun
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[1] in ("--version", "-V", "version"):
+        print(json.loads((Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json").read_text())["version"])
+        return 0
     if "--help" in argv[1:] or "-h" in argv[1:]:
         print(__doc__)
         return 0
