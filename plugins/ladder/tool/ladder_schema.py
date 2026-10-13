@@ -9,7 +9,7 @@ In the English:
   reads: Employee, Division          writes: qbs:Employee
   > employees whose [[Employee.TerminatedOn]] is empty, ordered by [[Employee.LastName]]
 
-A reference names an entity (its class name or its table name) and optionally a property or
+A reference names an entity (its class name first, else its table name) and optionally a property or
 navigation; a prefix (`qbs:`) picks the schema when the name exists in more than one.
 """
 from __future__ import annotations
@@ -296,11 +296,18 @@ def resolve(ref: Ref, schemas: dict[str, dict[str, Entity]]):
     pools = {ref.schema: schemas.get(ref.schema, {})} if ref.schema else schemas
     if ref.schema and ref.schema not in schemas:
         return None, None, None, f"{ref.text}: no schema named '{ref.schema}' (ladder.json has {', '.join(schemas) or 'none'})"
-    hits = []
-    for sname, ents in pools.items():
-        for e in ents.values():
-            if ref.entity in (e.name, e.table, e.table_name()):
-                hits.append((sname, e))
+    # An entity's own name wins over table names; a bare table name ("Saw") can belong to several entities
+    # (Station.Saw, Fabshop.Builder.Debug.Saw), and taking the first silently checked the wrong table (round 17).
+    hits = [(sname, e) for sname, ents in pools.items() for e in ents.values() if ref.entity == e.name]
+    if not hits:
+        hits = [(sname, e) for sname, ents in pools.items() for e in ents.values() if ref.entity == e.table_name()]
+    if not hits:
+        hits = [(sname, e) for sname, ents in pools.items() for e in ents.values() if ref.entity == e.table]
+        same_schema = [e for s, e in hits if s == (hits[0][0] if hits else None)]
+        if len(same_schema) > 1:
+            return None, None, None, (f"{ref.text}: the table name '{ref.entity}' belongs to "
+                                      f"{', '.join(sorted(e.name for e in same_schema))} ({', '.join(sorted(e.table_name() for e in same_schema))}); "
+                                      f"use the entity name")
     if not hits:
         names = sorted({e.name for ents in pools.values() for e in ents.values()})
         close = difflib.get_close_matches(ref.entity, names, n=3)

@@ -129,7 +129,9 @@ Steps refer to it two ways:
   > ordered by [[Employee_MainTable.LastName]], then [[Employee_MainTable.FirstName]]
 ```
 
-- `reads:` / `writes:` list the entities a step touches (class name or table name).
+- `reads:` / `writes:` list the entities a step touches (class name or table name). An entity's class name is matched first, then a table name with its schema (`Station.Saw`), then a bare table name;
+  a bare table name several entities share (`Saw` for `Station.Saw` and `Fabshop.Builder.Debug.Saw`) is reported as
+  ambiguous rather than resolved to the first (round 17).
 - `[[Entity.Member]]` marks an exact property or navigation inside a sentence. Use it where precision
   matters (filters, ordering, what is loaded), not on every word.
 - A `schema:` prefix is needed only when two schemas have an entity of that name.
