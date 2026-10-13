@@ -299,7 +299,9 @@ public async Task<ActionResult<PagedNotes>> List(int page = 1, int pageSize = 20
   a labelled region that declares no type, or declares a block another region's label names.
 - `@support <label>`: hand-written code no step owns (imports, hosting, glue).
 - `@end` closes the innermost region. Regions may nest, including a `@contract` region inside a `@node`
-  region when a type sits between a member and its doc comment.
+  region when a type sits between a member and its doc comment, and a `@node` region inside a `@contract` region (a
+  method a step owns inside a DTO class): regeneration then rewrites the type around the step's region and the step on
+  its own.
 - Code outside every region is an error (`untagged`). A region whose hash differs from the tree
   is `stale`. A leaf step with no region is `missing`.
 
@@ -361,7 +363,9 @@ one block marks only the regions that declare it. Label a region after its block
 name doesn't follow it. Data blocks no build lists describe types that live in
 `reads` files. `check_command` (with optional `check_cwd`) builds the code after `generate` writes a
 file, and the errors for that file go back to the generator once. `format_command` runs on every
-file `generate`, `regen` or `repair` changed. `after_generate` (optional) lists commands that rebuild files
+file `generate`, `regen` or `repair` changed. Prompts show the data blocks the steps name and every block those name in turn ("list of SkuProperty"). `regen
+--repair=N` stops at once when the build's errors are in files the build does not own, and says whose they are;
+an import in support code that the compiler reports unused is removed. `after_generate` (optional) lists commands that rebuild files
 derived from the code (an API's committed OpenAPI contract, client types generated from it); they run from
 `check_cwd` after `generate`, `regen` or `repair` changed code.
 `traces` (optional) names the trace folder a build's runs are in, when one harness covers several
@@ -420,7 +424,10 @@ because that would silently undo the edit. Resolve it one of three ways:
 `git diff` shows what the edit was. `stamp` also records each file's exported names; `check` reports
 names added or removed since (`exports-changed`) until a person runs `ladder accept --exports`. Before the first
 stamp, an adopted file is compared with its version at the project's `baseline` (else HEAD). Blind regeneration
-tells the generator the names each hidden region exports, so it keeps them. Commit `ladder.code.json` with the code, and run `ladder check`
+tells the generator the names each hidden region exports, and the declarations of its exported functions, so callers
+in other files keep compiling. `check` warns `exported-type-in-step` when an exported type is declared in a step's
+region and other files of its package use it: write it as a data block in a `@contract` region, or regeneration can
+rename its fields. Commit `ladder.code.json` with the code, and run `ladder check`
 in CI so a hand edit can't merge unnoticed.
 
 ## 9. Traces and comparison

@@ -115,6 +115,15 @@ def context_text(build: dict, ids: list[str] | None = None, conventions: bool = 
         for name, d in tree.data.items():
             if name not in shown and any(re.search(r"\b" + re.escape(name) + r"\b", t) for t in texts):
                 shown[name] = d
+        # and every block those blocks name ("list of SkuProperty"): round 12's service saw SkuHistory but not
+        # SkuProperty, guessed its field names, and three repairs never fixed it
+        grew = True
+        while grew:
+            grew = False
+            for name, d in tree.data.items():
+                if name not in shown and any(re.search(r"\b" + re.escape(name) + r"\b", x.text()) for x in list(shown.values())):
+                    shown[name] = d
+                    grew = True
         if shown:
             out += ["=== Data the English refers to:"]
         for k, d in shown.items():
@@ -391,7 +400,9 @@ def build_prompt(build: dict, file_rel: str, lines: list[str], r: L.Region,
     return "\n".join(parts)
 
 
-ADD_RE = re.compile(r"^@add-to-support\s+(.+?)\s*\n(.*?)\n@end-add\s*$", re.M | re.S)
+# (a reply may write them as comments, "// @add-to-support imports": round 12)
+ADD_RE = re.compile(r"^[ \t]*(?:(?://|#|--)[ \t]*)?@add-to-support\s+(.+?)\s*\n(.*?)\n[ \t]*(?:(?://|#|--)[ \t]*)?@end-add\s*$",
+                    re.M | re.S)
 
 
 def split_reply(text: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
@@ -677,6 +688,37 @@ def contract_prompt(build, file_rel, lines, r: L.Region, tree, conv: str) -> str
         f"and end with the line: {L.COMMENT[build['lang']]} @end"])
 
 
+def keep_nested(body: list[str], regions: list, lines: list[str], idx: int, lang: str) -> list[str] | None:
+    """A @contract region rewritten around step regions it holds (a DTO class with a method a step owns): put each
+    nested region back exactly as it was. The step is regenerated on its own; round 12's contract rewrite changed the
+    nested method, which then counted as a hand edit and its own regeneration was refused."""
+    nested = [rr for rr in regions if rr.parent == idx and rr.kind == "node"]
+    if not nested:
+        return body
+    c = re.escape(L.COMMENT[lang])
+    out, i = [], 0
+    for rr in nested:
+        ids = [t for t, _ in rr.tags]
+        start = next((k for k in range(i, len(body))
+                      if re.match(rf"^\s*{c}\s*@node\s+" + re.escape(ids[0]) + r"@", body[k])), None)
+        if start is None:
+            return None
+        depth, end = 0, None
+        for k in range(start, len(body)):
+            if re.match(rf"^\s*{c}\s*@(node|contract|support)\b", body[k]):
+                depth += 1
+            elif re.match(rf"^\s*{c}\s*@end\b", body[k]):
+                depth -= 1
+                if depth == 0:
+                    end = k
+                    break
+        if end is None:
+            return None
+        out += body[i:start] + lines[rr.start - 1:rr.end]
+        i = end + 1
+    return out + body[i:]
+
+
 def regen_contracts(b: dict, root: Path, tree, gen, log_dir) -> list:
     """Regenerate every stale @contract region of one build, before any step regions."""
     results = []
@@ -710,6 +752,10 @@ def regen_contracts(b: dict, root: Path, tree, gen, log_dir) -> list:
                 continue
             indent = lines[r.start - 1][: len(lines[r.start - 1]) - len(lines[r.start - 1].lstrip())]
             body = reindent(body, indent)
+            body = keep_nested(body, regions, lines, regions.index(r), b["lang"])
+            if body is None:
+                results.append((f, key, "REJECTED: the reply dropped or changed the step regions this contract region holds"))
+                continue
             new = lines[:r.start - 1] + body + lines[r.end:]
             tmp = fpath.with_name(fpath.name + ".regen-tmp")
             tmp.write_text("\n".join(new) + "\n")
@@ -785,11 +831,46 @@ def leaked_lines(conv: str, lines: list[str], regions: list, idxs) -> list[tuple
 def public_names_note(regions: list, lines: list[str], idx: int, lang: str) -> str:
     """The names a hidden region exports (its own lines), which other files import: a blind run must keep them.
     Round 11: two exported props interfaces came back unexported and the folder's index.ts no longer compiled."""
-    names = L.text_export_names("\n".join(L.region_own_code(regions, lines, idx)), lang)
+    own = L.region_own_code(regions, lines, idx)
+    names = L.text_export_names("\n".join(own), lang)
     if not names:
         return ""
-    return ("\n\n=== This region's public names (other files import them): " + ", ".join(names)
-            + ". Keep each one exported, with this name.")
+    # the declaration line of each exported function or constant: its signature is what callers in other files use
+    # (round 12: a dataset function came back taking three arguments where its caller passes one object)
+    sigs = [" ".join(l.split()) for l in own if re.match(r"^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|const)\b", l)
+            or re.match(r"^\s*public\s+(?:static\s+)?(?:async\s+)?[\w<>?,\s\[\]]+\s+\w+\s*\(", l)]
+    out = ("\n\n=== This region's public names (other files import them): " + ", ".join(names)
+           + ". Keep each one exported, with this name.")
+    if sigs:
+        out += " Keep these declarations as they are (callers depend on them): " + " | ".join(x[:200] for x in sigs)
+    return out
+
+
+def write_contract_around(b, f, fpath, lines, view, r, nest, tree, conv, gen, log_dir, key, dry_run):
+    """Blind: rewrite a @contract region's own lines (the type) around the step regions it holds, keeping them."""
+    want = lines[r.start - 1].split("@contract", 1)[1].strip().rpartition("@")[0]
+    marker = f"{L.COMMENT[b['lang']]} @contract {want}@{L.contract_hash(tree, b)}"
+    expect = nested_markers(nest, tree, b)
+    prompt = contract_prompt(b, f, view, r, tree, conv) + (
+        "\n\n=== BLIND REGENERATION: this region's own code (the type, outside its nested regions) is hidden on purpose; "
+        "write it from the English. The nested regions were just written from the English: keep them exactly as shown, "
+        "with their markers, in this order: " + " | ".join(expect))
+    tag = f"{b['name']}__blind-{key.replace(' ', '-')}"
+    (log_dir / f"{tag}.prompt.txt").write_text(SYSTEM + "\n\n" + prompt)
+    if dry_run:
+        return (f, key, "dry run: prompt written (own lines, around nested regions)")
+    reply = call_generator(gen + ["--system-prompt", SYSTEM], prompt, log_dir / "cwd")
+    (log_dir / f"{tag}.reply.txt").write_text(reply)
+    body, why = body_from_reply(reply, marker, b["lang"])
+    if body is None:
+        return (f, key, f"REJECTED: {why}")
+    got = [l.strip() for l in body[1:] if re.match(rf"^\s*{re.escape(L.COMMENT[b['lang']])}\s*@(node|contract)\b", l)]
+    if got != expect:
+        return (f, key, "REJECTED: nested region markers must be, in order: " + " | ".join(expect))
+    indent = lines[r.start - 1][: len(lines[r.start - 1]) - len(lines[r.start - 1].lstrip())]
+    new = lines[:r.start - 1] + reindent(body, indent) + lines[r.end:]
+    fpath.write_text("\n".join(new) + "\n")
+    return (f, key, f"written blind around its nested regions ({len(body)} lines)")
 
 
 def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_run: bool, skip: set | None = None) -> list:
@@ -813,15 +894,18 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
         has_child = {rr.parent for rr in regions if rr.parent is not None and rr.kind in ("node", "contract")}
 
         def todo_keys(regs, ks):
+            # a @contract region holding step regions (a DTO class with a method a step owns) is written like a
+            # parent: its nested regions first, then its own lines around them (round 12 crashed here)
             return [k for r, k, i in zip(regs, ks, range(len(regs)))
-                    if k and (r.kind == "contract" or (r.kind == "node" and i not in has_child
+                    if k and ((r.kind == "contract" and i not in has_child) or (r.kind == "node" and i not in has_child
                               and all(in_scope(b, t) for t, _ in r.tags)))]
         pending = todo_keys(regions, keys)
         # steps inserted in this run were just written from the English: not again
         pending = [k for k, r in zip(keys, regions) if k in pending and not (skip and r.tags
                    and all(t in skip for t, _ in r.tags))]
         parents = [k for r, k, i in zip(regions, keys, range(len(regions)))
-                   if k and r.kind == "node" and i in has_child and all(in_scope(b, t) for t, _ in r.tags)]
+                   if k and i in has_child and (r.kind == "contract" or (r.kind == "node"
+                                                and all(in_scope(b, t) for t, _ in r.tags)))]
         if asked:
             named = {k for r, k in zip(regions, keys) if k and r.kind == "node" and any(t in asked for t, _ in r.tags)}
             pending = [k for k in pending if k in named]
@@ -842,7 +926,10 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
             regions, _, lines, _ = L.parse_regions(fpath, b["lang"])
             keys = L.region_keys(regions)
             has_child = {rr.parent for rr in regions if rr.parent is not None and rr.kind in ("node", "contract")}
-            idx = next(i for i, k in enumerate(keys) if k == pending[0])
+            idx = next((i for i, k in enumerate(keys) if k == pending[0]), None)
+            if idx is None:
+                results.append((f, pending.pop(0), "REJECTED: region not found (an enclosing region's reply dropped it)"))
+                continue
             hide = {i for i, k in enumerate(keys) if k in pending}
             CTX["hidden_steps"] = {t for i in hide for t, _ in regions[i].tags}
             # parents' own lines (constructors, fields) are hidden too: they are rewritten last
@@ -879,6 +966,13 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
             else:
                 new, why = validate_and_splice(fpath, b["lang"], lines, r, clean_reply(reply), tree)
                 if new is None:
+                    # one more try, told what was wrong (as plain regen does)
+                    retry = prompt + f"\n\n=== Your previous reply was rejected: {why}\nFix that."
+                    (log_dir / f"{tag}.retry.prompt.txt").write_text(SYSTEM + "\n\n" + retry)
+                    reply = call_generator(gen + ["--system-prompt", SYSTEM], retry, log_dir / "cwd")
+                    (log_dir / f"{tag}.retry.reply.txt").write_text(reply)
+                    new, why = validate_and_splice(fpath, b["lang"], lines, r, clean_reply(reply), tree)
+                if new is None:
                     results.append((f, key, f"REJECTED: {why}"))
                     continue
             new, notes = apply_support_adds(new, b["lang"], split_reply(reply)[1])
@@ -897,6 +991,9 @@ def regen_blind(cfg: dict, root: Path, tree, lock, b: dict, gen, log_dir, dry_ru
             r = regions[idx]
             view = blinded_own(lines, regions, {keys.index(k) for k in [key] + parents if k in keys})
             nest = nested_regions(regions, idx)
+            if r.kind == "contract":
+                results.append(write_contract_around(b, f, fpath, lines, view, r, nest, tree, conv, gen, log_dir, key, dry_run))
+                continue
             REDO.update(t for t, _ in r.tags)
             prompt = build_prompt(b, f, view, r, tree, lock, None, nested=nest)
             prompt += public_names_note(regions, lines, idx, b["lang"])
@@ -1131,6 +1228,25 @@ SOURCE_EXTS = "py|cpp|cc|cxx|c|hpp|hh|h|cs|ts|tsx|mts|cts|js|jsx|mjs|cjs|java|kt
 ERR_LOC = re.compile(r"""([\w./\\-]+\.(?:""" + SOURCE_EXTS + r"""))(?:"?, line |[:(])(\d+)""")
 
 
+def remove_import_name(fpath: Path, ln: int, name: str) -> bool:
+    """Remove one name from a one-line import at line ln (the whole line when it was the only name)."""
+    lines = fpath.read_text().splitlines()
+    l = lines[ln - 1]
+    m = re.match(r"^(\s*import\s+(?:type\s+)?)\{([^}]*)\}(\s+from\s+.*)$", l)
+    if m:
+        names = [x.strip() for x in m.group(2).split(",") if x.strip()]
+        keep = [x for x in names if re.sub(r"^type\s+", "", x).split(" as ")[-1].strip() != name]
+        if len(keep) == len(names):
+            return False
+        lines[ln - 1] = f"{m.group(1)}{{ {', '.join(keep)} }}{m.group(3)}" if keep else None
+    elif re.match(rf"^\s*import\s+(?:type\s+)?{re.escape(name)}\s+from\s+", l):
+        lines[ln - 1] = None
+    else:
+        return False
+    fpath.write_text("\n".join(x for x in lines if x is not None) + "\n")
+    return True
+
+
 def repair(pj: Path, build_name: str, errors: str) -> int:
     """Map build/run errors to the regions they point at and regenerate those regions,
     with the error text in the prompt. Errors inside @support regions are reported, not touched."""
@@ -1163,6 +1279,13 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
                 while idx is not None and regions[idx].kind not in ("node", "contract"):
                     idx = regions[idx].parent
                 if idx is None:
+                    # An import in support code that regenerated code no longer uses (round 9's F12; round 12 it broke a
+                    # strict TypeScript build): drop just that name. Nothing else in support code is touched.
+                    unused = re.search(r"'([A-Za-z_$][\w$]*)' is declared but its value is never read", line)
+                    if unused and IMPORT_LIKE.match(lines[ln - 1]) and remove_import_name(fpath, ln, unused.group(1)):
+                        print(f"{build_name:<20} {f}:{ln}  removed the unused import {unused.group(1)} from support code")
+                        lines = fpath.read_text().splitlines()
+                        continue
                     print(f"{build_name:<20} {f}:{ln}  error in support code, not regenerated: {line.strip()[:100]}")
                     status = 1
                     continue

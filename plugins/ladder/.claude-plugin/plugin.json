@@ -1,7 +1,7 @@
 {
   "name": "ladder",
   "displayName": "Ladder",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "description": "Write software behavior in plain English and generate tagged, verifiable code from it. Skills to transcribe existing code into Ladder English and to write, generate and verify code from it.",
   "author": { "name": "Ben" },
   "keywords": ["ladder", "spec", "english", "code generation", "transcription", "verification"],
