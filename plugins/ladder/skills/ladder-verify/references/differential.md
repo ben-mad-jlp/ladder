@@ -40,6 +40,10 @@ Rules that keep it honest:
 - **Fake time, advanced in 1 ms ticks with a microtask flush after each tick.** Advancing 100 ms at
   once fires timers back to back without the microtasks between them, which hides ordering bugs.
 - **Log order, not just values.** Events, settlements and state in the order they happened.
+- **Log what callers observe, not the code's internal shapes.** When a framework consumes the result (a state machine
+  merging a transition's context, a store applying a patch), log the result as the framework reads it (`context ?? {}`),
+  or the state after it. In round 16 a transition answered `{nextState}` where the original answered
+  `{nextState, context: {}}`; the machine treats both the same, and only the harness told them apart.
 - **Messages verbatim**, errors as `name: message`.
 - **Weight the random choices** toward the behavior being verified (after an English change, call
   the changed method more often).
