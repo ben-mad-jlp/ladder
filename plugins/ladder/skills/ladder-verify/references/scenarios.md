@@ -55,6 +55,9 @@ first.
 
 ## Masking
 
+The service's own address (`http://127.0.0.1:5613` in a `Location` header or a link) is recorded as `<base>`,
+so two builds on two ports compare equal.
+
 Values the database or the clock decides (ids, timestamps, ETags) can differ between two correct
 builds. Mask them by key with `--mask id,createdUtc,updatedUtc`; masked values become `"<masked>"`
 everywhere in the body. Mask as little as possible: a masked field is no longer compared.

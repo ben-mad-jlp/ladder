@@ -97,6 +97,7 @@ def contract_text(tree: L.Tree, nid: str) -> str:
             lines.append(f"  {key}: {' '.join(val.split())}")
     for name, d in contract_data(tree, nid).items():
         lines.append(f"  data {name}")
+        # notes render as before (`Name.note: ...`), so contracts recorded by earlier stamps still match
         lines += [f"  {name}.{k}: {' '.join(v.split())}" for k, v in d.fields]
         lines += [f"  {name} rule: {' '.join(r.split())}" for r in d.rules]
     return "\n".join(lines)

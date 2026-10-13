@@ -124,8 +124,8 @@ def tag(argv: list[str]) -> int:
     if len(argv) < 2 or argv[0].startswith("--"):
         raise SystemExit("usage: ladder tag <ladder.json> <regions.json> [--base GIT_REF]")
     pj, spec_path = Path(argv[0]), Path(argv[1])
-    ref = opt(argv, "--base", default="HEAD")
     cfg, root, tree, *_ = L.load_project(pj)
+    ref = opt(argv, "--base", default=cfg.get("baseline") or "HEAD")
     spec = json.loads(spec_path.read_text())
     by_file = {f: b for b in cfg["builds"] if b.get("tagged") is not False for f in b["files"]}
     bad = 0
@@ -141,6 +141,14 @@ def tag(argv: list[str]) -> int:
             bad += 1
             continue
         nl = "\r\n" if "\r\n" in src else "\n"
+        mine = sorted({m.group(1) for m in re.finditer(r"@node\s+([\w.]+)@", src) if m.group(1) in tree})
+        if mine:
+            # Tagging a file that already carries this project's markers would add them twice (round 11: re-running
+            # with --base HEAD after the tags were committed).
+            print(f"  {f}: the file at {ref} already has regions for {', '.join(mine[:4])}; use the commit before this "
+                  f"project's tags as --base (or set \"baseline\" in ladder.json)")
+            bad += 1
+            continue
         lines = src.split(nl)
         trailing = lines[-1] == ""
         if trailing:
@@ -537,7 +545,10 @@ def replay(argv: list[str]) -> int:
                 if ob.returncode != 0:
                     raise SystemExit(f"replay: --observe command failed ({ob.returncode}): {ob.stderr.strip()[:200]}")
                 result["observed"] = ob.stdout.strip()
-            result = _mask_text(_mask(_mask_echoes(result, mask_f), mask_f, sent_at), text_f)
+            # The service's own address (a Location header, a link in a body) says where it ran, not how it behaved:
+            # two builds on two ports must compare equal (round 11).
+            here = [(re.compile(re.escape(base.rstrip("/"))), "<base>")]
+            result = _mask_text(_mask(_mask_echoes(result, mask_f), mask_f, sent_at), here + text_f)
             info = f"{raw_r['method']} {raw_r['path']}"
             events.append({"step": step, "ev": "enter", "ms": 0, "info": info})
             events.append({"step": step, "ev": "exit", "ms": 0, "info": f"{status}",
@@ -646,7 +657,8 @@ def export(argv: list[str]) -> int:
         "steps": [dict(id=n.id, title=n.title, parent=n.parent, children=n.children, depth=n.depth,
                        inputs=n.inputs, outputs=n.outputs, effects=n.effects, how=n.steps, notes=n.notes, compare=n.compare, reads=n.reads, writes=n.writes, calls=n.calls,
                        uses=n.uses, hash=n.hash, line=n.line) for n in tree.values()],
-        "data": [dict(name=d.name, fields=[dict(name=k, description=v) for k, v in d.fields], rules=d.rules)
+        "data": [dict(name=d.name, fields=[dict(name=k, description=v) for k, v in d.real_fields()], rules=d.rules,
+                      notes=[v for k, v in d.fields if k == "note"])
                  for d in tree.data.values()],
         "rules": tree.rules,
         "vocabulary": [dict(name=c.name, inputs=c.inputs, outputs=c.outputs, bindings=c.bindings,
