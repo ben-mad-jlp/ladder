@@ -88,7 +88,9 @@ build and repair in the same run.
 
 `regen` exits 1 if any region's reply was rejected (that region keeps its old code; the reason is
 printed and the prompt and reply are logged), 0 otherwise. `generate` writes only the steps in the
-build's `steps` scope, and gives the generator the build's `"reads"` files as read-only context.
+build's `steps` scope, and gives the generator the build's `"reads"` files as read-only context. Put in `reads` the files that declare the types the code uses, not only the modules it calls: a hook's file that imports its state type from elsewhere does not show the fields.
+
+**Repairs fix causes.** The repair prompt forbids silencing an error with a cast (`as unknown as`, `as any`), an ignore comment, `dynamic` or a null-forgiving `!`; `regen` also prints `WARNING: ... now has more type escapes than before` for every region that gained one. Read those regions: in round 15 a repair passed a wrongly named prop through a cast, the build was clean, and only a test showed the button could never be enabled.
 
 **Hand-edited regions.** If someone changed generated code by hand since it was generated or
 approved, `regen`, `repair` and `generate` print `REFUSED` for that region and leave it alone. Don't

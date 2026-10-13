@@ -85,7 +85,9 @@ rule tag name: 1 to 24 characters from a-z, 0-9 and dashes
   `check` lists the steps that cite it (`rule-changed`) and `regen` rewrites them. A value the rule states (a limit,
   a message) that the code keeps in a constant goes in a `@contract rule <name>@<hash>` region: its hash is the
   rule's text, so changing the rule makes it stale and `regen` rewrites it. `check` warns `rule-in-support` when such
-  a value sits in `@support` code, which no change to the rule can reach.
+  a value sits in `@support` code, which no change to the rule can reach. A rule several projects follow (a limit both
+  the API and an app enforce) is written in each tree with the same name and text; `check` warns `rule-diverged`
+  when they drift apart.
 - A step's tag hash covers the text of every rule the step cites, so code generated under another version of a rule
   is stale, also when the rule is changed back before anyone stamps (round 13). Tags written before v0.6.8 hold while
   the rules they cite are as approved. Cite the rule ("(rule weight range)") in **every** step whose code uses its
@@ -253,6 +255,11 @@ and ladder.json names the other project, optionally with a test that runs both s
 ```
 
 (`"links": {"api": "../api/ladder.json"}` without a test.) `check` resolves every `calls:` item.
+A link carries changes only through `calls:` lines. `check` warns `uncalled-reference` when a step's English names
+another tree's step (`[upl.2.1]`, outside its notes) without a `calls:` line for it, and `link-unused` when no step on
+either side calls across a link: in both cases a change on the other side is never reported (round 15). A named rule
+written in two linked projects (also through a project in between, an API and its scanner linked through the library)
+must say the same thing: `check` warns `rule-diverged` when the texts differ, as when a change was made in one tree only.
 `stamp` records the called step's contract: its `in:`, `out:` and `effects:` lines and the data
 blocks they name. When that contract changes, the calling step shows as `linked-changed` until it
 is re-read and approved, so a change to the API's answer reaches the client's review. A caller also

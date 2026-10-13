@@ -915,6 +915,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
     # Links to steps in other trees (calls:), and tests of claims that reading cannot check.
     import ladder_links as K
     lproblems, lapprovals, lwarn, _ = K.check_links(tree, cfg, root, lock, links_since)
+    lwarn = lwarn + K.link_shape_warnings(tree, cfg, root)
     report["tree"] += lproblems + lapprovals
     report["warnings"] += lwarn
     tproblems, twarn = K.check_tests(cfg, root, tree, load_code(root))
@@ -1359,6 +1360,14 @@ def reference_stale_warnings(root: Path, cfg: dict) -> list[dict]:
     was = meta.get("code")
     if not was:
         return []
+    saved = load_code(root)
+    for b in cfg.get("builds", []):
+        if b.get("tagged") is False:
+            continue
+        approved = saved.get(b["name"], {})
+        for f, regs in code_fingerprints(root, b).items():
+            if any(approved.get(f, {}).get(key) not in (None, fp) for key, (fp, _) in regs.items()):
+                return []   # not the approved code (a scratch copy's regeneration, or unapproved edits): nothing to say
     now = code_fingerprint(root, cfg)
     changed = sorted(f for f in set(was) | set(now) if was.get(f) != now.get(f))
     if not changed:
@@ -2012,6 +2021,50 @@ def hand_edited(root: Path, b: dict) -> list[tuple[str, str, int]]:
     return out
 
 
+TYPE_ESCAPES = {
+    "typescript": [r"\bas\s+unknown\s+as\b", r"\bas\s+any\b", r"@ts-(?:ignore|expect-error|nocheck)", r"eslint-disable"],
+    "javascript": [r"eslint-disable"],
+    "csharp": [r"\bdynamic\b", r"#pragma\s+warning\s+disable", r"\bnull!"],
+    "python": [r"#\s*type:\s*ignore", r"\bcast\(\s*Any\b"],
+}
+
+
+def region_texts(root: Path, cfg: dict) -> dict[tuple[str, str, str], str]:
+    """{(build, file, region key): the region's own lines, comments included} for every tagged region."""
+    out = {}
+    for b in cfg.get("builds", []):
+        if b.get("tagged") is False:
+            continue
+        for f in b.get("files", []):
+            path = root / f
+            if not path.exists():
+                continue
+            regions, owner, lines, _ = parse_regions(path, b["lang"])
+            for idx, key in enumerate(region_keys(regions)):
+                if key is not None:
+                    out[(b["name"], f, key)] = "\n".join(l for i, l in enumerate(lines) if owner[i] == idx)
+    return out
+
+
+def type_escape_warnings(root: Path, cfg: dict, before: dict) -> list[str]:
+    """Regions the generator or a repair changed that now hold more type escapes (casts through unknown/any, ignore
+    comments, dynamic) than before: a compiler error may have been silenced instead of fixed (round 15)."""
+    langs = {b["name"]: b.get("lang", "") for b in cfg.get("builds", [])}
+    out = []
+    for k, now in region_texts(root, cfg).items():
+        was = before.get(k)
+        if was is None or was == now:
+            continue
+        pats = TYPE_ESCAPES.get(langs.get(k[0], ""), [])
+        added = [p for p in pats if len(re.findall(p, now)) > len(re.findall(p, was))]
+        if added:
+            shown = ", ".join(re.sub(r"\\[bs]|\(\?:|\)|\+", "", p).replace("\\", "") for p in added)
+            out.append(f"WARNING: {k[1]} [{k[2]}] now has more type escapes than before ({shown}): a compiler error may "
+                       f"have been silenced instead of fixed; read it, and if a name was guessed, give the English or "
+                       f"the build's \"reads\" what it needed")
+    return out
+
+
 def snapshot(root: Path, cfg: dict) -> dict:
     return {b["name"]: code_fingerprints(root, b) for b in cfg["builds"] if b.get("tagged") is not False}
 
@@ -2335,6 +2388,7 @@ def main(argv: list[str]) -> int:
         R.OUT = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--out=")), None)
         build = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--build=")), None)
         before = snapshot(root, cfg)
+        texts_before = region_texts(root, cfg)
         if argv[1] == "generate":
             status = R.generate(pj, build)
         elif argv[1] == "repair":
@@ -2356,6 +2410,9 @@ def main(argv: list[str]) -> int:
         rounds = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--repair=")), None)
         if argv[1] == "regen" and rounds and "--dry-run" not in argv:
             status = max(status, repair_until_builds(pj, cfg, root, build, int(rounds)))
+        if "--dry-run" not in argv and not any(a.startswith("--out=") for a in argv):
+            for w in type_escape_warnings(root, cfg, texts_before):
+                print(w)
         if "--dry-run" not in argv and not any(a.startswith("--out=") for a in argv) and snapshot(root, cfg) != before:
             status = max(status, run_after_generate(cfg, root))
         return status

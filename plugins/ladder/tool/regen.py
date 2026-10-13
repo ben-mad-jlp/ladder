@@ -1247,6 +1247,13 @@ def remove_import_name(fpath: Path, ln: int, name: str) -> bool:
     return True
 
 
+REPAIR_RULE = ("Fix the cause of each error; never hide it. Do not add type assertions or casts (`as unknown as`, `as any`, a "
+               "cast to another shape), `@ts-ignore` / `@ts-expect-error`, `dynamic`, `#pragma warning disable` or a "
+               "null-forgiving `!` to make an error go away: an error that says a name does not exist means the code uses "
+               "the wrong name, so use the names in the declarations shown and in the English. (Round 15: a repair cast the "
+               "scale's state to a guessed shape and passed a wrongly named prop through a cast; it compiled and was wrong.)")
+
+
 def repair(pj: Path, build_name: str, errors: str) -> int:
     """Map build/run errors to the regions they point at and regenerate those regions,
     with the error text in the prompt. Errors inside @support regions are reported, not touched."""
@@ -1305,6 +1312,7 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
             regions, _, lines, _ = L.parse_regions(fpath, b["lang"])
             r = regions[idx]
             reason = "\n".join(dict.fromkeys(hits[idx] + [l.strip() for l in err_lines if l.strip() and not ERR_LOC.search(l)][-3:]))
+            reason = REPAIR_RULE + "\n" + reason
             tag = f"{build_name}__repair-{r.label.replace(' + ', '+').replace(' ', '-')}"
             if r.kind == "contract":
                 conv = conventions_text(b)

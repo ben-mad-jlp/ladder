@@ -184,6 +184,10 @@ other files import, are contracts too: data blocks in `@contract` regions (round
 prose and blind regeneration renamed them; the container and the story fixtures stopped compiling). Accessibility labels and roles
 are the same kind of contract (screen readers and tests find controls by them): list them in the step that renders.
 
+**A link needs `calls:` lines.** When a step uses another tree's step, write `calls: <project> [<id>]`, not just `[<id>]` in a sentence: only `calls:` carries the other tree's changes into this one's review (round 15: the scanner named the library's steps in prose and a change in the API never reached it; `check` now warns `uncalled-reference` and `link-unused`). A rule the layers share (a limit the API and the app both enforce) gets the same name and text in each tree; `check` warns `rule-diverged` when they differ.
+
+**Name the fields read from another module's state.** When a step reads a hook's or a store's state, write the field names (`currentWeight`, `isSettled`), and put the file that declares their type in the build's `reads` (the hook's own file may only import it). In round 15 the screen's English said "the scale's weight"; blind regeneration wrote `weight` and `isStable`, and the repair, without the type, cast the state to a guessed shape.
+
 **Cite a rule wherever its value is used.** A named rule reaches only the steps that say "(rule <name>)". In round 13
 three parsers checked the same weight limit and only one cited the rule; a change to the rule regenerated that one and
 left the other two with the old limit, while every check and test passed. `check` now warns `rule-uncited`, but write
