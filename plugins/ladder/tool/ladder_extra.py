@@ -699,18 +699,109 @@ def init(argv: list[str]) -> int:
     return 0
 
 
+def projects(argv: list[str]) -> int:
+    """`ladder projects [FOLDER]`: the Ladder projects in a repository, as JSON, for the Ladder Review app. The ones
+    ladder.repo.json lists ("projects") when there is one at or above FOLDER; otherwise every ladder.json below FOLDER
+    (the files git tracks there, or a walk that skips hidden folders and node_modules when FOLDER is not in git)."""
+    args = [a for a in argv if not a.startswith("--")]
+    start = Path(args[0] if args else ".").resolve()
+    if start.is_file():
+        start = start.parent
+    found = L.find_repo(start)
+    if found:
+        repo, rdir = found
+        paths = L.repo_projects(repo, rdir)
+        base, repo_file = rdir, str(rdir / L.REPO_FILE)
+    else:
+        base, repo_file = start, None
+        git = subprocess.run(["git", "-C", str(start), "ls-files", "--cached", "--others", "--exclude-standard",
+                              "--", "ladder.json", "**/ladder.json"], capture_output=True, text=True)
+        if git.returncode == 0:
+            paths = sorted({(start / line).resolve() for line in git.stdout.splitlines() if line.strip()})
+        else:
+            paths = sorted(q.resolve() for q in start.rglob("ladder.json")
+                           if not any(part.startswith(".") or part == "node_modules"
+                                      for part in q.relative_to(start).parts[:-1]))
+        paths = [q for q in paths if q.exists()]
+    rows = []
+    for pj in paths:
+        row = dict(name=str(pj.parent.resolve().relative_to(base.resolve())) if pj.parent.resolve() != base.resolve()
+                   else pj.parent.name, path=str(pj.resolve()))
+        try:
+            cfg = L.read_config(pj)
+            row.update(title=cfg.get("title") or row["name"], tree=str((pj.parent / cfg["tree"]).resolve()),
+                       builds=[dict(name=b["name"], lang=b.get("lang", ""), files=b.get("files", []))
+                               for b in cfg.get("builds", [])],
+                       links={name: str((pj.parent / (v if isinstance(v, str) else v.get("project", ""))).resolve())
+                              for name, v in (cfg.get("links") or {}).items()})
+        except (SystemExit, KeyError, OSError) as e:
+            row.update(title=row["name"], error=str(e))
+        rows.append(row)
+    print(json.dumps(dict(root=str(base.resolve()), repoFile=repo_file, projects=rows), indent=2))
+    return 0
+
+
+def build_regions(pj: Path, cfg: dict, root: Path, tree, since: str | None = None) -> tuple[list[dict], dict]:
+    """Each build's files and tagged regions, with the kinds of the check problems that fall inside each region (stale,
+    hand-edited, ...): where a step's code is, for the Ladder Review app's Code tab and file view. Also returns the
+    check report it read them from, so a reader needs one run, not two."""
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        rep = L.check(pj, None, since, since, since)
+    by_file: dict[Path, list[dict]] = {}
+    for br in rep["builds"]:
+        for prob in br["problems"]:
+            if "file" in prob and "line" in prob:
+                f = Path(prob["file"])
+                f = (f if f.is_absolute() else root / f).resolve()
+                by_file.setdefault(f, []).append(dict(prob, build=br["name"]))
+    out = []
+    for b in cfg.get("builds", []):
+        files = []
+        for f in b.get("files", []):
+            path = (root / f).resolve()
+            entry = dict(path=f, absolute=str(path), exists=path.exists(), regions=[],
+                         problems=[dict(kind=x["kind"], line=x["line"], msg=x["msg"]) for x in by_file.get(path, [])
+                                   if x["build"] == b["name"]])
+            if path.exists() and b.get("tagged") is not False and b.get("lang") in L.COMMENT:
+                regions, _, lines, _ = L.parse_regions(path, b["lang"])
+                entry["lines"] = len(lines)
+                for r in regions:
+                    end = r.end or len(lines)
+                    kinds = sorted({x["kind"] for x in by_file.get(path, [])
+                                    if x["build"] == b["name"] and r.start <= x["line"] <= end
+                                    and x["kind"] != "untagged"})
+                    entry["regions"].append(dict(
+                        kind=r.kind, label=r.label, start=r.start, end=end, parent=r.parent,
+                        steps=[t for t, _ in r.tags if r.kind == "node"],
+                        hashes=[h for _, h in r.tags],
+                        current=[tree[t].tag_matches(h) if t in tree else None for t, h in r.tags]
+                        if r.kind == "node" else [],
+                        problems=kinds))
+            files.append(entry)
+        out.append(dict(name=b["name"], lang=b.get("lang", ""), mode=b.get("mode", ""),
+                        tagged=b.get("tagged") is not False, steps=b.get("steps"), files=files))
+    return out, rep
+
+
 def export(argv: list[str]) -> int:
+    with_regions = "--regions" in argv
+    since = next((a.split("=", 1)[1] for a in argv if a.startswith("--since=")), None)
+    argv = [a for a in argv if not a.startswith("--")]
     if not argv:
-        raise SystemExit("usage: ladder export <ladder.json> [out.json]")
+        raise SystemExit("usage: ladder export <ladder.json> [out.json] [--regions [--since=GIT_REF]]")
     pj = Path(argv[0])
-    cfg, root, tree, *_ = L.load_project(pj)
+    cfg, root, tree, lock, _ = L.load_project(pj)
     vocab = L.load_vocabulary(cfg, root) or {}
     data = {
         "title": cfg.get("title"),
         "contractHash": L.contract_hash(tree),
         "steps": [dict(id=n.id, title=n.title, parent=n.parent, children=n.children, depth=n.depth,
                        inputs=n.inputs, outputs=n.outputs, effects=n.effects, how=n.steps, notes=n.notes, compare=n.compare, reads=n.reads, writes=n.writes, calls=n.calls,
-                       uses=n.uses, hash=n.hash, line=n.line) for n in tree.values()],
+                       uses=n.uses, hash=n.hash, line=n.line, reviewHash=n.review_hash,
+                       approvedBy=(lock.get(n.id) or {}).get("approved_by"),
+                       approvedAt=(lock.get(n.id) or {}).get("approved_at")) for n in tree.values()],
         "data": [dict(name=d.name, fields=[dict(name=k, description=v) for k, v in d.real_fields()], rules=d.rules,
                       notes=[v for k, v in d.fields if k == "note"])
                  for d in tree.data.values()],
@@ -718,6 +809,10 @@ def export(argv: list[str]) -> int:
         "vocabulary": [dict(name=c.name, inputs=c.inputs, outputs=c.outputs, bindings=c.bindings,
                             known=c.known, checks=c.checks, tests=c.tests) for c in vocab.values()],
     }
+    if with_regions:
+        data["treeFile"] = str((root / cfg["tree"]).resolve())
+        data["builds"], rep = build_regions(pj, cfg, root, tree, since)
+        data["check"] = L.report_json(rep)
     text = json.dumps(data, indent=2)
     if len(argv) > 1:
         Path(argv[1]).write_text(text + "\n")
