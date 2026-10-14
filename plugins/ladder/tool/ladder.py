@@ -2806,3 +2806,11 @@ if __name__ == "__main__":
     except BrokenPipeError:          # output piped into `head` and closed early: not an error
         sys.stderr.close()
         sys.exit(0)
+    except RuntimeError as e:
+        if type(e).__name__ != "GeneratorFailed":
+            raise
+        # the run stops at the first failure: every later region would fail the same way (shipping round: 60 builds
+        # "failed" in seconds each while the generator was over its usage limit)
+        print(f"\nSTOPPED: {e}\nNothing after this region was generated; regions written before it are kept. Run "
+              f"the same command again once the generator works.", file=sys.stderr)
+        sys.exit(2)

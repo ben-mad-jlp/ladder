@@ -476,6 +476,10 @@ def apply_support_adds(lines: list[str], lang: str, adds) -> tuple[list[str], li
 USAGE = {"calls": 0, "seconds": 0.0, "prompt_chars": 0, "reply_chars": 0}
 
 
+class GeneratorFailed(RuntimeError):
+    """The generator command itself failed (not its reply): a quota, a network error, a missing program."""
+
+
 def call_generator(cmd: list[str], prompt: str, cwd: Path) -> str:
     import time
     t0 = time.monotonic()
@@ -486,7 +490,10 @@ def call_generator(cmd: list[str], prompt: str, cwd: Path) -> str:
         USAGE["seconds"] += time.monotonic() - t0
         USAGE["prompt_chars"] += len(prompt)
     if res.returncode != 0:
-        raise RuntimeError(f"generator failed ({res.returncode}): {res.stderr.strip()[:300]}")
+        # the generator's own words, from either stream (shipping round: `claude -p` hit a usage limit, said so on
+        # stdout, and the run printed an empty message and a traceback)
+        said = (res.stderr.strip() or res.stdout.strip() or "(no output)")[-400:]
+        raise GeneratorFailed(f"generator failed (exit {res.returncode}): {said}")
     USAGE["reply_chars"] += len(res.stdout)
     return res.stdout
 
@@ -1307,6 +1314,19 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
 
 # A source file and line in an error message: "Foo.cs(12,5)", "src/a.tsx(43,29)", "a.py", line 7", "x.go:12:3".
 SOURCE_EXTS = "py|cpp|cc|cxx|c|hpp|hh|h|cs|ts|tsx|mts|cts|js|jsx|mjs|cjs|java|kt|kts|go|rs|swift|rb|php|dart|scala|vue|svelte"
+def committed_lines(fpath: Path) -> set[str]:
+    """The stripped lines of a file as committed at HEAD (empty when it is not in git)."""
+    try:
+        top = subprocess.run(["git", "-C", str(fpath.parent), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        rel = fpath.resolve().relative_to(Path(top.stdout.strip()).resolve()).as_posix()
+        res = subprocess.run(["git", "-C", top.stdout.strip(), "show", f"HEAD:{rel}"], capture_output=True)
+    except (OSError, ValueError):
+        return set()
+    if res.returncode != 0:
+        return set()
+    return {l.strip() for l in res.stdout.decode("utf-8", errors="replace").splitlines()}
+
+
 def error_names_file(err_path: str, fpath: Path, bases: list[Path]) -> bool:
     """Whether a path in a build error means this file. Resolved against the folders the build runs from; a bare file
     name (no folder) is matched by name. Never by name alone when the error gives a folder (pilot: an error in
@@ -1424,6 +1444,22 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
                     unused = re.search(r"'([A-Za-z_$][\w$]*)' is declared but its value is never read", line)
                     if unused and IMPORT_LIKE.match(lines[ln - 1]) and remove_import_name(fpath, ln, unused.group(1)):
                         print(f"{build_name:<20} {f}:{ln}  removed the unused import {unused.group(1)} from support code")
+                        lines = fpath.read_text().splitlines()
+                        continue
+                    # An import this generation added (it is not in the committed file) that does not resolve: the
+                    # generator asked for a namespace or module that does not exist (shipping round: a `using
+                    # qb_api_services.Exceptions;`), and nothing else may change support code, so the build never
+                    # recovered. Remove that line; an import the person wrote is never touched.
+                    if IMPORT_LIKE.match(lines[ln - 1]) and lines[ln - 1].strip() not in committed_lines(fpath):
+                        gone = lines[ln - 1].strip()
+                        text = fpath.read_text()
+                        nl = "\r\n" if "\r\n" in text else "\n"
+                        kept = text.split(nl)
+                        del kept[ln - 1]
+                        with open(fpath, "w", newline="") as fh:
+                            fh.write(nl.join(kept))
+                        print(f"{build_name:<20} {f}:{ln}  removed an import this generation added, which does not "
+                              f"resolve: {gone[:100]}")
                         lines = fpath.read_text().splitlines()
                         continue
                     print(f"{build_name:<20} {f}:{ln}  error in support code, not regenerated: {line.strip()[:100]}")

@@ -128,5 +128,23 @@ class Links(Base):
         self.assertIn("does not link to", w[0]["msg"])
 
 
+class GeneratorAndImports(Base):
+    def test_generator_failure_carries_its_own_words(self):
+        import regen as R
+        with self.assertRaises(R.GeneratorFailed) as e:
+            R.call_generator(["sh", "-c", "echo usage limit reached; exit 1"], "prompt", self.root)
+        self.assertIn("usage limit reached", str(e.exception))
+
+    def test_committed_lines_tell_a_person_s_import_from_a_generated_one(self):
+        import regen as R
+        f = self.root / "a.cs"
+        f.write_text("using System;\nclass A {}\n")
+        self.commit()
+        f.write_text("using System;\nusing Nowhere.Exceptions;\nclass A {}\n")
+        lines = R.committed_lines(f)
+        self.assertIn("using System;", lines)
+        self.assertNotIn("using Nowhere.Exceptions;", lines)
+
+
 if __name__ == "__main__":
     unittest.main()
