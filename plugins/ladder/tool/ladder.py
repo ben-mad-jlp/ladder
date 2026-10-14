@@ -2,20 +2,40 @@
 """ladder: keep an English step tree and generated code in sync.
 
 Commands
+  ladder --version                 the plugin version this tool came with
   ladder check  <project.json> [--builds=A,B] [--all-differences] [--since=GIT_REF]
                                    verify tags, coverage, staleness, vocabulary, links, comparisons
                                    exit 0 ok · 1 problems · 3 only awaiting a person's approval
                                    --since: report schema and linked-step changes since GIT_REF
                                    instead of since approval (before the first stamp)
-  ladder check --all [FOLDER] [--since=GIT_REF]
+  ladder check --all [FOLDER] [--since=GIT_REF] [--json]
                                    every project the nearest ladder.repo.json lists ("projects"):
                                    one line each, then a count by kind
+  ladder check  ... --json         the same report as JSON, for the Ladder Review app and scripts (same exit code)
+  ladder projects [FOLDER]         the Ladder projects in a repository as JSON: those ladder.repo.json lists, else
+                                   every ladder.json under FOLDER (default .) that git tracks or that exists
   ladder test   <project.json> [NAME...]   run the tests capabilities (test: lines) and links
                                    ("test") declare, and record the results for check
   ladder hashes <project.json>   print each step's current hash (for whoever generates code)
   ladder stamp  <project.json>   approve the tree as it is now (writes ladder.lock.json)
+  ladder stamp  <project.json> --steps ID[,ID...] [--dry-run] [--json] [--by NAME]
+                                   approve chosen steps and data blocks (a removed one by naming it), keeping
+                                   the rest of the lock; records who approved each and when
+  ladder edit   <project.json> <STEP ID> [--from FILE] [--expect HASH] [--dry-run] [--json]
+                                   change a step's parts (JSON on stdin or --from: title, inputs, outputs,
+                                   effects, how, notes, uses, reads, writes, calls, compare; parts left out are
+                                   kept), rewriting only the lines that change; --expect: refuse if the step's
+                                   review hash (ladder export) is no longer that; --dry-run: the diff and what
+                                   goes stale, nothing written
+  ladder answer <project.json> <STEP ID> <NOTE NUMBER> <ANSWER...> [--plain] [--by NAME] [--dry-run] [--json]
+                                   answer a QUESTION/DIFFERS/DECISION note: "ANSWERED: <answer> (<who>, <date>);
+                                   question: <what was asked>"; --plain: a plain note instead (a DECISION
+                                   accepted, a difference both builds keep)
   ladder view   <project.json> [out.html]   build the side-by-side viewer
-  ladder export <project.json> [out.json]   the parsed tree, data, rules and vocabulary as JSON
+  ladder export <project.json> [out.json] [--regions [--since=GIT_REF]]
+                                   the parsed tree, data, rules and vocabulary as JSON; --regions adds each
+                                   build's files and tagged regions, with the check problems that fall in each,
+                                   and the check report itself ("check", as `check --json` prints it)
   ladder init   <folder> --name NAME --build NAME:LANG [--build ...] [--adopted]   start a project
                                    (or --lang LANG to name a build after its language)
   ladder tag    <project.json> <regions.json> [--base GIT_REF]
@@ -586,7 +606,7 @@ def repo_projects(repo: dict, rdir: Path) -> list[Path]:
     return sorted(found)
 
 
-def check_all(start: Path, since: str | None = None) -> int:
+def check_all(start: Path, since: str | None = None, as_json: bool = False) -> int:
     """`ladder check --all [FOLDER]`: check every project ladder.repo.json lists, in one run, and print one line each
     (round 20: a repository of 500 projects took 500 separate checks and gave no overview). Exit as the worst
     project: 1 when any has problems, 3 when the rest only await approval, 0 when all are ok."""
@@ -600,7 +620,9 @@ def check_all(start: Path, since: str | None = None) -> int:
     counts = {"ok": 0, "awaiting-approval": 0, "problems": 0, "error": 0}
     kinds: dict[str, int] = {}
     width = max(len(str(p.parent.relative_to(rdir))) for p in projects)
-    print(f"{len(projects)} projects in {rdir / REPO_FILE}")
+    rows: list[dict] = []
+    if not as_json:
+        print(f"{len(projects)} projects in {rdir / REPO_FILE}")
     for pj in projects:
         name = str(pj.parent.relative_to(rdir))
         try:
@@ -608,7 +630,9 @@ def check_all(start: Path, since: str | None = None) -> int:
                 rep = check(pj, None, since, since, since)
         except SystemExit as e:
             counts["error"] += 1
-            print(f"  {name:<{width}}  error     {e}")
+            rows.append(dict(name=name, path=str(pj), status="error", error=str(e), kinds={}))
+            if not as_json:
+                print(f"  {name:<{width}}  error     {e}")
             continue
         status = rep["status"]
         counts[status] += 1
@@ -619,18 +643,27 @@ def check_all(start: Path, since: str | None = None) -> int:
             found_kinds["comparison"] = 1
         for k, n in found_kinds.items():
             kinds[k] = kinds.get(k, 0) + n
-        if status != "ok":
+        rows.append(dict(name=name, path=str(pj), status=status, kinds=found_kinds,
+                         warnings=len(rep.get("warnings", []))))
+        if status != "ok" and not as_json:
             what = ", ".join(f"{k} x{n}" if n > 1 else k for k, n in sorted(found_kinds.items(), key=lambda kv: -kv[1]))
             label = {"problems": "problems", "awaiting-approval": "approval"}[status]
             print(f"  {name:<{width}}  {label:<9} {what}")
+    if as_json:
+        print(json.dumps(dict(repo=str(rdir / REPO_FILE), projects=rows, counts=counts, kinds=kinds), indent=2))
+    else:
+        print_all_summary(counts, kinds)
+    if counts["problems"] or counts["error"]:
+        return 1
+    return 3 if counts["awaiting-approval"] else 0
+
+
+def print_all_summary(counts: dict, kinds: dict) -> None:
     print(f"\n{counts['ok']} ok, {counts['awaiting-approval']} awaiting approval, {counts['problems']} with problems"
           + (f", {counts['error']} could not be read" if counts["error"] else ""))
     if kinds:
         print("by kind: " + ", ".join(f"{k} {n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])))
         print("details: ladder check <folder>/ladder.json")
-    if counts["problems"] or counts["error"]:
-        return 1
-    return 3 if counts["awaiting-approval"] else 0
 
 
 def load_project(pj: Path):
@@ -951,6 +984,19 @@ def baseline_lock(cfg: dict, root: Path, ref: str) -> dict | None:
     if data_texts(old):
         out["@data"] = data_texts(old)
     return out
+
+
+# Tree items a person resolves by reviewing and approving (`ladder stamp`); every other tree item is a problem.
+APPROVAL_KINDS = {"new", "baseline-new", "edited", "rule-changed", "parent-changed", "removed", "capability-changed",
+                  "data-new", "data-edited", "data-removed", "compare-edited", "schema-changed", "linked-changed"}
+
+
+def report_json(rep: dict) -> dict:
+    """The check report for JSON readers: each tree item says whether it waits for a person ("approval") or is a
+    problem, so a reader need not keep its own copy of APPROVAL_KINDS."""
+    for p in rep["tree"]:
+        p["level"] = "approval" if p["kind"] in APPROVAL_KINDS else "problem"
+    return rep
 
 
 def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | None = None,
@@ -1320,10 +1366,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
         report["tree"].append(dict(kind="trace-steps", node=", ".join(unknown[:8]),
                                    msg="traces name steps that are not in the tree (a typo?); list harness-only "
                                        "names in compare.extra_steps"))
-    approval_kinds = {"new", "baseline-new", "edited", "rule-changed", "parent-changed", "removed", "capability-changed",
-                      "data-new", "data-edited", "data-removed", "compare-edited", "schema-changed",
-                      "linked-changed"}
-    real_tree = [p for p in report["tree"] if p["kind"] not in approval_kinds]
+    real_tree = [p for p in report["tree"] if p["kind"] not in APPROVAL_KINDS]
     real = (real_tree or any(b["problems"] for b in report["builds"])
             or any(v == 0 for v in report.get("mutants", {}).values())
             or not all(b["ok"] for run in report["compare"] for b in run["builds"])
@@ -1901,10 +1944,19 @@ def stamp(pj: Path, force: bool = False) -> int:
             print("regenerate them, or `ladder retag <ladder.json> <ids>` if the English was only reworded "
                   "(`ladder stamp --force` stamps anyway)")
             return 1
-    cfg, root, tree, _, lock_path = load_project(pj)
-    lock = {n.id: {"hash": n.hash, "review_hash": n.review_hash, "parent_hash": tree[n.parent].hash if n.parent else None,
-                   "text": n.own_text(), "compare": n.compare}
-            for n in tree.values()}
+    cfg, root, tree, old_lock, lock_path = load_project(pj)
+    import datetime
+    import ladder_edit as E
+    who, when = E.git_name(root), datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    lock = {}
+    for n in tree.values():
+        was = old_lock.get(n.id) or {}
+        same = was.get("review_hash") == n.review_hash and was.get("compare") == n.compare and "approved_by" in was
+        # who approved each step, and when; a step approved again unchanged keeps its approver
+        lock[n.id] = {"hash": n.hash, "review_hash": n.review_hash,
+                      "parent_hash": tree[n.parent].hash if n.parent else None, "text": n.own_text(),
+                      "compare": n.compare, "approved_by": was["approved_by"] if same else who,
+                      "approved_at": was.get("approved_at") if same else when}
     vocab = load_vocabulary(cfg, root)
     if vocab:
         lock["@vocabulary"] = {name: {"contract": c.contract_hash(),
@@ -2534,6 +2586,19 @@ def main(argv: list[str]) -> int:
     if "--help" in argv[1:] or "-h" in argv[1:]:
         print(__doc__)
         return 0
+    if argv[1:2] == ["--version"]:
+        plugin = Path(__file__).resolve().parents[1] / ".claude-plugin" / "plugin.json"
+        print("ladder " + (json.loads(plugin.read_text()).get("version", "?") if plugin.exists() else "?"))
+        return 0
+    if len(argv) >= 3 and argv[1] in {"edit", "answer"}:
+        import ladder_edit as E
+        return (E.edit_main if argv[1] == "edit" else E.answer_main)(argv[2:])
+    if len(argv) >= 3 and argv[1] == "stamp" and any(a == "--steps" or a.startswith("--steps=") for a in argv[3:]):
+        import ladder_edit as E
+        return E.stamp_main(Path(argv[2]), argv[3:])
+    if len(argv) >= 2 and argv[1] == "projects":
+        import ladder_extra as X
+        return X.projects(argv[2:])
     if len(argv) >= 3 and argv[1] in {"adopt-check", "replay", "init", "export", "tag"}:
         import ladder_extra as X
         return {"adopt-check": X.adopt_check, "replay": X.replay, "init": X.init, "export": X.export,
@@ -2601,7 +2666,7 @@ def main(argv: list[str]) -> int:
     if len(argv) >= 3 and argv[1] == "check" and argv[2] == "--all":
         start = next((a for a in argv[3:] if not a.startswith("--")), ".")
         since = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--since=")), None)
-        return check_all(Path(start), since)
+        return check_all(Path(start), since, as_json="--json" in argv[3:])
     if len(argv) < 3 or argv[1] not in {"check", "hashes", "stamp", "view"}:
         print(__doc__)
         return 2
@@ -2613,8 +2678,13 @@ def main(argv: list[str]) -> int:
         links_since = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--links-since=")), since)
         global SHOW_ALL
         SHOW_ALL = "--all-differences" in argv[3:]
-        rep = check(pj, only, schema_since, links_since, since)
-        print_report(rep, load_project(pj)[2])
+        if "--json" in argv[3:]:
+            with contextlib.redirect_stdout(io.StringIO()):   # some checks print notes as they go
+                rep = check(pj, only, schema_since, links_since, since)
+            print(json.dumps(report_json(rep), indent=2, default=str))
+        else:
+            rep = check(pj, only, schema_since, links_since, since)
+            print_report(rep, load_project(pj)[2])
         # 0 ok · 1 problems · 3 only waiting for a person's approval
         return {"ok": 0, "problems": 1, "awaiting-approval": 3}[rep["status"]]
     if cmd == "hashes":

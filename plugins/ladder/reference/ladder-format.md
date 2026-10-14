@@ -576,9 +576,19 @@ ladder check <ladder.json> [--since=REF] [--all-differences]
 ladder check --all [FOLDER] [--since=REF]             every project ladder.repo.json lists, one line each and a
                                                       count by kind; exit 1 if any has problems, 3 if the rest
                                                       only await approval
+ladder check ... --json                               the same report (or, with --all, one row per project) as
+                                                      JSON, same exit code; each tree item has "level":
+                                                      "approval" (waits for a person) or "problem"
+ladder projects [FOLDER]                              the projects as JSON: those ladder.repo.json lists, else
+                                                      every ladder.json git tracks below FOLDER (no repo
+                                                      file needed), with title, builds and resolved links
 ladder test <ladder.json> [NAME...]                   run capability and link tests; record the results
 ladder hashes <ladder.json>                           current hash of every step
 ladder export <ladder.json> [out.json]                the parsed tree as JSON
+              [--regions [--since=REF]]               --regions: each build's files and tagged regions (lines,
+                                                      steps, whether each tag is current, the check problems
+                                                      inside it) and the check report as "check"
+ladder --version                                      the plugin version the tool came with
 ladder adopt-check <ladder.json> [--base REF]         transcription changed nothing but comments
 ladder generate <ladder.json> --build=NAME [--out=F]  write a build's file from the English (--out: elsewhere)
 ladder regen <ladder.json> [--build=NAME] [--redo=IDS] [--dry-run] [--repair=N]
@@ -605,6 +615,28 @@ ladder regen <ladder.json> --build=NAME --blind       rewrite a build's regions 
                                                       with --redo=IDS only the regions of those steps, after
                                                       writing the new steps among them (a change to an
                                                       approved tree)
-ladder stamp <ladder.json> [--force]                  approve the English as it is now (refused while a region is stale)
+ladder stamp <ladder.json> [--force]                  approve the English as it is now (refused while a region is stale);
+                                                      each step records who approved it and when (git user.name)
+ladder stamp <ladder.json> --steps IDS [--dry-run]    approve only those steps and data blocks (a removed one by
+              [--json] [--by NAME]                    naming it); the rest of the lock is kept; refused while
+                                                      a chosen step's code is stale
+ladder edit <ladder.json> <ID> [--from F] [--expect H]   change a step's parts (JSON: title, inputs, outputs,
+              [--dry-run] [--json]                    effects, how, notes, uses, reads, writes, calls, compare;
+                                                      parts left out are kept) rewriting only the lines that
+                                                      change; refused if the step's review hash is not H, or if
+                                                      the result would not parse; --dry-run: the diff and the
+                                                      regions that go stale
+ladder answer <ladder.json> <ID> <N> <ANSWER...>      answer note N of a step: "ANSWERED: <answer> (<who>,
+              [--plain] [--by NAME] [--dry-run]       <date>); question: <what was asked>"; --plain: a plain
+                                                      note (a DECISION accepted, a difference both keep)
 ladder view <ladder.json> [out.html]                  side-by-side viewer
 ```
+
+A note's answer changes the step's hash like any other line: its code shows stale, and `ladder retag` (not
+regeneration) is right when the code still does what the step says. An `ANSWERED: bug: ...` note means the
+behavior must still change; the step's how-lines are rewritten and its code regenerated.
+
+The JSON commands (`check --json`, `projects`, `export --regions`, and `edit`, `answer`, `stamp --steps` with
+`--json`) are what the Ladder Review macOS app
+(`apps/ladder-review/`) reads; scripts and CI can read them too. They only add keys over time, so a reader should
+ignore keys it does not know.

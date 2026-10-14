@@ -176,6 +176,11 @@ Ladder v0.4–v0.6 added things the app should show. All are in `plugins/ladder/
 
 The app only calls the tool, so these come first. Each is small, and each is useful without the app too (CI, Claude, the command line).
 
+Built in v0.8.0: `ladder check --json`, `ladder export --regions` (regions, with the check report),
+`ladder projects` (from `ladder.repo.json`, which v0.7.0 added and which covers most of what `ladder.workspace.json`
+was for), `ladder edit`, `ladder stamp --steps`, the approver in the lock, and `ladder answer`. Still to build:
+`ladder.workspace.json`, `ladder index`, `ladder search`, `ladder seams`, `ladder evidence`.
+
 | Addition | What it does | Needed for |
 | --- | --- | --- |
 | `ladder.workspace.json` | lists every project in the repo, its area and API-to-client pairs | Navigator, search, seam view |
