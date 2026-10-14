@@ -670,11 +670,14 @@ def code_hash(p: Path) -> str:
     return hashlib.sha1(kept.encode(errors="surrogateescape")).hexdigest()
 
 
-def project_test_hash(root: Path, cmd: str, files: list[str], cwd: Path | None = None) -> str:
+def project_test_hash(root: Path, cmd: str, files: list[str], cwd: Path | None = None, legacy: bool = False) -> str:
+    """legacy: as v0.7.1 and earlier recorded it (the files' raw bytes), so a result recorded then still counts while
+    the code is unchanged, instead of every project's tests reading stale after the upgrade."""
     parts = [cmd, command_files_hash(cmd, cwd)]
     for f in sorted(files):
         p = root / f
-        parts.append(f + ":" + (code_hash(p) if p.exists() else "missing"))
+        h = (hashlib.sha1(p.read_bytes()).hexdigest() if legacy else code_hash(p)) if p.exists() else "missing"
+        parts.append(f + ":" + h)
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:8]
 
 
@@ -724,7 +727,8 @@ def all_tests(cfg: dict, root: Path, tree: L.Tree) -> list[dict]:
         names = t.get("builds") or [b["name"] for b in cfg.get("builds", []) if b.get("tagged", True) is not False]
         files = [f for b in cfg.get("builds", []) if b["name"] in names for f in b.get("files", [])]
         out.append(dict(key=f"tests {t['name']}", what=f"the project's tests '{t['name']}'", cmd=t["command"],
-                        hash=project_test_hash(root, t["command"], files, cwd), users=[]))
+                        hash=project_test_hash(root, t["command"], files, cwd),
+                        old_hash=project_test_hash(root, t["command"], files, cwd, legacy=True), users=[]))
     linked = load_linked(cfg, root) if cfg.get("links") else {}
     for alias in (cfg.get("links") or {}):
         spec = link_spec(cfg, alias)
@@ -775,7 +779,7 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
             continue
         if r is None:
             warnings.append(dict(kind="test-not-run", node=t["key"], msg=f"never run; `ladder test` runs `{t['cmd']}`"))
-        elif r.get("hash") != t["hash"]:
+        elif r.get("hash") != t["hash"] and r.get("hash") != t.get("old_hash"):
             warnings.append(dict(kind="test-stale", node=t["key"],
                                  msg=f"what it tests changed since it last ran ({r.get('at', '?')}): the capability or link, its test "
                                      f"files, the code of the builds it tests, or the schema of tables it touches (after a "
