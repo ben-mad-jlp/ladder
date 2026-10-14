@@ -419,7 +419,9 @@ def clean_reply(text: str) -> list[str]:
     return split_reply(text)[0]
 
 
-IMPORT_LIKE = re.compile(r"^\s*(import |from \S+ import |#include |using [A-Z]\w*[.;]|using System)")
+# C# namespaces may start lower case (`using qb_api_services.Approvals;`); a `using var x = ...` or `using (...)`
+# statement is not an import (shipping round: a generated `using qb_api_services.Exceptions;` was not seen as one)
+IMPORT_LIKE = re.compile(r"^\s*(import |from \S+ import |#include |using (?:static )?(?!var\b)[A-Za-z_][\w.]*\s*[;=])")
 
 
 def apply_support_adds(lines: list[str], lang: str, adds) -> tuple[list[str], list[str]]:
@@ -887,14 +889,16 @@ def public_names_note(regions: list, lines: list[str], idx: int, lang: str) -> s
     # the declaration line of each exported function or constant: its signature is what callers in other files use
     # (round 12: a dataset function came back taking three arguments where its caller passes one object)
     sigs = declarations(own)
+    keep = ("public (or internal, as it is now)" if lang == "csharp" else "exported")
     out = ("\n\n=== This region's public names (other files import them): " + ", ".join(names)
-           + ". Keep each one exported, with this name.")
+           + f". Keep each one {keep}, with this name.")
     if sigs:
         out += " Keep these declarations as they are (callers depend on them): " + " | ".join(sigs)
     return out
 
 
 DECL_START = re.compile(r"^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|const)\b"
+                        r"|^\s*(?:public|internal)\s+(?:(?:static|readonly|const|required|new)\s+)*[\w<>?,.\[\]]+\s+\w+\s*(?:=(?!>)|;|\{\s*get)"
                         r"|^\s*(?:public|internal)\s+(?:static\s+)?(?:async\s+)?(?:\([^()]*\)\??|[\w<>?,\s\[\]]+)\s+\w+\s*\(")
 
 
@@ -905,6 +909,12 @@ def declarations(own: list[str], limit: int = 600) -> list[str]:
     out = []
     for i, line in enumerate(own):
         if not DECL_START.match(line):
+            continue
+        if re.match(r"^\s*(?:public|internal)\s+(?:(?:static|readonly|const|required|new)\s+)*[\w<>?,.\[\]]+\s+\w+\s*"
+                    r"(?:=(?!>)|;|\{\s*get)", line):
+            # a C# constant, field or property: its declaration up to the value (shipping round: a public const came
+            # back private, and the test that reads it stopped compiling)
+            out.append(" ".join(re.split(r"=(?!>)|\{", line, 1)[0].split()) + (" { get; ... }" if "{" in line else ""))
             continue
         if re.match(r"^\s*export\s+(?:default\s+)?const\b", line) and "=" in line:
             # a constant: its name and type, not its value
@@ -1314,6 +1324,31 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
 
 # A source file and line in an error message: "Foo.cs(12,5)", "src/a.tsx(43,29)", "a.py", line 7", "x.go:12:3".
 SOURCE_EXTS = "py|cpp|cc|cxx|c|hpp|hh|h|cs|ts|tsx|mts|cts|js|jsx|mjs|cjs|java|kt|kts|go|rs|swift|rb|php|dart|scala|vue|svelte"
+def drop_added_unresolved_imports(errors: str, files: list[Path], bases: list[Path]) -> list[str]:
+    """For each build error on an import line that is not in the committed file (this generation added it), remove the
+    line. Returns what was removed. Used before giving up: a last repair round can add one again (shipping round)."""
+    removed = []
+    for fpath in files:
+        if not fpath.exists():
+            continue
+        text = fpath.read_text()
+        nl = "\r\n" if "\r\n" in text else "\n"
+        lines = text.split(nl)
+        drop = set()
+        for m in ERR_LOC.finditer(errors):
+            if not error_names_file(m.group(1), fpath, bases):
+                continue
+            ln = int(m.group(2))
+            if 1 <= ln <= len(lines) and IMPORT_LIKE.match(lines[ln - 1]) and lines[ln - 1].strip() not in committed_lines(fpath):
+                drop.add(ln)
+        if drop:
+            removed += [f"{fpath.name}:{ln} {lines[ln - 1].strip()}" for ln in sorted(drop)]
+            kept = [l for i, l in enumerate(lines, 1) if i not in drop]
+            with open(fpath, "w", newline="") as fh:
+                fh.write(nl.join(kept))
+    return removed
+
+
 def committed_lines(fpath: Path) -> set[str]:
     """The stripped lines of a file as committed at HEAD (empty when it is not in git)."""
     try:

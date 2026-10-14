@@ -2664,6 +2664,16 @@ def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, roun
             return 0
         n = len(errs.splitlines())
         if r == rounds:
+            bases = [root / cfg.get("check_cwd", "."), root, Path.cwd()]
+            files = [root / f for t in targets for b in cfg["builds"] if b["name"] == t for f in b.get("files", [])]
+            dropped = R.drop_added_unresolved_imports(errs, files, bases)
+            if dropped:
+                print("removed imports this generation added, which do not resolve: " + "; ".join(dropped))
+                errs = R.project_check_errors(cfg, root) or ""
+                if not errs:
+                    print(f"builds: clean after {rounds} repair round(s) and removing those imports")
+                    return 0
+                n = len(errs.splitlines())
             print(f"STILL DOES NOT BUILD after {rounds} repair round(s) ({n} error lines):\n" + errs[:3000])
             return 1
         # Which builds' files the errors are in, by path (pilot: "hooks.ts" in another feature's error counted as this
