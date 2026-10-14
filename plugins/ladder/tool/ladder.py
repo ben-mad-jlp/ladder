@@ -648,7 +648,7 @@ def repo_projects(repo: dict, rdir: Path) -> list[Path]:
     return sorted(found)
 
 
-def check_all(start: Path, since: str | None = None) -> int:
+def check_all(start: Path, since: str | None = None, show_warnings: bool = False) -> int:
     """`ladder check --all [FOLDER]`: check every project ladder.repo.json lists, in one run, and print one line each
     (round 20: a repository of 500 projects took 500 separate checks and gave no overview). Exit as the worst
     project: 1 when any has problems, 3 when the rest only await approval, 0 when all are ok."""
@@ -661,6 +661,7 @@ def check_all(start: Path, since: str | None = None) -> int:
         raise SystemExit(f"ladder check --all: the \"projects\" of {rdir / REPO_FILE} match no ladder.json")
     counts = {"ok": 0, "awaiting-approval": 0, "problems": 0, "error": 0}
     kinds: dict[str, int] = {}
+    wkinds: dict[str, int] = {}
     width = max(len(str(p.parent.relative_to(rdir))) for p in projects)
     print(f"{len(projects)} projects in {rdir / REPO_FILE}")
     for pj in projects:
@@ -681,14 +682,28 @@ def check_all(start: Path, since: str | None = None) -> int:
             found_kinds["comparison"] = 1
         for k, n in found_kinds.items():
             kinds[k] = kinds.get(k, 0) + n
+        warned: dict[str, int] = {}
+        for w in rep.get("warnings", []):
+            warned[w["kind"]] = warned.get(w["kind"], 0) + 1
+        for k, n in warned.items():
+            wkinds[k] = wkinds.get(k, 0) + n
+        wtext = ", ".join(f"{k} x{n}" if n > 1 else k for k, n in sorted(warned.items(), key=lambda kv: -kv[1]))
         if status != "ok":
             what = ", ".join(f"{k} x{n}" if n > 1 else k for k, n in sorted(found_kinds.items(), key=lambda kv: -kv[1]))
             label = {"problems": "problems", "awaiting-approval": "approval"}[status]
-            print(f"  {name:<{width}}  {label:<9} {what}")
+            print(f"  {name:<{width}}  {label:<9} {what}" + (f"; warnings: {wtext}" if show_warnings and wtext else ""))
+        elif show_warnings and wtext:
+            print(f"  {name:<{width}}  {'ok':<9} warnings: {wtext}")
     print(f"\n{counts['ok']} ok, {counts['awaiting-approval']} awaiting approval, {counts['problems']} with problems"
           + (f", {counts['error']} could not be read" if counts["error"] else ""))
     if kinds:
         print("by kind: " + ", ".join(f"{k} {n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])))
+    if wkinds:
+        # Warnings do not change the result, but a reviewer of a whole repository needs to see them (shipping round:
+        # linked-unapproved and untested-link were invisible in the overview)
+        print("warnings: " + ", ".join(f"{k} {n}" for k, n in sorted(wkinds.items(), key=lambda kv: -kv[1]))
+              + ("" if show_warnings else "  (per project: ladder check --all --warnings)"))
+    if kinds or wkinds:
         print("details: ladder check <folder>/ladder.json")
     if counts["problems"] or counts["error"]:
         return 1
@@ -2649,6 +2664,16 @@ def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, roun
             return 0
         n = len(errs.splitlines())
         if r == rounds:
+            bases = [root / cfg.get("check_cwd", "."), root, Path.cwd()]
+            files = [root / f for t in targets for b in cfg["builds"] if b["name"] == t for f in b.get("files", [])]
+            dropped = R.drop_added_unresolved_imports(errs, files, bases)
+            if dropped:
+                print("removed imports this generation added, which do not resolve: " + "; ".join(dropped))
+                errs = R.project_check_errors(cfg, root) or ""
+                if not errs:
+                    print(f"builds: clean after {rounds} repair round(s) and removing those imports")
+                    return 0
+                n = len(errs.splitlines())
             print(f"STILL DOES NOT BUILD after {rounds} repair round(s) ({n} error lines):\n" + errs[:3000])
             return 1
         # Which builds' files the errors are in, by path (pilot: "hooks.ts" in another feature's error counted as this
@@ -2751,7 +2776,7 @@ def main(argv: list[str]) -> int:
     if len(argv) >= 3 and argv[1] == "check" and argv[2] == "--all":
         start = next((a for a in argv[3:] if not a.startswith("--")), ".")
         since = next((a.split("=", 1)[1] for a in argv[3:] if a.startswith("--since=")), None)
-        return check_all(Path(start), since)
+        return check_all(Path(start), since, "--warnings" in argv[3:])
     if len(argv) < 3 or argv[1] not in {"check", "hashes", "stamp", "view"}:
         print(__doc__)
         return 2
@@ -2791,3 +2816,11 @@ if __name__ == "__main__":
     except BrokenPipeError:          # output piped into `head` and closed early: not an error
         sys.stderr.close()
         sys.exit(0)
+    except RuntimeError as e:
+        if type(e).__name__ != "GeneratorFailed":
+            raise
+        # the run stops at the first failure: every later region would fail the same way (shipping round: 60 builds
+        # "failed" in seconds each while the generator was over its usage limit)
+        print(f"\nSTOPPED: {e}\nNothing after this region was generated; regions written before it are kept. Run "
+              f"the same command again once the generator works.", file=sys.stderr)
+        sys.exit(2)

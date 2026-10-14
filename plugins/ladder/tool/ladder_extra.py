@@ -42,8 +42,15 @@ def _is_comment(line: str, lang: str) -> bool:
     return lang in L.BLOCK_COMMENT_LANGS and (s.startswith("/*") or s.startswith("*") or s.endswith("*/"))
 
 
+def _line_ending(text: str) -> str | None:
+    """"CRLF" or "LF" when a text's lines end one way, None for a single line or a mix."""
+    crlf, lf = text.count("\r\n"), text.count("\n") - text.count("\r\n")
+    return "CRLF" if crlf and not lf else "LF" if lf and not crlf else None
+
+
 def compare_tagging(original: str, tagged: str, lang: str) -> dict:
-    """Transcription may only ADD comment or blank lines. Everything else is a violation."""
+    """Transcription may only ADD comment or blank lines. Everything else is a violation, line endings included
+    (shipping round: tag rewrote CRLF files as LF, every line changed in git, and this check said ok)."""
     a, b = original.splitlines(), tagged.splitlines()
     removed, added_code, added_comments = [], [], 0
     sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
@@ -56,8 +63,12 @@ def compare_tagging(original: str, tagged: str, lang: str) -> dict:
                     added_comments += 1
                 else:
                     added_code.append((j + 1, b[j]))
-    return dict(removed=removed, added_code=added_code, added_comments=added_comments,
-                ok=not removed and not added_code)
+    endings = None
+    was, now = _line_ending(original), _line_ending(tagged)
+    if was and was != (now or "mixed"):
+        endings = f"line endings changed from {was} to {now or 'a mix'}"
+    return dict(removed=removed, added_code=added_code, added_comments=added_comments, endings=endings,
+                ok=not removed and not added_code and not endings)
 
 
 def _git_original(root: Path, rel: str, ref: str) -> str | None:
@@ -66,9 +77,15 @@ def _git_original(root: Path, rel: str, ref: str) -> str | None:
     if top.returncode != 0:
         raise SystemExit("adopt-check: the project is not inside a git repository; use --original/--tagged")
     path = (root / rel).resolve().relative_to(Path(top.stdout.strip()).resolve())
-    res = subprocess.run(["git", "-C", top.stdout.strip(), "show", f"{ref}:{path.as_posix()}"],
-                         capture_output=True, text=True)
-    return res.stdout if res.returncode == 0 else None
+    # bytes, not text mode: text mode turns CRLF into LF, and tag then rewrote every line of a CRLF file
+    res = subprocess.run(["git", "-C", top.stdout.strip(), "show", f"{ref}:{path.as_posix()}"], capture_output=True)
+    return res.stdout.decode("utf-8", errors="surrogateescape") if res.returncode == 0 else None
+
+
+def _read_exact(path: Path) -> str:
+    """A file's text with its line endings as they are on disk."""
+    with open(path, newline="") as fh:
+        return fh.read()
 
 
 def _print_result(name: str, r: dict) -> None:
@@ -76,6 +93,8 @@ def _print_result(name: str, r: dict) -> None:
         print(f"  ok   {name}: only comment lines added ({r['added_comments']})")
         return
     print(f"  FAIL {name}")
+    if r.get("endings"):
+        print(f"         {r['endings']}")
     for ln, text in r["removed"][:10]:
         print(f"         removed or changed original line {ln}: {text.strip()[:90]}")
     for ln, text in r["added_code"][:10]:
@@ -85,8 +104,8 @@ def _print_result(name: str, r: dict) -> None:
 def adopt_check(argv: list[str]) -> int:
     if "--original" in argv:
         tagged_path = opt(argv, "--tagged", required=True)
-        r = compare_tagging(Path(opt(argv, "--original", required=True)).read_text(),
-                            Path(tagged_path).read_text(), opt(argv, "--lang", required=True))
+        r = compare_tagging(_read_exact(Path(opt(argv, "--original", required=True))),
+                            _read_exact(Path(tagged_path)), opt(argv, "--lang", required=True))
         _print_result(tagged_path, r)
         return 0 if r["ok"] else 1
     if not argv or argv[0].startswith("--"):
@@ -104,7 +123,7 @@ def adopt_check(argv: list[str]) -> int:
             if orig is None:
                 print(f"  skip {f}: not in {ref} (new file)")
                 continue
-            r = compare_tagging(orig, (root / f).read_text(), b["lang"])
+            r = compare_tagging(orig, _read_exact(root / f), b["lang"])
             _print_result(f, r)
             bad += not r["ok"]
     print("RESULT:", "ok" if not bad else f"{bad} file(s) changed code")

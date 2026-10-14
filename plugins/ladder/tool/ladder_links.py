@@ -37,12 +37,23 @@ import ladder as L
 CALL_RE = re.compile(r"^\s*([A-Za-z][\w-]*)\s*\[([A-Za-z0-9_.\-]+)\]\s*$")
 
 
+MULTI_CALL_RE = re.compile(r"^\s*([A-Za-z][\w-]*)\s*((?:\[[A-Za-z0-9_.\-]+\]\s*)+)$")
+
+
 def parse_calls(n) -> list[tuple[str, str, str]]:
-    """(alias, step id, as written) for each item of a step's calls: lines."""
+    """(alias, step id, as written) for each item of a step's calls: lines. An item may name several steps of one
+    tree: `scanner [shc.20.13] [shc.20.14]` (shipping round: the natural way to write it was refused)."""
     out = []
     for item in getattr(n, "calls", []):
         m = CALL_RE.match(item)
-        out.append((m.group(1), m.group(2), item) if m else ("", "", item))
+        if m:
+            out.append((m.group(1), m.group(2), item))
+            continue
+        mm = MULTI_CALL_RE.match(item)
+        if mm:
+            out += [(mm.group(1), tid, item) for tid in re.findall(r"\[([A-Za-z0-9_.\-]+)\]", mm.group(2))]
+            continue
+        out.append(("", "", item))
     return out
 
 
@@ -89,8 +100,24 @@ def tree_at(cfg2: dict, root2: Path, ref: str) -> L.Tree | None:
         Path(f.name).unlink()
 
 
+def is_target(tree, tid: str) -> bool:
+    """Whether a calls: target exists in a tree: a step, or a data block (a type the caller uses: shipping round)."""
+    return tid in tree or tid in getattr(tree, "data", {})
+
+
+def data_text(tree, name: str) -> str:
+    d = tree.data[name]
+    lines = [f"data {name}"]
+    lines += [f"  {name}.{k}: {' '.join(v.split())}" for k, v in d.fields]
+    lines += [f"  {name} rule: {' '.join(r.split())}" for r in d.rules]
+    return "\n".join(lines)
+
+
 def contract_text(tree: L.Tree, nid: str) -> str:
-    """What a caller relies on: the called step's in:/out:/effects: lines and the data blocks they name."""
+    """What a caller relies on: the called step's in:/out:/effects: lines and the data blocks they name; for a data
+    block named in calls:, the block itself."""
+    if nid not in tree and nid in getattr(tree, "data", {}):
+        return data_text(tree, nid)
     n = tree[nid]
     lines = [f"[{n.id}] {n.title}"]
     for key, val in (("in", n.inputs), ("out", n.outputs), ("effects", n.effects)):
@@ -210,8 +237,7 @@ def link_shape_warnings(tree: L.Tree, cfg: dict, root: Path) -> list[dict]:
     - link-unused: a link that no `calls:` line uses, in either direction."""
     out: list[dict] = []
     linked = {a: v for a, v in load_linked(cfg, root).items() if not isinstance(v, str)}
-    if not linked:
-        return out
+    # (no early return without links: a project that links to nothing may still name other projects' steps)
     norm = lambda t: " ".join(t.split()).lower()
     rules = getattr(tree, "rules", {})
     # every project reachable through links (an API and its scanner are often linked only through the library)
@@ -244,7 +270,7 @@ def link_shape_warnings(tree: L.Tree, cfg: dict, root: Path) -> list[dict]:
     for nid, n in tree.items():
         targets = {tid for _, tid, _ in parse_calls(n)}
         called_aliases |= {a for a, _, _ in parse_calls(n) if a}
-        foreign = []
+        foreign, unlinked = [], []
         # what the step does (not its notes, which may point at another tree to explain something)
         said = "\n".join([n.title, n.inputs, n.outputs, n.effects, *n.steps])
         for ref in dict.fromkeys(STEP_REF_RE.findall(said)):
@@ -253,6 +279,16 @@ def link_shape_warnings(tree: L.Tree, cfg: dict, root: Path) -> list[dict]:
             owner = next((a for a, (_, _, t2) in linked.items() if ref in t2), None)
             if owner:
                 foreign.append(f"{owner} [{ref}]")
+            elif ref not in tree:
+                # a step of a project this one does not link to yet (shipping round: ~100 calls were invisible
+                # until the first link existed)
+                where = repo_step_owner(root, ref)
+                if where:
+                    unlinked.append(f"[{ref}] of {where}")
+        if unlinked:
+            out.append(dict(kind="uncalled-reference", node=nid,
+                            msg=f"[{nid}] names {', '.join(unlinked)}, a project this one does not link to: changes there "
+                                f"are never reported here; add a \"links\" entry and a `calls:` line"))
         if foreign:
             out.append(dict(kind="uncalled-reference", node=nid,
                             msg=f"[{nid}] names {', '.join(foreign)} without a `calls:` line: changes there are never "
@@ -299,9 +335,11 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
             if isinstance(got, str):
                 continue
             c2, r2, t2 = got
-            if tid not in t2:
-                problems.append(dict(kind="link", node=nid, msg=f"calls: {written}: the {alias} tree has no step [{tid}]"))
+            if not is_target(t2, tid):
+                problems.append(dict(kind="link", node=nid, msg=f"calls: {written}: the {alias} tree has no step or "
+                                                                 f"data block [{tid}]"))
                 continue
+            is_data = tid not in t2
             key = f"{alias}:{tid}"
             if alias not in callee_locks:
                 lp = r2 / "ladder.lock.json"
@@ -310,7 +348,7 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                 except ValueError:
                     callee_locks[alias] = {}
             approved = callee_locks[alias].get(tid, {}).get("hash")
-            if approved is None or not t2[tid].tag_matches(approved):
+            if not is_data and (approved is None or not t2[tid].tag_matches(approved)):
                 warnings.append(dict(kind="linked-unapproved", node=nid,
                                      msg=f"calls {key}, which the {alias} project has "
                                          + ("never approved" if approved is None else "changed since its approval")
@@ -318,13 +356,13 @@ def check_links(tree: L.Tree, cfg: dict, root: Path, lock: dict, since: str | No
                                            f"after {alias} is approved"))
             now = contract_text(t2, tid)
             facts.setdefault(nid, {})[key] = now
-            now_behind = behind_hashes(t2, tid)
+            now_behind = behind_hashes(t2, tid) if not is_data else {}
             facts[nid][key + "#behind"] = json.dumps(now_behind, sort_keys=True)
             if since:
                 if alias not in old_trees:
                     old_trees[alias] = tree_at(c2, r2, since)
                 ot = old_trees[alias]
-                was = contract_text(ot, tid) if ot is not None and tid in ot else None
+                was = contract_text(ot, tid) if ot is not None and is_target(ot, tid) else None
                 was_behind = behind_hashes(ot, tid) if ot is not None and tid in ot else None
                 when = f"since {since}"
             else:
@@ -476,6 +514,31 @@ def caller_projects(cfg: dict, root: Path, linked: dict) -> list[tuple[str, dict
     return out
 
 
+_STEP_OWNERS: dict = {}
+
+
+def repo_step_owner(root: Path, ref: str) -> str | None:
+    """The project (folder, relative to this one) whose tree has step `ref`, among those ladder.repo.json lists."""
+    found = L.find_repo(root)
+    if not found or not found[0].get("projects"):
+        return None
+    repo, rdir = found
+    if rdir not in _STEP_OWNERS:
+        owners: dict[str, Path] = {}
+        for pj in L.repo_projects(repo, rdir):
+            try:
+                c2 = L.linked_config(pj)
+                for sid in L.linked_tree(pj.parent / c2["tree"]):
+                    owners.setdefault(sid, pj.parent.resolve())
+            except (SystemExit, OSError, KeyError, ValueError):
+                continue
+        _STEP_OWNERS[rdir] = owners
+    owner = _STEP_OWNERS[rdir].get(ref)
+    if owner is None or owner == root.resolve():
+        return None
+    return os.path.relpath(owner, root.resolve())
+
+
 _REVERSE: dict = {}
 
 
@@ -539,7 +602,7 @@ def prompt_text(ids: list[str], tree: L.Tree, cfg: dict, root: Path) -> str:
     seen = set()
     for nid, (alias, tid, _) in wanted:
         got = linked.get(alias)
-        if isinstance(got, tuple) and tid in got[2] and (alias, tid) not in seen:
+        if isinstance(got, tuple) and is_target(got[2], tid) and (alias, tid) not in seen:
             seen.add((alias, tid))
             out.append(f"--- {alias} {contract_text(got[2], tid)}")
     return "\n".join(out) + "\n"
@@ -591,16 +654,30 @@ def link_test_hash(tree: L.Tree, alias: str, linked, cmd: str, cwd: Path | None 
         for a, tid, _ in parse_calls(n):
             if a == alias:
                 parts.append(f"{nid}@{n.hash}")
-                if isinstance(got, tuple) and tid in got[2]:
+                if isinstance(got, tuple) and is_target(got[2], tid):
                     parts.append(contract_text(got[2], tid))
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:8]
 
 
-def project_test_hash(root: Path, cmd: str, files: list[str], cwd: Path | None = None) -> str:
+MARKER_LINE = re.compile(r"^\s*(?://|#|--)\s*@(?:node|contract|support|end)\b")
+
+
+def code_hash(p: Path) -> str:
+    """A code file's hash for test records: without Ladder's marker lines and with line endings normalised, so a
+    retag or a stamp (markers only) does not make a passed test stale (shipping round: twice in one project)."""
+    text = p.read_text(errors="surrogateescape")
+    kept = "\n".join(l for l in text.splitlines() if not MARKER_LINE.match(l))
+    return hashlib.sha1(kept.encode(errors="surrogateescape")).hexdigest()
+
+
+def project_test_hash(root: Path, cmd: str, files: list[str], cwd: Path | None = None, legacy: bool = False) -> str:
+    """legacy: as v0.7.1 and earlier recorded it (the files' raw bytes), so a result recorded then still counts while
+    the code is unchanged, instead of every project's tests reading stale after the upgrade."""
     parts = [cmd, command_files_hash(cmd, cwd)]
     for f in sorted(files):
         p = root / f
-        parts.append(f + ":" + (hashlib.sha1(p.read_bytes()).hexdigest() if p.exists() else "missing"))
+        h = (hashlib.sha1(p.read_bytes()).hexdigest() if legacy else code_hash(p)) if p.exists() else "missing"
+        parts.append(f + ":" + h)
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:8]
 
 
@@ -650,7 +727,8 @@ def all_tests(cfg: dict, root: Path, tree: L.Tree) -> list[dict]:
         names = t.get("builds") or [b["name"] for b in cfg.get("builds", []) if b.get("tagged", True) is not False]
         files = [f for b in cfg.get("builds", []) if b["name"] in names for f in b.get("files", [])]
         out.append(dict(key=f"tests {t['name']}", what=f"the project's tests '{t['name']}'", cmd=t["command"],
-                        hash=project_test_hash(root, t["command"], files, cwd), users=[]))
+                        hash=project_test_hash(root, t["command"], files, cwd),
+                        old_hash=project_test_hash(root, t["command"], files, cwd, legacy=True), users=[]))
     linked = load_linked(cfg, root) if cfg.get("links") else {}
     for alias in (cfg.get("links") or {}):
         spec = link_spec(cfg, alias)
@@ -701,7 +779,7 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
             continue
         if r is None:
             warnings.append(dict(kind="test-not-run", node=t["key"], msg=f"never run; `ladder test` runs `{t['cmd']}`"))
-        elif r.get("hash") != t["hash"]:
+        elif r.get("hash") != t["hash"] and r.get("hash") != t.get("old_hash"):
             warnings.append(dict(kind="test-stale", node=t["key"],
                                  msg=f"what it tests changed since it last ran ({r.get('at', '?')}): the capability or link, its test "
                                      f"files, the code of the builds it tests, or the schema of tables it touches (after a "
@@ -709,6 +787,10 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
         elif not r.get("ok"):
             problems.append(dict(kind="test-failed", node=t["key"],
                                  msg=f"failed when last run ({r.get('at', '?')}): {r.get('tail', '')[:600]}"))
+        elif r.get("silent"):
+            warnings.append(dict(kind="test-silent", node=t["key"],
+                                 msg=f"passed with no output ({r.get('at', '?')}): nothing shows that any test ran (a filter "
+                                     f"that matches nothing exits 0); make `{t['cmd']}` print its runner's summary"))
     return problems, warnings
 
 
@@ -755,6 +837,21 @@ def _git_root(path: Path) -> Path | None:
     return Path(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else None
 
 
+NO_TESTS_RE = re.compile(r"No test files found[^\n]*|No test matches the given testcase filter[^\n]*|"
+                         r"Total tests: 0\b|no tests ran[^\n]*|0 tests? (?:collected|found)", re.I)
+COUNT_RES = [re.compile(r"Tests\s+(\d+) passed"), re.compile(r"Total tests:\s*(\d+)"),
+             re.compile(r"Passed!\s*-\s*Failed:\s*\d+,\s*Passed:\s*(\d+)"), re.compile(r"\b(\d+) passed\b")]
+
+
+def tests_run(out: str) -> int | None:
+    """How many tests a run reports (vitest, jest, dotnet test, pytest summaries; summed over several), or None."""
+    for rx in COUNT_RES:
+        hits = rx.findall(out)
+        if hits:
+            return sum(int(h) for h in hits)
+    return None
+
+
 def run_tests(pj: Path, only: list[str] | None = None) -> int:
     import datetime
     cfg, root, tree, _, _ = L.load_project(pj)
@@ -767,6 +864,9 @@ def run_tests(pj: Path, only: list[str] | None = None) -> int:
     code = L.load_code(root)
     results = code.setdefault("@tests", {})
     cwd = root / cfg.get("check_cwd", ".")
+    found = L.find_repo(root)
+    also = [root] + ([found[1]] if found else []) + [g for g in [_git_root(root)] if g]
+    ran_info: dict[str, tuple[int | None, bool]] = {}
     failed = 0
     ran: dict[str, tuple[bool, int, list[str]]] = {}   # one run per distinct command (round 9: one link test named
     first: dict[str, str] = {}                          # by five subjects started the API five times)
@@ -776,17 +876,32 @@ def run_tests(pj: Path, only: list[str] | None = None) -> int:
             print(f"{t['what']}: same command as {first[t['cmd']]}, not run again")
         else:
             print(f"{t['what']}: {t['cmd']}")
+            gone = missing_files(t["cmd"], cwd, also)
+            if gone:
+                # check reports these as test-missing; running them only fails on the missing file (shipping round)
+                print(f"  not run: names {', '.join(gone)}, which does not exist")
+                continue
             res = subprocess.run(t["cmd"], shell=True, cwd=cwd, capture_output=True, text=True)
-            tail = failure_lines(res.stdout + res.stderr)
+            out = res.stdout + res.stderr
+            tail = failure_lines(out)
             ok, rc = res.returncode == 0, res.returncode
+            none_ran = NO_TESTS_RE.search(out)
+            if ok and none_ran:
+                # a filter that matches nothing exits 0 (shipping round: a misspelt class name recorded as a pass)
+                ok, tail = False, [f"no tests ran: {none_ran.group(0).strip()}"]
+            count = tests_run(out)
             ran[t["cmd"]] = (ok, rc, tail)
+            ran_info[t["cmd"]] = (count, not out.strip())
             first[t["cmd"]] = t["what"]
         failed += not ok
-        print(f"  {'ok' if ok else 'FAILED (exit ' + str(rc) + ')'}")
+        count, silent = ran_info.get(t["cmd"], (None, False))
+        print(f"  {'ok' if ok else 'FAILED (exit ' + str(rc) + ')'}" + (f", {count} tests" if ok and count else "")
+              + (" (no output: nothing shows that a test ran)" if ok and silent else ""))
         if not ok:
             print("    " + "\n    ".join(tail))
         results[t["key"]] = dict(hash=t["hash"], ok=ok, at=datetime.date.today().isoformat(),
-                                 tail=" / ".join(tail)[:600] if not ok else "")
+                                 tail=" / ".join(tail)[:600] if not ok else "",
+                                 **({"count": count} if count else {}), **({"silent": True} if ok and silent else {}))
     (root / L.CODE_FILE).write_text(json.dumps(code, indent=2, sort_keys=True) + "\n")
     print(f"\n{len(tests) - failed} of {len(tests)} passed; results recorded in ladder.code.json")
     return 1 if failed else 0
