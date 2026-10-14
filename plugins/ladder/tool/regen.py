@@ -455,6 +455,14 @@ def apply_support_adds(lines: list[str], lang: str, adds) -> tuple[list[str], li
             continue
         if all(IMPORT_LIKE.match(a) for a in new):
             last = max((i for i in range(start + 1, end) if IMPORT_LIKE.match(lines[i])), default=start)
+            # after the end of that import, not its first line: `import type {` over several lines (pilot: two
+            # imports landed inside one and the file no longer parsed)
+            depth = 0
+            for j in range(last, end):
+                depth += lines[j].count("{") + lines[j].count("(") - lines[j].count("}") - lines[j].count(")")
+                last = j
+                if depth <= 0:
+                    break
             at = last + 1
         else:
             at = end
@@ -463,11 +471,35 @@ def apply_support_adds(lines: list[str], lang: str, adds) -> tuple[list[str], li
     return lines, notes
 
 
+# Generator use in this run (pilot: sizing a whole-repository run needs calls, time and prompt size per region; they
+# were measured from outside). Printed after "prompts and replies" and appended to <log>/usage.json.
+USAGE = {"calls": 0, "seconds": 0.0, "prompt_chars": 0, "reply_chars": 0}
+
+
 def call_generator(cmd: list[str], prompt: str, cwd: Path) -> str:
-    res = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=cwd, timeout=600)
+    import time
+    t0 = time.monotonic()
+    try:
+        res = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=cwd, timeout=600)
+    finally:
+        USAGE["calls"] += 1
+        USAGE["seconds"] += time.monotonic() - t0
+        USAGE["prompt_chars"] += len(prompt)
     if res.returncode != 0:
         raise RuntimeError(f"generator failed ({res.returncode}): {res.stderr.strip()[:300]}")
+    USAGE["reply_chars"] += len(res.stdout)
     return res.stdout
+
+
+def usage_line(log_dir: Path) -> str:
+    """One line on this run's generator use, also written to <log>/usage.json."""
+    u = dict(USAGE, seconds=round(USAGE["seconds"], 1))
+    try:
+        (log_dir / "usage.json").write_text(json.dumps(u, indent=2) + "\n")
+    except OSError:
+        pass
+    return (f"generator: {u['calls']} call(s), {u['seconds']:.0f} s, prompts {u['prompt_chars'] // 1000}k characters, "
+            f"replies {u['reply_chars'] // 1000}k")
 
 
 def validate_and_splice(file: Path, lang: str, lines: list[str], r: L.Region, reply: list[str],
@@ -828,21 +860,68 @@ def leaked_lines(conv: str, lines: list[str], regions: list, idxs) -> list[tuple
     return out
 
 
+CS_MEMBER = re.compile(r"^\s*(?:public|internal)\s+(?:(?:static|async|virtual|override|sealed|new|readonly|required|const)\s+)*"
+                       r"(?!class\b|interface\b|record\b|struct\b|enum\b|delegate\b|event\b)"
+                       r"(?:\([^()]*\)\??|[\w<>?,.\[\]]+(?:\s*<[^>]*>)?)\s+([A-Za-z_]\w*)\s*(?:\(|<|\{|=>|=|;)", re.M)
+
+
 def public_names_note(regions: list, lines: list[str], idx: int, lang: str) -> str:
     """The names a hidden region exports (its own lines), which other files import: a blind run must keep them.
     Round 11: two exported props interfaces came back unexported and the folder's index.ts no longer compiled."""
     own = L.region_own_code(regions, lines, idx)
     names = L.text_export_names("\n".join(own), lang)
+    if lang == "csharp":
+        # Members too, not only types: a public (or internal, seen by test projects) method or property that other
+        # code calls (pilot: a test called AlertService.IsScheduledDue, the English never named it, the blind run
+        # renamed it and the tests stopped compiling).
+        names = sorted(set(names) | set(CS_MEMBER.findall("\n".join(own))))
     if not names:
         return ""
     # the declaration line of each exported function or constant: its signature is what callers in other files use
     # (round 12: a dataset function came back taking three arguments where its caller passes one object)
-    sigs = [" ".join(l.split()) for l in own if re.match(r"^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|const)\b", l)
-            or re.match(r"^\s*public\s+(?:static\s+)?(?:async\s+)?[\w<>?,\s\[\]]+\s+\w+\s*\(", l)]
+    sigs = declarations(own)
     out = ("\n\n=== This region's public names (other files import them): " + ", ".join(names)
            + ". Keep each one exported, with this name.")
     if sigs:
-        out += " Keep these declarations as they are (callers depend on them): " + " | ".join(x[:200] for x in sigs)
+        out += " Keep these declarations as they are (callers depend on them): " + " | ".join(sigs)
+    return out
+
+
+DECL_START = re.compile(r"^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|const)\b"
+                        r"|^\s*(?:public|internal)\s+(?:static\s+)?(?:async\s+)?(?:\([^()]*\)\??|[\w<>?,\s\[\]]+)\s+\w+\s*\(")
+
+
+def declarations(own: list[str], limit: int = 600) -> list[str]:
+    """Each exported function's or public method's whole declaration, up to where its body starts: a parameter list
+    over several lines is part of what callers depend on (pilot: only `export function alertsDataset(` was kept, and
+    the blind run turned its (name, input object) into six positional parameters)."""
+    out = []
+    for i, line in enumerate(own):
+        if not DECL_START.match(line):
+            continue
+        if re.match(r"^\s*export\s+(?:default\s+)?const\b", line) and "=" in line:
+            # a constant: its name and type, not its value
+            head = line.split("=", 1)[0] if not re.search(r"=\s*(?:async\s*)?\(", line) else None
+            if head is not None:
+                out.append(" ".join(head.split()))
+                continue
+        parts = []
+        for l in own[i:i + 20]:
+            parts.append(l.strip())
+            text = " ".join(parts)
+            # the parameter list starts at the first `name(` (after any tuple return type) and the declaration ends on
+            # the line where it closes
+            m = re.search(r"[A-Za-z_]\w*\s*(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\s*\(", text)
+            if m:
+                depth = 0
+                for ch in text[m.end() - 1:]:
+                    depth += (ch == "(") - (ch == ")")
+                    if depth == 0:
+                        break
+                if depth == 0:
+                    break
+        decl = " ".join(" ".join(parts).split())
+        out.append(decl[:limit])
     return out
 
 
@@ -1031,7 +1110,9 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
         # steps citing a rule that changed since approval are rewritten too (their own text did not change)
         REDO.update(c for r in L.changed_rules(tree, lock) for c in L.rule_citers(tree, r))
     ref_name = cfg.get("compare", {}).get("reference")
-    builds = sorted(cfg["builds"], key=lambda b: b["name"] != ref_name)
+    # A build compared by behaviour only ("tagged": false: a recording, an outside implementation) has no regions to
+    # write (pilot: regen tried to insert a new step's region into a recording and reported it rejected).
+    builds = sorted((b for b in cfg["builds"] if b.get("tagged") is not False), key=lambda b: b["name"] != ref_name)
     if only:
         builds = [b for b in builds if b["name"] == only]
     log_dir = new_log_dir(root, "-blind" if BLIND else "")
@@ -1220,11 +1301,27 @@ def regen(pj: Path, only: str | None = None, dry_run: bool = False) -> int:
             print(f"{name:<20} {f}  [{label}]  {status}")
             bad += status.startswith(("REJECTED", "REFUSED"))
     print(f"\nprompts and replies: {log_dir.relative_to(root)}")
+    print(usage_line(log_dir))
     return 1 if bad else 0
 
 
 # A source file and line in an error message: "Foo.cs(12,5)", "src/a.tsx(43,29)", "a.py", line 7", "x.go:12:3".
 SOURCE_EXTS = "py|cpp|cc|cxx|c|hpp|hh|h|cs|ts|tsx|mts|cts|js|jsx|mjs|cjs|java|kt|kts|go|rs|swift|rb|php|dart|scala|vue|svelte"
+def error_names_file(err_path: str, fpath: Path, bases: list[Path]) -> bool:
+    """Whether a path in a build error means this file. Resolved against the folders the build runs from; a bare file
+    name (no folder) is matched by name. Never by name alone when the error gives a folder (pilot: an error in
+    features/developer/hooks.ts was repaired in features/alerts/hooks.ts, at the same line)."""
+    p = Path(err_path.replace("\\", "/"))
+    target = fpath.resolve()
+    if p.is_absolute():
+        return p.resolve() == target
+    if any((base / p).resolve() == target for base in bases):
+        return True
+    if len(p.parts) == 1:
+        return p.name == fpath.name
+    return str(target).endswith("/" + p.as_posix().lstrip("./"))
+
+
 ERR_LOC = re.compile(r"""([\w./\\-]+\.(?:""" + SOURCE_EXTS + r"""))(?:"?, line |[:(])(\d+)""")
 
 
@@ -1254,6 +1351,41 @@ REPAIR_RULE = ("Fix the cause of each error; never hide it. Do not add type asse
                "scale's state to a guessed shape and passed a wrongly named prop through a cast; it compiled and was wrong.)")
 
 
+TYPE_IN_ERROR = re.compile(r"'([A-Z][A-Za-z0-9_]*)(?:<[^']*>)?'")
+
+
+def named_type_declarations(errors: str, cwd: Path, own: Path, most: int = 4, lines: int = 40) -> str:
+    """The declarations of the types a build's errors name ("missing ... from type 'MeasureDecl'"), found with git grep
+    under the build folder: a region that must fit a type it never saw cannot be repaired from the message alone
+    (pilot: two repair rounds guessed DimensionDecl's fields and failed both times)."""
+    names = [n for n in dict.fromkeys(TYPE_IN_ERROR.findall(errors)) if len(n) > 2][:12]
+    out = []
+    for name in names:
+        res = subprocess.run(["git", "grep", "-n", "-E",
+                              rf"^\s*(export\s+)?((public|internal|sealed|abstract|partial|static)\s+)*"
+                              rf"(interface|type|class|record|struct|enum)\s+{name}\b"],
+                             cwd=cwd, capture_output=True, text=True)
+        hits = [h for h in res.stdout.splitlines() if h][:1]
+        for h in hits:
+            f, ln = h.split(":", 2)[:2]
+            path = cwd / f
+            if path.resolve() == own.resolve():
+                continue          # the region's own file: the prompt already shows it
+            body = path.read_text().splitlines()[int(ln) - 1:int(ln) - 1 + lines]
+            depth, keep = 0, []
+            for l in body:
+                keep.append(l)
+                depth += l.count("{") - l.count("}") + l.count("(") - l.count(")")
+                if depth <= 0 and len(keep) > 1 and re.search(r"[};]\s*$", l.strip()):
+                    break
+            out.append(f"--- {name} ({f}:{ln})\n" + "\n".join(keep))
+        if len(out) >= most:
+            break
+    if not out:
+        return ""
+    return "\n\n=== Declarations of the types these errors name (fit the code to them):\n" + "\n".join(out)
+
+
 def repair(pj: Path, build_name: str, errors: str) -> int:
     """Map build/run errors to the regions they point at and regenerate those regions,
     with the error text in the prompt. Errors inside @support regions are reported, not touched."""
@@ -1265,6 +1397,7 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
     log_dir = new_log_dir(root, "-repair")
     (log_dir / "cwd").mkdir(exist_ok=True)
     status = 0
+    bases = [root / cfg.get("check_cwd", "."), root, Path.cwd()]
     for f in b["files"]:
         fpath = root / f
         regions, owner, lines, _ = L.parse_regions(fpath, b["lang"])
@@ -1272,12 +1405,12 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
         err_lines = errors.splitlines()
         if "Traceback (most recent call last)" in errors:
             # A traceback lists every caller; only the innermost frame in this file is the fault.
-            ours = [l for l in err_lines if ERR_LOC.search(l) and Path(ERR_LOC.search(l).group(1)).name == fpath.name]
+            ours = [l for l in err_lines if ERR_LOC.search(l) and error_names_file(ERR_LOC.search(l).group(1), fpath, bases)]
             last = ours[-1:] if ours else []
             err_lines = last + [l for l in err_lines if not ERR_LOC.search(l)][-3:]
         for line in err_lines:
             for m in ERR_LOC.finditer(line):
-                if not str(fpath).endswith(m.group(1).lstrip("./")) and Path(m.group(1)).name != fpath.name:
+                if not error_names_file(m.group(1), fpath, bases):
                     continue
                 ln = int(m.group(2))
                 if not 1 <= ln <= len(lines):
@@ -1312,7 +1445,7 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
             regions, _, lines, _ = L.parse_regions(fpath, b["lang"])
             r = regions[idx]
             reason = "\n".join(dict.fromkeys(hits[idx] + [l.strip() for l in err_lines if l.strip() and not ERR_LOC.search(l)][-3:]))
-            reason = REPAIR_RULE + "\n" + reason
+            reason = REPAIR_RULE + "\n" + reason + named_type_declarations(reason, root / cfg.get("check_cwd", "."), fpath)
             tag = f"{build_name}__repair-{r.label.replace(' + ', '+').replace(' ', '-')}"
             if r.kind == "contract":
                 conv = conventions_text(b)
@@ -1348,6 +1481,7 @@ def repair(pj: Path, build_name: str, errors: str) -> int:
             for n in notes:
                 print(f"{build_name:<20} {f}  [support]  {n}")
     print(f"prompts and replies: {log_dir.relative_to(root)}")
+    print(usage_line(log_dir))
     return status
 
 
@@ -1580,10 +1714,12 @@ def generate(pj: Path, build_name: str, attempts: int = 2) -> int:
             print(f"{build_name}: generated {target} ({len(lines)} lines, attempt {attempt})"
                   + (" -- STILL DOES NOT BUILD, run `ladder repair` with:\n" + build_errors if build_errors else ""))
             print(f"prompts and replies: {log_dir.relative_to(root)}")
+            print(usage_line(log_dir))
             return 1 if build_errors else 0
         feedback = "; ".join(issues[:8])
         print(f"{build_name}: attempt {attempt} rejected: {feedback}")
     print(f"prompts and replies: {log_dir.relative_to(root)}")
+    print(usage_line(log_dir))
     return 1
 
 

@@ -396,9 +396,49 @@ def parse_vocabulary(path: Path) -> dict[str, Capability]:
     return caps
 
 
+def _same_capability(a: Capability, b: Capability) -> bool:
+    return (a.inputs, a.outputs, a.bindings, a.known, a.checks, a.notes, a.tests, a.tables) == \
+        (b.inputs, b.outputs, b.bindings, b.known, b.checks, b.notes, b.tests, b.tables)
+
+
+def vocabulary_layers(cfg: dict, root: Path) -> list[tuple[str, dict[str, Capability]]]:
+    """The vocabulary files a project reads, in order: "vocabulary" (often the repository's shared one), then each of
+    "extra_vocabulary" (the area's own capabilities)."""
+    files = ([cfg["vocabulary"]] if cfg.get("vocabulary") else []) + list(cfg.get("extra_vocabulary") or [])
+    return [(f, parse_vocabulary(root / f)) for f in files]
+
+
 def load_vocabulary(cfg: dict, root: Path) -> dict[str, Capability] | None:
-    v = cfg.get("vocabulary")
-    return parse_vocabulary(root / v) if v else None
+    """Every capability the project may use. "extra_vocabulary" adds to "vocabulary" rather than replacing it (pilot:
+    four areas each copied the shared capabilities into their own file, and one changed a copy). A capability defined
+    again with different text is an error: change the shared one, or give the area's its own name."""
+    layers = vocabulary_layers(cfg, root)
+    if not layers:
+        return None
+    caps: dict[str, Capability] = {}
+    where: dict[str, str] = {}
+    for f, more in layers:
+        for name, c in more.items():
+            if name in caps and not _same_capability(caps[name], c):
+                raise SystemExit(f"{root / f}:{c.line}: capability '{name}' is also defined in {where[name]} and says "
+                                 f"something else: change it there (it is shared), or give this one its own name")
+            if name not in caps:
+                caps[name], where[name] = c, f
+    return caps
+
+
+def vocabulary_copy_warnings(cfg: dict, root: Path) -> list[dict]:
+    """Capabilities an extra vocabulary repeats word for word from an earlier file: copies to delete."""
+    out, seen = [], {}
+    for f, more in vocabulary_layers(cfg, root):
+        for name in more:
+            if name in seen:
+                out.append(dict(kind="vocabulary-copy", node=name,
+                                msg=f"'{name}' in {f} repeats {seen[name]} word for word; delete the copy (the project "
+                                    f"reads both files)"))
+            else:
+                seen[name] = f
+    return out
 
 
 # ---------------------------------------------------------------- code regions
@@ -542,6 +582,8 @@ def with_repo_defaults(raw: dict, root: Path) -> dict:
             raise SystemExit(f"{rdir / REPO_FILE}: defaults.{k} belongs in each project's ladder.json")
         if k in ("vocabulary", "check_cwd"):
             v = rebase(v)
+        elif k == "extra_vocabulary":
+            v = [rebase(x) for x in v]
         elif k == "schemas":
             v = {name: ({**s, "source": rebase(s["source"])} if isinstance(s, dict) and "source" in s else s)
                  for name, s in v.items()}
@@ -572,6 +614,26 @@ def read_config(pj: Path) -> dict:
     except ValueError as e:
         raise SystemExit(f"{pj}: {e}")
     return with_repo_defaults(raw, pj.parent)
+
+
+def generated_by(cfg: dict, root: Path, f: str) -> str | None:
+    """The "generated" glob that names file f (a build's path, relative to the project), if another tool writes it:
+    ladder.repo.json's globs are relative to it, a project's own relative to the project."""
+    target = (root / f).resolve()
+    found = find_repo(root)
+    pats = []
+    if found:
+        pats += [(found[1].resolve(), g) for g in found[0].get("generated") or []]
+    raw = cfg.get("generated") or []
+    pats += [(root.resolve(), g) for g in raw]
+    for base, g in pats:
+        try:
+            rel = target.relative_to(base).as_posix()
+        except ValueError:
+            continue
+        if fnmatch.fnmatchcase(rel, g):
+            return g
+    return None
 
 
 def repo_projects(repo: dict, rdir: Path) -> list[Path]:
@@ -705,6 +767,12 @@ def contract_hash(tree: dict[str, Node], build: dict | None = None) -> str:
 
 
 CONTRACT_DECL_RE = re.compile(r"\b(?:class|interface|record|struct|type|enum)\s+([A-Z][A-Za-z0-9_]*)\b")
+
+
+def rule_region_name(label: str) -> str | None:
+    """The rule a @contract region holds the code of (`@contract rule <name>`), or None."""
+    bare = label.replace("contract ", "", 1)
+    return bare[5:].strip() if bare.startswith("rule ") else None
 
 
 def region_contract_hash(tree, build: dict | None, code: list[str], label: str = "") -> str:
@@ -1143,16 +1211,29 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                 br["problems"].append(dict(kind="missing-file", file=f, line=0,
                                            msg="file not found (generate it with `ladder generate`, or fix the path in ladder.json)"))
                 continue
+            gen = generated_by(cfg, root, f)
+            if gen:
+                br["problems"].append(dict(kind="generated-file", file=f, line=0,
+                                           msg=f"another tool writes this file (\"generated\": {gen}): its markers are lost "
+                                               f"the next time it runs, and that tool's own check sees a changed file. Take it "
+                                               f"out of the build; if Ladder's code feeds it, add the tool to after_generate"))
+                continue
             regions, _, flines, probs = parse_regions(fpath, b["lang"])
             br["problems"] += group_untagged(probs)
             for r in regions:
                 if r.kind == "contract":
                     h = r.tags[0][1] if r.tags else ""
-                    has_contract = True
+                    # A named rule's region (@contract rule ...) spells out no data block (pilot: it hid a build's
+                    # missing data contract).
+                    has_contract = has_contract or rule_region_name(r.label) is None
                     own = region_own_code(regions, flines, regions.index(r))
                     if not contract_region_ok(tree, b, h, own, r.label):
+                        now_h = region_contract_hash(tree, b, own, r.label)
+                        what = (f"the code of rule {rule_region_name(r.label)} was generated from an older wording of "
+                                f"the rule" if rule_region_name(r.label) else
+                                "contract types were generated from older in:/out: lines or data blocks")
                         br["problems"].append(dict(kind="stale-contract", file=f, line=r.start,
-                                                   msg=f"contract types were generated from older in:/out: lines or data blocks (tag {h}, now {region_contract_hash(tree, b, own, r.label)}); regenerate this region"))
+                                                   msg=f"{what} (tag {h}, now {now_h}); regenerate this region"))
                     # A region whose label names data blocks must declare those, and no block another region's label
                     # names: blind generation once wrote three DTOs into one file and repair then emptied the right one.
                     named = label_blocks(tree, b, r.label)
@@ -1291,6 +1372,7 @@ def check(pj: Path, only_builds: list[str] | None = None, schema_since: str | No
                         f"names), or tag it as @support if no step owns it"))
         report["builds"].append(br)
     report["warnings"] += rule_in_support_warnings(root, cfg, tree, lock)
+    report["warnings"] += vocabulary_copy_warnings(cfg, root)
     for b in cfg.get("builds", []):
         report["warnings"] += exported_type_warnings(root, b)
     report["compare"] = compare_runs(root, cfg, tree)
@@ -1413,10 +1495,51 @@ def apply_compare(value: str, rules: dict) -> str:
     return json.dumps(walk(v), sort_keys=True, separators=(",", ":"))
 
 
-def match_info(ref: str, val: str, tol: float) -> tuple[str, float]:
-    """'same' if identical; 'close' if only numbers differ and each by at most tol;
-    otherwise 'different'. Returns (status, largest numeric difference)."""
-    if ref == val:
+REL_TIME_RE = re.compile(r"\bnow([+-])(\d+)(m|s)\b")
+
+
+def shift_times(val: str, gap_s: float) -> str:
+    """A result recorded gap_s seconds after the reference, with each relative time ("now-17780m") moved back by that
+    gap: a fixed date in the data then reads as it did in the reference's recording."""
+    def move(m):
+        n = (1 if m.group(1) == "+" else -1) * int(m.group(2))
+        unit = 60 if m.group(3) == "m" else 1
+        k = round((n * unit + gap_s) / unit)
+        return f"now{'+' if k >= 0 else '-'}{abs(k)}{m.group(3)}"
+    return REL_TIME_RE.sub(move, val)
+
+
+def same_but_for_drift(ref: str, val: str, gap_s: float | None) -> bool:
+    """Equal once every relative time that differs is read either as "now"-based (equal as written) or as a fixed date
+    (moved by the gap between the two recordings), within a minute: what a masked time cannot tell apart."""
+    if gap_s is None or not REL_TIME_RE.search(ref) or REL_TIME_RE.sub("#", ref) != REL_TIME_RE.sub("#", val):
+        return False
+    shifted = shift_times(val, gap_s)
+    for a, b, c in zip(REL_TIME_RE.finditer(ref), REL_TIME_RE.finditer(val), REL_TIME_RE.finditer(shifted)):
+        def mins(m):
+            n = (1 if m.group(1) == "+" else -1) * int(m.group(2))
+            return n if m.group(3) == "m" else n / 60
+        if abs(mins(a) - mins(b)) > 1 and abs(mins(a) - mins(c)) > 1:
+            return False
+    return True
+
+
+def run_gap(ref_dir: Path, dir_: Path, run: str) -> float | None:
+    """Seconds between the reference's recording of a run and a build's (from each folder's .replay.json), or None."""
+    from datetime import datetime
+    def started(d):
+        try:
+            return datetime.fromisoformat(json.loads((d / ".replay.json").read_text())["started"][run])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+    a, b = started(ref_dir), started(dir_)
+    return (b - a).total_seconds() if a and b else None
+
+
+def match_info(ref: str, val: str, tol: float, gap_s: float | None = None) -> tuple[str, float]:
+    """'same' if identical (or identical but for relative times moved by the gap between the recordings); 'close' if
+    only numbers differ and each by at most tol; otherwise 'different'. Returns (status, largest numeric difference)."""
+    if ref == val or same_but_for_drift(ref, val, gap_s):
         return "same", 0.0
     if NUM_RE.sub("#", ref) != NUM_RE.sub("#", val):
         return "different", float("inf")
@@ -1613,7 +1736,7 @@ def replay_settings_warnings(root: Path, cfg: dict) -> list[dict]:
             continue
         want, got = dict(want, observe=repo_relative_command(want.get("observe", ""))), dict(got, observe=repo_relative_command(got.get("observe", "")))
         diffs = [f"{k}: {want.get(k)} vs {got.get(k)}" for k in sorted(set(want) | set(got))
-                 if k not in ("recorded", "mask_text", "code") and want.get(k) != got.get(k)]   # mask_text: applied to both at compare; code: differs by design
+                 if k not in ("recorded", "mask_text", "code", "started") and want.get(k) != got.get(k)]   # mask_text: applied to both at compare; code, started: differ by design
         if diffs:
             out.append(dict(kind="replay-settings", node=b["name"],
                             msg=f"recorded with different replay settings than {ref} (" + "; ".join(diffs)
@@ -1698,7 +1821,7 @@ def compare_runs(root: Path, cfg: dict, tree: dict | None = None) -> list[dict]:
                     pairs = list(zip(ref_ex_b[step], ex[step]))
                 if rl:
                     pairs = [(apply_compare(r, rl), apply_compare(v, rl)) for r, v in pairs]
-                results = [match_info(r, v, step_tol) for r, v in pairs]
+                results = [match_info(r, v, step_tol, run_gap(ref_path.parent, path.parent, run)) for r, v in pairs]
                 status = ("different" if any(r[0] == "different" for r in results)
                           else "close" if any(r[0] == "close" for r in results) else "same")
                 worst = max(r[1] for r in results)
@@ -2192,13 +2315,31 @@ def hand_edited(root: Path, b: dict) -> list[tuple[str, str, int]]:
     what the generator last wrote in this checkout."""
     saved = load_code(root).get(b["name"], {})
     gen = load_generated(root).get(b["name"], {})
+    committed = committed_code(root).get(b["name"], {})
     out = []
     for f, regs in code_fingerprints(root, b).items():
         for key, (fp, line) in regs.items():
             was = saved.get(f, {}).get(key)
-            if was is not None and was != fp and gen.get(f, {}).get(key) != fp:
+            # The code as committed (approved) is never a hand edit: restoring it after a regeneration went wrong
+            # (`git checkout` of the file) must not make regen refuse the region (pilot).
+            if was is not None and was != fp and gen.get(f, {}).get(key) != fp \
+                    and committed.get(f, {}).get(key) != fp:
                 out.append((f, key, line))
     return out
+
+
+def committed_code(root: Path) -> dict:
+    """ladder.code.json as committed at HEAD ({} when it is not in git)."""
+    try:
+        res = subprocess.run(["git", "-C", str(root), "show", f"HEAD:./{CODE_FILE}"], capture_output=True, text=True)
+    except OSError:
+        return {}
+    if res.returncode != 0:
+        return {}
+    try:
+        return json.loads(res.stdout)
+    except ValueError:
+        return {}
 
 
 TYPE_ESCAPES = {
@@ -2510,11 +2651,17 @@ def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, roun
         if r == rounds:
             print(f"STILL DOES NOT BUILD after {rounds} repair round(s) ({n} error lines):\n" + errs[:3000])
             return 1
-        names = {Path(f).name for t in targets for b in cfg["builds"] if b["name"] == t for f in b.get("files", [])}
-        if not any(nm in errs for nm in names):
+        # Which builds' files the errors are in, by path (pilot: "hooks.ts" in another feature's error counted as this
+        # build's hooks.ts, and the repair rewrote a region nothing was wrong with)
+        bases = [root / cfg.get("check_cwd", "."), root, Path.cwd()]
+        locs = [m.group(1) for m in R.ERR_LOC.finditer(errs)]
+
+        def owns(bb: dict) -> bool:
+            return any(R.error_names_file(lp, root / f, bases) for f in bb.get("files", []) for lp in locs)
+        if not any(owns(b) for t in targets for b in cfg["builds"] if b["name"] == t):
             # Round 12: one broken build made every later build "STILL DOES NOT BUILD" after three useless rounds.
             others = sorted({b["name"] for b in cfg["builds"] if b.get("tagged") is not False and b["name"] not in targets
-                             for f in b.get("files", []) if Path(f).name in errs})
+                             and owns(b)})
             hint = (f"fix {', '.join(others)} first (`ladder regen --build=<it> --repair=N`)" if others else
                     "they are in files no build of this project generates (tests, fixtures, other features): update "
                     "them by hand as part of the change, or reconsider the English (an optional field breaks no caller)")
@@ -2531,6 +2678,9 @@ def repair_until_builds(pj: Path, cfg: dict, root: Path, build: str | None, roun
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[1] in ("--version", "-V", "version"):
+        print(json.loads((Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json").read_text())["version"])
+        return 0
     if "--help" in argv[1:] or "-h" in argv[1:]:
         print(__doc__)
         return 0

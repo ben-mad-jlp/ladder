@@ -686,8 +686,19 @@ def check_tests(cfg: dict, root: Path, tree: L.Tree, code: dict) -> tuple[list[d
         warnings.append(dict(kind="untested-project", node="tests",
                              msg="no \"tests\" in ladder.json: nothing records that this code passes the slice's own "
                                  "tests; add {\"name\": ..., \"command\": ...} for each (run from check_cwd)"))
+    cwd = root / cfg.get("check_cwd", ".")
+    found = L.find_repo(root)
+    also = [root] + ([found[1]] if found else []) + [g for g in [_git_root(root)] if g]
     for t in tests:
         r = results.get(t["key"])
+        gone = missing_files(t["cmd"], cwd, also)
+        if gone:
+            # A test line copied from another area may name a harness that is not here (pilot): say so, not "never run".
+            warnings.append(dict(kind="test-missing", node=t["key"],
+                                 msg=f"`{t['cmd']}` names {', '.join(gone)}, which does not exist (from {cwd}, the "
+                                     f"project or the repository root); "
+                                     f"fix the path, or write that test for this project"))
+            continue
         if r is None:
             warnings.append(dict(kind="test-not-run", node=t["key"], msg=f"never run; `ladder test` runs `{t['cmd']}`"))
         elif r.get("hash") != t["hash"]:
@@ -718,6 +729,30 @@ def failure_lines(output: str, limit: int = 10) -> list[str]:
             seen.add(l)
             out.append(l)
     return out[:limit]
+
+
+TEST_FILE_RE = re.compile(r"^[\w./-]*/[\w.-]+\.(?:sh|ts|tsx|js|mjs|cjs|py|cs|json)$")
+
+
+def missing_files(cmd: str, cwd: Path, also: list[Path] | None = None) -> list[str]:
+    """Words of a test command that look like a file path (a folder and a file name with an extension) and exist
+    neither from the folder the command runs in nor from the other folders given (the project, the repository root:
+    a runner script often resolves its arguments from the repository root)."""
+    bases = [cwd, *(also or [])]
+    out = []
+    for word in cmd.split():
+        w = word.strip("'\"")
+        if TEST_FILE_RE.match(w) and not any((b / w).exists() for b in bases):
+            out.append(w)
+    return out
+
+
+def _git_root(path: Path) -> Path | None:
+    try:
+        res = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    except OSError:
+        return None
+    return Path(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else None
 
 
 def run_tests(pj: Path, only: list[str] | None = None) -> int:
